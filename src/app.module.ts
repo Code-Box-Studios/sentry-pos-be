@@ -7,6 +7,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { validate } from './config/env.validation';
 import { ContextMiddleware } from './common/context/context.middleware';
 import { AuthModule } from './auth/auth.module';
+import { MailModule } from './mail/mail.module';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { AuthModule } from './auth/auth.module';
       validate,
     }),
     PrismaModule,
+    MailModule,
     HealthModule,
     AuthModule,
   ],

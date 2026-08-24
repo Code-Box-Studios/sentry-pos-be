@@ -133,6 +133,20 @@ export class PlatformWriteForbiddenError extends ApiHttpException {
 }
 
 // ---------------------------------------------------------------------------
+// Token errors (Task 9 — invite / password-reset)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single-use invite or reset token was invalid: unknown, already consumed, or
+ * expired. Deliberately generic (400) so it never reveals which of those it was.
+ */
+export class InvalidTokenError extends ApiHttpException {
+  constructor(message = 'This link is invalid or has expired.') {
+    super(HttpStatus.BAD_REQUEST, 'invalid_token', message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Domain errors
 // ---------------------------------------------------------------------------
 

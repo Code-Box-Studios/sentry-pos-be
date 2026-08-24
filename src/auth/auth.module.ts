@@ -4,6 +4,7 @@ import { PassportModule } from '@nestjs/passport';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { TotpService } from './totp.service';
+import { InviteService } from './invite.service';
 import { AuditService } from './audit.service';
 import { JwtStrategy } from './jwt.strategy';
 import { PortalAuthGuard } from './guards/portal-auth.guard';
@@ -23,6 +24,7 @@ import { LockoutModule } from '../common/lockout/lockout.module';
   providers: [
     AuthService,
     TotpService,
+    InviteService,
     AuditService,
     JwtStrategy,
     PortalAuthGuard,
@@ -32,6 +34,7 @@ import { LockoutModule } from '../common/lockout/lockout.module';
   exports: [
     AuthService,
     TotpService,
+    InviteService,
     AuditService,
     PortalAuthGuard,
     AdminGuard,

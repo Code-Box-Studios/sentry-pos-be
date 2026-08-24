@@ -11,12 +11,16 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { AuthService, LoginResult } from './auth.service';
 import { TotpService } from './totp.service';
+import { InviteService } from './invite.service';
 import { LockoutService } from '../common/lockout/lockout.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RefreshDto } from './dto/refresh.dto';
 import { TotpEnableDto } from './dto/totp-enable.dto';
 import { TotpVerifyDto } from './dto/totp-verify.dto';
+import { InviteAcceptDto } from './dto/invite-accept.dto';
+import { PasswordResetRequestDto } from './dto/password-reset-request.dto';
+import { PasswordResetConfirmDto } from './dto/password-reset-confirm.dto';
 import { PreauthGuard, PreauthPayload } from './guards/preauth.guard';
 import {
   UnauthorizedError,
@@ -34,6 +38,7 @@ export class AuthController {
   constructor(
     private readonly auth: AuthService,
     private readonly totp: TotpService,
+    private readonly invites: InviteService,
     private readonly lockout: LockoutService,
     private readonly raw: PrismaService,
     private readonly jwt: JwtService,
@@ -63,6 +68,50 @@ export class AuthController {
   async logout(@Body() dto: RefreshDto): Promise<{ ok: true }> {
     await this.auth.logout(dto.refreshToken);
     return { ok: true };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Invite acceptance (Task 9)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Accept an invite: verify the single-use token, set the user's password,
+   * activate the owner, and seed the demo business. Invalid/expired/used tokens
+   * collapse to a generic 400 `invalid_token`.
+   */
+  @Post('invite/accept')
+  async acceptInvite(@Body() dto: InviteAcceptDto): Promise<{ ok: true }> {
+    await this.invites.acceptInvite(dto.token, dto.password);
+    return { ok: true };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Password reset (Task 9)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Request a password reset. ALWAYS returns 204 — never reveals whether the
+   * email exists (no user enumeration). A token + email are produced only when
+   * the account actually exists.
+   */
+  @Post('password-reset/request')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async requestPasswordReset(
+    @Body() dto: PasswordResetRequestDto,
+  ): Promise<void> {
+    await this.invites.requestReset(dto.email);
+  }
+
+  /**
+   * Confirm a password reset: verify the single-use token, set the new password,
+   * and revoke ALL of the user's refresh tokens. Returns 204 on success.
+   */
+  @Post('password-reset/confirm')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async confirmPasswordReset(
+    @Body() dto: PasswordResetConfirmDto,
+  ): Promise<void> {
+    await this.invites.confirmReset(dto.token, dto.password);
   }
 
   // ---------------------------------------------------------------------------
