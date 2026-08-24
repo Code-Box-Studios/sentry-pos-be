@@ -30,4 +30,15 @@ describe('HealthController (e2e)', () => {
       .expect(200)
       .expect({ ok: true });
   });
+
+  it('GET /v1/health → response includes X-Request-Id header (middleware wired)', () => {
+    return request(app.getHttpServer())
+      .get('/v1/health')
+      .expect(200)
+      .expect((res) => {
+        expect(res.headers['x-request-id']).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        );
+      });
+  });
 });
