@@ -1,6 +1,10 @@
 import { Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { getContext, RequestContext } from '../common/context/request-context';
+
+/** Minimal write surface shared by the raw client and a transaction client. */
+type AuditClient = Pick<PrismaService, 'auditLog'> | Prisma.TransactionClient;
 
 /**
  * Task 7 — explicit auth-event audit helper (§11 auth events).
@@ -21,12 +25,16 @@ export class AuditService {
    * @param userId  the user being authenticated (audit entity)
    * @param ownerId the owner the user belongs to (null for platform admins)
    * @param meta    extra metadata merged into the row
+   * @param client  optional Prisma client — pass a transaction client to write
+   *                the audit row INSIDE a `$transaction` (so it rolls back with
+   *                the flow). Defaults to the raw client.
    */
   async logAuth(
     action: string,
     userId: string,
     ownerId: string | null,
     meta: Record<string, unknown> = {},
+    client: AuditClient = this.raw,
   ): Promise<void> {
     let ctx: RequestContext | null = null;
     try {
@@ -35,7 +43,7 @@ export class AuditService {
       // called outside a request scope (e.g. unit tests) — use empty metadata
     }
 
-    await this.raw.auditLog.create({
+    await client.auditLog.create({
       data: {
         actorType: ownerId ? 'owner' : 'platform_admin',
         actorId: userId,

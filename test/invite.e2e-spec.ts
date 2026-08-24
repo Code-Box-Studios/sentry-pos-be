@@ -25,6 +25,7 @@ import { PrismaService } from '../src/prisma/prisma.service';
 import { InviteService } from '../src/auth/invite.service';
 import { MailService } from '../src/mail/mail.service';
 import { hashSecret } from '../src/auth/hashing';
+import * as demoSeed from '../src/portal/demo-seed';
 import { resetDb, closeDb } from './helpers/db';
 
 const raw = new PrismaClient();
@@ -302,6 +303,77 @@ describe('Invite + reset + demo seed (e2e)', () => {
     expect(audit.length).toBe(1);
     expect(audit[0].ownerId).toBe(owner.id);
     expect(audit[0].businessId).toBe(biz!.id);
+
+    // §11 auth event: invite acceptance, actor = the owner.
+    const accepted = await raw.auditLog.findMany({
+      where: { action: 'auth.invite_accepted', entityId: user.id },
+    });
+    expect(accepted.length).toBe(1);
+    expect(accepted[0].ownerId).toBe(owner.id);
+  });
+
+  // =========================================================================
+  // Invite accept is ATOMIC — a seed failure rolls back the whole accept
+  // =========================================================================
+
+  it('a demo-seed failure rolls back the ENTIRE accept (token unconsumed, owner inactive, no partial rows)', async () => {
+    const { owner, user } = await seedPendingOwner('suspended');
+    const token = await invites.createInvite(user.id);
+
+    // Force the demo seed to blow up part-way through the accept transaction.
+    const spy = jest
+      .spyOn(demoSeed, 'seedDemoBusiness')
+      .mockRejectedValueOnce(new Error('injected seed failure'));
+
+    // The accept surfaces the failure (mapped to 500 by the global filter).
+    await request(server())
+      .post('/v1/auth/invite/accept')
+      .send({ token, password: 'newpassword123' })
+      .expect(500);
+
+    spy.mockRestore();
+
+    // Nothing was committed: token still unconsumed...
+    const tokenRow = await raw.authToken.findUniqueOrThrow({
+      where: { tokenHash: sha256(token) },
+    });
+    expect(tokenRow.usedAt).toBeNull();
+
+    // ...password still unset, owner still inactive...
+    const afterUser = await raw.user.findUniqueOrThrow({
+      where: { id: user.id },
+    });
+    expect(afterUser.passwordHash).toBeNull();
+    const afterOwner = await raw.owner.findUniqueOrThrow({
+      where: { id: owner.id },
+    });
+    expect(afterOwner.status).toBe('suspended');
+
+    // ...and no partial business/audit rows leaked.
+    const biz = await raw.business.findFirst({ where: { ownerId: owner.id } });
+    expect(biz).toBeNull();
+    const seededAudit = await raw.auditLog.findMany({
+      where: { action: 'business.demo_seeded' },
+    });
+    expect(seededAudit.length).toBe(0);
+    const acceptedAudit = await raw.auditLog.findMany({
+      where: { action: 'auth.invite_accepted' },
+    });
+    expect(acceptedAudit.length).toBe(0);
+
+    // The invite can simply be RETRIED and now succeeds end to end.
+    await request(server())
+      .post('/v1/auth/invite/accept')
+      .send({ token, password: 'newpassword123' })
+      .expect(201);
+    const retriedOwner = await raw.owner.findUniqueOrThrow({
+      where: { id: owner.id },
+    });
+    expect(retriedOwner.status).toBe('active');
+    const retriedBiz = await raw.business.findFirst({
+      where: { ownerId: owner.id, isDemo: true },
+    });
+    expect(retriedBiz).not.toBeNull();
   });
 
   // =========================================================================
@@ -402,6 +474,12 @@ describe('Invite + reset + demo seed (e2e)', () => {
       .post('/v1/auth/refresh')
       .send({ refreshToken: s2.body.refreshToken })
       .expect(401);
+
+    // §11 auth event: password reset, actor = the user.
+    const resetAudit = await raw.auditLog.findMany({
+      where: { action: 'auth.password_reset', entityId: user.id },
+    });
+    expect(resetAudit.length).toBe(1);
   });
 
   it('reset confirm with an unknown token is rejected and single-use is enforced', async () => {

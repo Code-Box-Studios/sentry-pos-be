@@ -1,9 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomBytes } from 'crypto';
-import { AuthTokenKind } from '@prisma/client';
+import { AuthTokenKind, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
+import { AuditService } from './audit.service';
 import { hashSecret } from './hashing';
 import { seedDemoBusiness } from '../portal/demo-seed';
 import { InvalidTokenError } from '../common/errors/api-errors';
@@ -35,6 +36,7 @@ export class InviteService {
   constructor(
     private readonly raw: PrismaService,
     private readonly mail: MailService,
+    private readonly audit: AuditService,
     config: ConfigService,
   ) {
     this.appUrl = config.get<string>('APP_URL') ?? 'http://localhost:3000';
@@ -84,25 +86,46 @@ export class InviteService {
    * Accept an invite: verify the token, set the user's password (argon2),
    * activate the owner, and seed the demo business. Single-use + expiry
    * enforced. All failures collapse to a generic `invalid_token` (400).
+   *
+   * The ENTIRE accept is ATOMIC: token-consume + set-password + owner-activation
+   * + `seedDemoBusiness` (its ~30 creates + the `business.demo_seeded` audit row)
+   * + the `auth.invite_accepted` audit row all run inside a single
+   * `$transaction`. If any seed step fails, everything rolls back — the invite
+   * token stays UNCONSUMED and the owner stays INACTIVE, so the invite can simply
+   * be retried (no half-seeded demo, no stranded activation). Password hashing
+   * (CPU-bound, no DB side effects) runs before the transaction so a connection
+   * isn't held during argon2.
    */
   async acceptInvite(token: string, password: string): Promise<void> {
-    const row = await this.consumeToken(token, AuthTokenKind.invite);
-
     const passwordHash = await hashSecret(password);
-    const user = await this.raw.user.update({
-      where: { id: row.userId },
-      data: { passwordHash },
-    });
 
-    // Activate the owner (a pre-invite owner may be created suspended/inactive).
-    if (user.ownerId) {
-      await this.raw.owner.update({
-        where: { id: user.ownerId },
-        data: { status: 'active', suspendedAt: null },
+    await this.raw.$transaction(async (tx) => {
+      const row = await this.consumeToken(tx, token, AuthTokenKind.invite);
+
+      const user = await tx.user.update({
+        where: { id: row.userId },
+        data: { passwordHash },
       });
-      // Seed the demo business as system provisioning (raw client).
-      await seedDemoBusiness(this.raw, user.ownerId);
-    }
+
+      // Activate the owner (a pre-invite owner may be created suspended/inactive)
+      // and seed the demo business as system provisioning — all in this tx.
+      if (user.ownerId) {
+        await tx.owner.update({
+          where: { id: user.ownerId },
+          data: { status: 'active', suspendedAt: null },
+        });
+        await seedDemoBusiness(tx, user.ownerId);
+      }
+
+      // §11 auth event — actor = the owner (or platform admin fallback).
+      await this.audit.logAuth(
+        'auth.invite_accepted',
+        user.id,
+        user.ownerId ?? null,
+        {},
+        tx,
+      );
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -145,20 +168,35 @@ export class InviteService {
   /**
    * Confirm a password reset: verify the token, set the new password, and
    * revoke ALL of the user's refresh tokens. Single-use + expiry enforced.
+   *
+   * Atomic: token-consume + set-password + revoke-all-sessions + the
+   * `auth.password_reset` audit row all run in one `$transaction`.
    */
   async confirmReset(token: string, password: string): Promise<void> {
-    const row = await this.consumeToken(token, AuthTokenKind.reset);
-
     const passwordHash = await hashSecret(password);
-    await this.raw.user.update({
-      where: { id: row.userId },
-      data: { passwordHash },
-    });
 
-    // Revoke every active refresh token for this user (invalidate all sessions).
-    await this.raw.refreshToken.updateMany({
-      where: { userId: row.userId, revokedAt: null },
-      data: { revokedAt: new Date() },
+    await this.raw.$transaction(async (tx) => {
+      const row = await this.consumeToken(tx, token, AuthTokenKind.reset);
+
+      const user = await tx.user.update({
+        where: { id: row.userId },
+        data: { passwordHash },
+      });
+
+      // Revoke every active refresh token for this user (invalidate all sessions).
+      await tx.refreshToken.updateMany({
+        where: { userId: row.userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+
+      // §11 auth event — actor = the user whose password was reset.
+      await this.audit.logAuth(
+        'auth.password_reset',
+        user.id,
+        user.ownerId ?? null,
+        {},
+        tx,
+      );
     });
   }
 
@@ -169,13 +207,16 @@ export class InviteService {
   /**
    * Look up a token by its hash, enforce kind / not-used / not-expired, and mark
    * it used atomically. Returns the row on success; throws `invalid_token`
-   * (generic 400) on any failure so nothing about the token is revealed.
+   * (generic 400) on any failure so nothing about the token is revealed. Runs on
+   * the caller-supplied transaction client so consumption commits/rolls back with
+   * the rest of the flow.
    */
   private async consumeToken(
+    tx: Prisma.TransactionClient,
     token: string,
     kind: AuthTokenKind,
   ): Promise<{ id: string; userId: string }> {
-    const row = await this.raw.authToken.findUnique({
+    const row = await tx.authToken.findUnique({
       where: { tokenHash: sha256(token) },
     });
 
@@ -190,7 +231,7 @@ export class InviteService {
 
     // Mark used, but guard against a concurrent double-accept: updateMany with
     // usedAt still null so exactly one caller wins the single-use race.
-    const result = await this.raw.authToken.updateMany({
+    const result = await tx.authToken.updateMany({
       where: { id: row.id, usedAt: null },
       data: { usedAt: new Date() },
     });

@@ -1,17 +1,20 @@
-import { PrismaService } from '../prisma/prisma.service';
+import { Prisma } from '@prisma/client';
 
 /**
  * Task 9 — demo-business provisioning.
  *
- * `seedDemoBusiness(ownerId)` creates one `is_demo` business named exactly
+ * `seedDemoBusiness(tx, ownerId)` creates one `is_demo` business named exactly
  * "Kape Diaria (Demo)" whose catalog + stock mirror the FE mock seed
  * (frontend/pos/src/api/mock/seed.ts) so Task 22's parity holds. The FE mock is
  * the source of truth; prices are in centavos (FE `pesos(n)` === n * 100).
  *
- * This runs on the RAW PrismaClient as SYSTEM provisioning: it deliberately
- * bypasses the tenancy choke point (there is no request scope during invite
- * acceptance, and a brand-new owner has no business to scope to yet). Exactly
- * one summary audit row (`business.demo_seeded`, actor = the owner) is written.
+ * This runs on the RAW client (bypasses the tenancy choke point — there is no
+ * request scope during invite acceptance and a brand-new owner has no business
+ * to scope to yet) and is ALWAYS invoked inside the invite-accept `$transaction`
+ * (`tx` is the transaction client). A failure part-way through therefore rolls
+ * back the whole accept, so the seed's non-idempotence never leaves a half-built
+ * demo behind. Exactly one summary audit row (`business.demo_seeded`,
+ * actor = the owner) is written.
  *
  * The business is created with `isDemo = true`, which excludes it from
  * `max_businesses` counting (the cap enforcement lands in Task 11).
@@ -321,13 +324,14 @@ const DEMO_BRANCH = {
 
 /**
  * Provision the demo business for a freshly-activated owner. Returns the new
- * business id. Idempotency is NOT built in — call once, on invite acceptance.
+ * business id. Idempotency is NOT built in — call once, on invite acceptance,
+ * inside a transaction (`tx`) so a partial failure rolls the whole accept back.
  */
 export async function seedDemoBusiness(
-  raw: PrismaService,
+  tx: Prisma.TransactionClient,
   ownerId: string,
 ): Promise<string> {
-  const business = await raw.business.create({
+  const business = await tx.business.create({
     data: {
       ownerId,
       name: DEMO_BUSINESS_NAME,
@@ -343,7 +347,7 @@ export async function seedDemoBusiness(
     },
   });
 
-  const branch = await raw.branch.create({
+  const branch = await tx.branch.create({
     data: {
       businessId: business.id,
       name: DEMO_BRANCH.name,
@@ -355,7 +359,7 @@ export async function seedDemoBusiness(
   // Categories.
   const categoryIdByKey = new Map<string, string>();
   for (const cat of CATEGORIES) {
-    const row = await raw.category.create({
+    const row = await tx.category.create({
       data: {
         businessId: business.id,
         name: cat.name,
@@ -368,7 +372,7 @@ export async function seedDemoBusiness(
   // Modifier groups + their modifiers.
   const groupIdByKey = new Map<string, string>();
   for (const group of MODIFIER_GROUPS) {
-    const row = await raw.modifierGroup.create({
+    const row = await tx.modifierGroup.create({
       data: {
         businessId: business.id,
         name: group.name,
@@ -387,7 +391,7 @@ export async function seedDemoBusiness(
 
   // Discounts.
   for (const disc of DISCOUNTS) {
-    await raw.discount.create({
+    await tx.discount.create({
       data: {
         businessId: business.id,
         name: disc.name,
@@ -406,7 +410,7 @@ export async function seedDemoBusiness(
     if (!categoryId) {
       throw new Error(`demo seed: unknown category ${prod.categoryKey}`);
     }
-    const row = await raw.product.create({
+    const row = await tx.product.create({
       data: {
         businessId: business.id,
         categoryId,
@@ -449,7 +453,7 @@ export async function seedDemoBusiness(
     if (!productId) {
       throw new Error(`demo seed: unknown product ${level.productKey}`);
     }
-    await raw.branchStock.create({
+    await tx.branchStock.create({
       data: {
         branchId: branch.id,
         productId,
@@ -460,7 +464,7 @@ export async function seedDemoBusiness(
   }
 
   // Exactly one summary audit row, actor = the owner.
-  await raw.auditLog.create({
+  await tx.auditLog.create({
     data: {
       actorType: 'owner',
       actorId: ownerId,
