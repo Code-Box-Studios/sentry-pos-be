@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { resetDb } from './helpers/db';
+import { resetDb, closeDb } from './helpers/db';
 
 /**
  * Schema integrity e2e tests (Task 2).
@@ -25,6 +25,7 @@ describe('Schema integrity constraints', () => {
 
   afterAll(async () => {
     await prisma.$disconnect();
+    await closeDb();
   });
 
   beforeEach(async () => {
@@ -154,7 +155,7 @@ describe('Schema integrity constraints', () => {
           INSERT INTO branch_stock (id, created_at, updated_at, branch_id, product_id, qty)
           VALUES (gen_random_uuid(), NOW(), NOW(), ${branch.id}::uuid, ${product.id}::uuid, -1)
         `,
-      ).rejects.toThrow();
+      ).rejects.toThrow(/check constraint|branch_stock_qty_nonnegative/);
     });
   });
 

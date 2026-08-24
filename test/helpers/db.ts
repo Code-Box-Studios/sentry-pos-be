@@ -27,4 +27,12 @@ export async function resetDb(): Promise<void> {
   }
 }
 
+/**
+ * Drain the shared PrismaClient connection pool.  Call from a suite's afterAll
+ * so Jest doesn't warn about open handles / leaked connections.
+ */
+export async function closeDb(): Promise<void> {
+  await prisma.$disconnect();
+}
+
 export { prisma };

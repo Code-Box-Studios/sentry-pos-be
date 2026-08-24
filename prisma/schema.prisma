@@ -249,6 +249,7 @@ model Branch {
   stockMovements StockMovement[]
   shifts        Shift[]
   stockCounts   StockCount[]
+  sales         Sale[]
 
   @@unique([businessId, code])
   @@map("branches")
@@ -595,6 +596,7 @@ model Sale {
   draft           Json
 
   // relations
+  branch          Branch      @relation(fields: [branchId], references: [id])
   terminal        Terminal    @relation(fields: [terminalId], references: [id])
   shift           Shift?      @relation(fields: [shiftId], references: [id])
   discount_rel    Discount?   @relation(fields: [discountId], references: [id])
