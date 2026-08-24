@@ -145,6 +145,25 @@ describe('PortalAuthGuard', () => {
     });
   });
 
+  it('fails closed when the owner row is missing (dangling ownerId)', async () => {
+    // user.ownerId is set but no owner row exists → must be denied, never granted.
+    const guard = guardWithUser(
+      { id: 'u1', ownerId: 'o-missing', deletedAt: null },
+      null,
+    );
+    const token = sign({
+      sub: 'u1',
+      role: 'owner',
+      ownerId: 'o-missing',
+      sid: 's1',
+    });
+    await runInCtx(async () => {
+      await expect(
+        guard.canActivate(ctxWith({ authorization: `Bearer ${token}` })),
+      ).rejects.toBeInstanceOf(OwnerSuspendedError);
+    });
+  });
+
   it('accepts a live owner and stamps tenant context', async () => {
     const guard = guardWithUser(
       { id: 'u1', ownerId: 'o1', deletedAt: null },

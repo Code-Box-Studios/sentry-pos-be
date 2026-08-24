@@ -23,6 +23,22 @@ const SUSPENDED_STATUSES: ReadonlySet<OwnerStatus> = new Set<OwnerStatus>([
   OwnerStatus.closed,
 ]);
 
+/**
+ * Constant-work decoy hash for timing-attack resistance.
+ *
+ * A real user with a set password runs a full argon2 verify on every wrong
+ * password. The unknown-email and null-`passwordHash` (pre-activation) branches
+ * have no hash to verify against, so returning early there would make those
+ * responses measurably faster — a timing side channel that reveals whether an
+ * email exists / is activated. We instead run an argon2 verify against this
+ * fixed decoy hash on those branches so all three failure paths perform
+ * equivalent crypto before returning `login_invalid`. The decoy is a precomputed
+ * argon2id hash of a random string (matching `hashSecret`'s params); it never
+ * matches any real password.
+ */
+const DECOY_HASH =
+  '$argon2id$v=19$m=65536,p=4,t=3$oC3OkBIibBISXXAxDB2G5w$bn2Bi+j0YAUYmt3P6ODBbpWhBhrhH/5mAubxROX/ZWM';
+
 export type LoginResult =
   | { accessToken: string; refreshToken: string; role: 'owner' }
   | { totpRequired: true; preAuthToken: string }
@@ -60,7 +76,10 @@ export class AuthService {
     // Unknown email: fail like a wrong password, but there is no user row to
     // track lockout against, so we simply return the invalid error. This keeps
     // the response indistinguishable in shape from a genuine wrong password.
+    // Run a constant-work decoy verify first so this path spends the same argon2
+    // time as a known-user wrong password (no timing enumeration of accounts).
     if (!user) {
+      await verifySecret(DECOY_HASH, password);
       throw new LoginInvalidError(3);
     }
 
@@ -68,11 +87,13 @@ export class AuthService {
     this.lockout.assertNotLocked(user, 'login');
 
     // A pre-activation user (passwordHash === null) MUST fail exactly like a
-    // wrong password — never reveal that the account is not yet activated.
+    // wrong password — never reveal that the account is not yet activated. Verify
+    // against the decoy hash so the null-hash path does the same argon2 work as a
+    // real wrong-password attempt (constant-work; the decoy never matches).
     const valid =
       user.passwordHash != null
         ? await verifySecret(user.passwordHash, password)
-        : false;
+        : await verifySecret(DECOY_HASH, password).then(() => false);
 
     if (!valid) {
       // Audit the failure BEFORE recordFailure (which throws login_invalid).

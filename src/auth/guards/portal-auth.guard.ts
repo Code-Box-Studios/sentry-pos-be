@@ -47,7 +47,9 @@ export class PortalAuthGuard extends AuthGuard('jwt') {
       const owner = await this.raw.owner.findUnique({
         where: { id: user.ownerId },
       });
-      if (owner && SUSPENDED_STATUSES.has(owner.status)) {
+      // Fail closed: deny if the owner row is missing OR suspended. A dangling
+      // ownerId (owner deleted/absent) must never grant portal access.
+      if (!owner || SUSPENDED_STATUSES.has(owner.status)) {
         throw new OwnerSuspendedError();
       }
     }
