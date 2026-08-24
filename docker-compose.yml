@@ -1,7 +1,7 @@
 services:
   db:
     image: postgres:16-alpine
-    ports: ["54329:5432"]
+    ports: ["54400:5432"]
     environment:
       POSTGRES_USER: sentry
       POSTGRES_PASSWORD: sentry

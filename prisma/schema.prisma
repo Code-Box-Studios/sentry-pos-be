@@ -1,0 +1,684 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum OwnerStatus {
+  active
+  suspended
+  hard_suspended
+  closed
+}
+
+enum UserRole {
+  platform_admin
+  owner
+}
+
+enum BusinessType {
+  retail
+  fnb
+  mixed
+}
+
+enum SoldBy {
+  unit
+  weight
+}
+
+enum DiscountKind {
+  percent
+  fixed
+}
+
+enum DiscountAppliesTo {
+  line
+  order
+  both
+}
+
+enum MovementType {
+  sale
+  void
+  refund
+  adjustment
+  receive
+  transfer_out
+  transfer_in
+}
+
+enum ReasonCategory {
+  damage
+  expiry
+  theft_loss
+  count_correction
+  other
+}
+
+enum CashMovementType {
+  cash_in  @map("in")
+  cash_out @map("out")
+}
+
+enum CountStatus {
+  draft
+  posted
+}
+
+enum OrderType {
+  dine_in
+  takeout
+  none
+}
+
+enum SaleStatus {
+  completed
+  voided
+  refunded
+}
+
+enum PaymentMethod {
+  cash
+  card
+  gcash
+  maya
+  other
+}
+
+enum RecipientType {
+  user
+  staff
+}
+
+enum NotificationType {
+  low_stock
+  shift_unclosed
+  expiring_soon
+}
+
+enum ActorType {
+  owner
+  terminal
+  platform_admin
+}
+
+enum AuthTokenKind {
+  invite
+  reset
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+model Owner {
+  id          String      @id @default(uuid()) @db.Uuid
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+  deletedAt   DateTime?   @map("deleted_at")
+
+  name        String
+  email       String      @unique
+  status      OwnerStatus @default(active)
+  maxBusinesses Int       @default(1) @map("max_businesses")
+  suspendedAt DateTime?   @map("suspended_at")
+
+  // relations
+  users       User[]
+  businesses  Business[]
+
+  @@map("owners")
+}
+
+model User {
+  id                 String    @id @default(uuid()) @db.Uuid
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+  deletedAt          DateTime? @map("deleted_at")
+
+  email              String    @unique
+  passwordHash       String?   @map("password_hash")
+  role               UserRole
+  ownerId            String?   @db.Uuid @map("owner_id")
+  pinHash            String?   @map("pin_hash")
+  totpSecret         String?   @map("totp_secret")
+  totpRecoveryCodes  String[]  @map("totp_recovery_codes")
+  failedLoginCount   Int       @default(0) @map("failed_login_count")
+  loginLockedUntil   DateTime? @map("login_locked_until")
+  failedPinCount     Int       @default(0) @map("failed_pin_count")
+  pinLockedUntil     DateTime? @map("pin_locked_until")
+
+  // relations
+  owner        Owner?        @relation(fields: [ownerId], references: [id])
+  authTokens   AuthToken[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+model AuthToken {
+  id        String        @id @default(uuid()) @db.Uuid
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+  deletedAt DateTime?     @map("deleted_at")
+
+  kind      AuthTokenKind
+  tokenHash String        @unique @map("token_hash")
+  userId    String        @db.Uuid @map("user_id")
+  expiresAt DateTime      @map("expires_at")
+  usedAt    DateTime?     @map("used_at")
+
+  // relations
+  user      User          @relation(fields: [userId], references: [id])
+
+  @@map("auth_tokens")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tokenHash String    @unique @map("token_hash")
+  userId    String    @db.Uuid @map("user_id")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+
+  // relations
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@map("refresh_tokens")
+}
+
+model Business {
+  id                String       @id @default(uuid()) @db.Uuid
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+  deletedAt         DateTime?    @map("deleted_at")
+
+  ownerId           String       @db.Uuid @map("owner_id")
+  name              String
+  type              BusinessType
+  currency          String       @default("PHP")
+  taxRate           Decimal      @db.Decimal(5, 4) @map("tax_rate")
+  serviceChargeRate Decimal      @db.Decimal(5, 4) @default(0) @map("service_charge_rate")
+  allowMiscItems    Boolean      @default(true) @map("allow_misc_items")
+  isDemo            Boolean      @default(false) @map("is_demo")
+  dayStartTime      String       @default("00:00") @map("day_start_time")
+  expiryWarningDays Int          @default(7) @map("expiry_warning_days")
+  logoPath          String?      @map("logo_path")
+  receiptHeader     String       @default("") @map("receipt_header")
+  receiptFooter     String       @default("") @map("receipt_footer")
+
+  // relations
+  owner             Owner        @relation(fields: [ownerId], references: [id])
+  branches          Branch[]
+  categories        Category[]
+  products          Product[]
+  modifierGroups    ModifierGroup[]
+  discounts         Discount[]
+
+  @@map("businesses")
+}
+
+model Branch {
+  id         String    @id @default(uuid()) @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  businessId String    @db.Uuid @map("business_id")
+  name       String
+  code       String
+  address    String
+
+  // relations
+  business      Business        @relation(fields: [businessId], references: [id])
+  terminals     Terminal[]
+  branchStocks  BranchStock[]
+  stockMovements StockMovement[]
+  shifts        Shift[]
+  stockCounts   StockCount[]
+
+  @@unique([businessId, code])
+  @@map("branches")
+}
+
+model Terminal {
+  id              String    @id @default(uuid()) @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  branchId        String    @db.Uuid @map("branch_id")
+  name            String
+  code            String
+  deviceTokenHash String?   @map("device_token_hash")
+  receiptSeq      Int       @default(1) @map("receipt_seq")
+  lastSeenAt      DateTime? @map("last_seen_at")
+
+  // relations
+  branch          Branch    @relation(fields: [branchId], references: [id])
+  shifts          Shift[]
+  sales           Sale[]
+
+  @@unique([branchId, code])
+  @@map("terminals")
+}
+
+model Category {
+  id         String    @id @default(uuid()) @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  businessId String    @db.Uuid @map("business_id")
+  name       String
+  sortOrder  Int       @default(0) @map("sort_order")
+
+  // relations
+  business   Business  @relation(fields: [businessId], references: [id])
+  products   Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id                  String    @id @default(uuid()) @db.Uuid
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+  deletedAt           DateTime? @map("deleted_at")
+
+  businessId          String    @db.Uuid @map("business_id")
+  categoryId          String    @db.Uuid @map("category_id")
+  name                String
+  sku                 String?
+  barcode             String?
+  price               Int
+  cost                Int?
+  soldBy              SoldBy    @default(unit) @map("sold_by")
+  lowStockThreshold   Decimal?  @db.Decimal(10, 3) @map("low_stock_threshold")
+  imagePath           String?   @map("image_path")
+  trackStock          Boolean   @default(true) @map("track_stock")
+  trackExpiry         Boolean   @default(false) @map("track_expiry")
+  active              Boolean   @default(true)
+
+  // relations
+  business            Business          @relation(fields: [businessId], references: [id])
+  category            Category          @relation(fields: [categoryId], references: [id])
+  variants            ProductVariant[]
+  productModifierGroups ProductModifierGroup[]
+  branchStocks        BranchStock[]
+  stockMovements      StockMovement[]
+  stockBatches        StockBatch[]
+  stockCountItems     StockCountItem[]
+
+  @@map("products")
+}
+
+model ProductVariant {
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  productId String    @db.Uuid @map("product_id")
+  name      String
+  sku       String?
+  barcode   String?
+  price     Int
+  cost      Int?
+
+  // relations
+  product       Product         @relation(fields: [productId], references: [id])
+  branchStocks  BranchStock[]
+  stockMovements StockMovement[]
+  stockBatches  StockBatch[]
+  stockCountItems StockCountItem[]
+
+  @@unique([productId, sku])
+  @@unique([productId, barcode])
+  @@map("product_variants")
+}
+
+model ModifierGroup {
+  id         String    @id @default(uuid()) @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  businessId String    @db.Uuid @map("business_id")
+  name       String
+  minSelect  Int       @default(0) @map("min_select")
+  maxSelect  Int       @default(1) @map("max_select")
+
+  // relations
+  business   Business  @relation(fields: [businessId], references: [id])
+  modifiers  Modifier[]
+  productModifierGroups ProductModifierGroup[]
+
+  @@map("modifier_groups")
+}
+
+model Modifier {
+  id         String        @id @default(uuid()) @db.Uuid
+  createdAt  DateTime      @default(now()) @map("created_at")
+  updatedAt  DateTime      @updatedAt @map("updated_at")
+  deletedAt  DateTime?     @map("deleted_at")
+
+  groupId    String        @db.Uuid @map("group_id")
+  name       String
+  priceDelta Int           @default(0) @map("price_delta")
+
+  // relations
+  group      ModifierGroup @relation(fields: [groupId], references: [id])
+
+  @@map("modifiers")
+}
+
+model ProductModifierGroup {
+  id        String        @id @default(uuid()) @db.Uuid
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+  deletedAt DateTime?     @map("deleted_at")
+
+  productId String        @db.Uuid @map("product_id")
+  groupId   String        @db.Uuid @map("group_id")
+
+  // relations
+  product   Product       @relation(fields: [productId], references: [id])
+  group     ModifierGroup @relation(fields: [groupId], references: [id])
+
+  @@unique([productId, groupId])
+  @@map("product_modifier_groups")
+}
+
+model Discount {
+  id         String            @id @default(uuid()) @db.Uuid
+  createdAt  DateTime          @default(now()) @map("created_at")
+  updatedAt  DateTime          @updatedAt @map("updated_at")
+  deletedAt  DateTime?         @map("deleted_at")
+
+  businessId String            @db.Uuid @map("business_id")
+  name       String
+  kind       DiscountKind
+  value      Int
+  appliesTo  DiscountAppliesTo @map("applies_to")
+  active     Boolean           @default(true)
+
+  // relations
+  business   Business          @relation(fields: [businessId], references: [id])
+  sales      Sale[]
+  saleItems  SaleItem[]
+
+  @@map("discounts")
+}
+
+model BranchStock {
+  id        String          @id @default(uuid()) @db.Uuid
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+  deletedAt DateTime?       @map("deleted_at")
+
+  branchId  String          @db.Uuid @map("branch_id")
+  productId String          @db.Uuid @map("product_id")
+  variantId String?         @db.Uuid @map("variant_id")
+  qty       Decimal         @db.Decimal(10, 3) @default(0)
+
+  // relations
+  branch    Branch          @relation(fields: [branchId], references: [id])
+  product   Product         @relation(fields: [productId], references: [id])
+  variant   ProductVariant? @relation(fields: [variantId], references: [id])
+
+  @@map("branch_stock")
+}
+
+model StockMovement {
+  id             String          @id @default(uuid()) @db.Uuid
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+  deletedAt      DateTime?       @map("deleted_at")
+
+  branchId       String          @db.Uuid @map("branch_id")
+  productId      String          @db.Uuid @map("product_id")
+  variantId      String?         @db.Uuid @map("variant_id")
+  type           MovementType
+  refId          String          @db.Uuid @map("ref_id")
+  transferId     String?         @db.Uuid @map("transfer_id")
+  qtyDelta       Decimal         @db.Decimal(10, 3) @map("qty_delta")
+  reasonCategory ReasonCategory? @map("reason_category")
+  unitCost       Int?            @map("unit_cost")
+  note           String?
+
+  // relations
+  branch         Branch          @relation(fields: [branchId], references: [id])
+  product        Product         @relation(fields: [productId], references: [id])
+  variant        ProductVariant? @relation(fields: [variantId], references: [id])
+
+  @@map("stock_movements")
+}
+
+model Shift {
+  id           String    @id @default(uuid()) @db.Uuid
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  branchId     String    @db.Uuid @map("branch_id")
+  terminalId   String    @db.Uuid @map("terminal_id")
+  openedAt     DateTime  @map("opened_at")
+  closedAt     DateTime? @map("closed_at")
+  openingCash  Int       @map("opening_cash")
+  closingCash  Int?      @map("closing_cash")
+  expectedCash Int?      @map("expected_cash")
+
+  // relations
+  branch        Branch             @relation(fields: [branchId], references: [id])
+  terminal      Terminal           @relation(fields: [terminalId], references: [id])
+  cashMovements ShiftCashMovement[]
+  sales         Sale[]
+
+  @@map("shifts")
+}
+
+model ShiftCashMovement {
+  id        String           @id @default(uuid()) @db.Uuid
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+  deletedAt DateTime?        @map("deleted_at")
+
+  shiftId   String           @db.Uuid @map("shift_id")
+  type      CashMovementType
+  amount    Int
+  reason    String
+
+  // relations
+  shift     Shift            @relation(fields: [shiftId], references: [id])
+
+  @@map("shift_cash_movements")
+}
+
+model StockCount {
+  id         String      @id @default(uuid()) @db.Uuid
+  createdAt  DateTime    @default(now()) @map("created_at")
+  updatedAt  DateTime    @updatedAt @map("updated_at")
+  deletedAt  DateTime?   @map("deleted_at")
+
+  branchId   String      @db.Uuid @map("branch_id")
+  status     CountStatus @default(draft)
+  postedAt   DateTime?   @map("posted_at")
+
+  // relations
+  branch     Branch          @relation(fields: [branchId], references: [id])
+  items      StockCountItem[]
+
+  @@map("stock_counts")
+}
+
+model StockCountItem {
+  id           String         @id @default(uuid()) @db.Uuid
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+  deletedAt    DateTime?      @map("deleted_at")
+
+  stockCountId String         @db.Uuid @map("stock_count_id")
+  productId    String         @db.Uuid @map("product_id")
+  variantId    String?        @db.Uuid @map("variant_id")
+  expectedQty  Decimal        @db.Decimal(10, 3) @map("expected_qty")
+  countedQty   Decimal        @db.Decimal(10, 3) @map("counted_qty")
+
+  // relations
+  stockCount   StockCount     @relation(fields: [stockCountId], references: [id])
+  product      Product        @relation(fields: [productId], references: [id])
+  variant      ProductVariant? @relation(fields: [variantId], references: [id])
+
+  @@map("stock_count_items")
+}
+
+model StockBatch {
+  id          String         @id @default(uuid()) @db.Uuid
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+  deletedAt   DateTime?      @map("deleted_at")
+
+  productId   String         @db.Uuid @map("product_id")
+  variantId   String?        @db.Uuid @map("variant_id")
+  qty         Decimal        @db.Decimal(10, 3)
+  expiresAt   DateTime?      @map("expires_at")
+  receivedAt  DateTime       @map("received_at")
+  unitCost    Int?           @map("unit_cost")
+
+  // relations
+  product     Product        @relation(fields: [productId], references: [id])
+  variant     ProductVariant? @relation(fields: [variantId], references: [id])
+
+  @@map("stock_batches")
+}
+
+model Sale {
+  id              String     @id @default(uuid()) @db.Uuid
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+  deletedAt       DateTime?  @map("deleted_at")
+
+  branchId        String     @db.Uuid @map("branch_id")
+  terminalId      String     @db.Uuid @map("terminal_id")
+  shiftId         String?    @db.Uuid @map("shift_id")
+  receiptNo       String     @map("receipt_no")
+  orderType       OrderType  @map("order_type")
+  status          SaleStatus
+  statusReason    String?    @map("status_reason")
+  subtotal        Int
+  discount        Int        @default(0)
+  discountId      String?    @db.Uuid @map("discount_id")
+  serviceCharge   Int        @default(0) @map("service_charge")
+  scPwd           Json?      @map("sc_pwd")
+  scPwdDiscount   Int        @default(0) @map("sc_pwd_discount")
+  vatExemptSales  Int        @default(0) @map("vat_exempt_sales")
+  tax             Int
+  total           Int
+  createdAtDevice DateTime   @map("created_at_device")
+  syncedAt        DateTime?  @map("synced_at")
+  voidedAt        DateTime?  @map("voided_at")
+  refundedAt      DateTime?  @map("refunded_at")
+  refundShiftId   String?    @db.Uuid @map("refund_shift_id")
+  draft           Json
+
+  // relations
+  terminal        Terminal    @relation(fields: [terminalId], references: [id])
+  shift           Shift?      @relation(fields: [shiftId], references: [id])
+  discount_rel    Discount?   @relation(fields: [discountId], references: [id])
+  items           SaleItem[]
+  payments        SalePayment[]
+
+  @@unique([terminalId, receiptNo])
+  @@map("sales")
+}
+
+model SaleItem {
+  id            String         @id @default(uuid()) @db.Uuid
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  deletedAt     DateTime?      @map("deleted_at")
+
+  saleId        String         @db.Uuid @map("sale_id")
+  productId     String?        @db.Uuid @map("product_id")
+  variantId     String?        @db.Uuid @map("variant_id")
+  nameSnapshot  String         @map("name_snapshot")
+  qty           Decimal        @db.Decimal(10, 3)
+  unitPrice     Int            @map("unit_price")
+  costSnapshot  Int?           @map("cost_snapshot")
+  discount      Int            @default(0)
+  discountId    String?        @db.Uuid @map("discount_id")
+  modifiers     Json
+
+  // relations
+  sale          Sale           @relation(fields: [saleId], references: [id])
+  discount_rel  Discount?      @relation(fields: [discountId], references: [id])
+
+  @@map("sale_items")
+}
+
+model SalePayment {
+  id        String        @id @default(uuid()) @db.Uuid
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+  deletedAt DateTime?     @map("deleted_at")
+
+  saleId    String        @db.Uuid @map("sale_id")
+  method    PaymentMethod
+  reference String?
+  amount    Int
+  tendered  Int
+  change    Int
+
+  // relations
+  sale      Sale          @relation(fields: [saleId], references: [id])
+
+  @@map("sale_payments")
+}
+
+model Notification {
+  id             String           @id @default(uuid()) @db.Uuid
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+  deletedAt      DateTime?        @map("deleted_at")
+
+  recipientType  RecipientType    @map("recipient_type")
+  recipientId    String           @db.Uuid @map("recipient_id")
+  type           NotificationType
+  payload        Json
+  readAt         DateTime?        @map("read_at")
+
+  @@map("notifications")
+}
+
+model AuditLog {
+  id          String    @id @default(uuid()) @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  actorType   ActorType @map("actor_type")
+  actorId     String?   @db.Uuid @map("actor_id")
+  ownerId     String?   @db.Uuid @map("owner_id")
+  businessId  String?   @db.Uuid @map("business_id")
+  branchId    String?   @db.Uuid @map("branch_id")
+  action      String
+  entityType  String    @map("entity_type")
+  entityId    String?   @db.Uuid @map("entity_id")
+  changes     Json
+  metadata    Json
+
+  @@map("audit_logs")
+}
