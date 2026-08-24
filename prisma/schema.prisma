@@ -659,7 +659,11 @@ model Notification {
   recipientType  RecipientType    @map("recipient_type")
   recipientId    String           @db.Uuid @map("recipient_id")
   type           NotificationType
-  payload        Json
+  title          String
+  body           String
+  businessId     String?          @db.Uuid @map("business_id")
+  branchId       String?          @db.Uuid @map("branch_id")
+  entityId       String?          @db.Uuid @map("entity_id")
   readAt         DateTime?        @map("read_at")
 
   @@map("notifications")

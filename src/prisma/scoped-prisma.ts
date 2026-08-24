@@ -63,7 +63,25 @@ export class TenantScopeError extends Error {
 
 /** modelName(camel) -> (relationFieldName -> targetModelName(camel)). */
 const RELATION_TARGET: Record<string, Record<string, string>> = {};
-/** modelName(camel) -> Set of scalar/relation field names that are soft-deletable relations. */
+
+/**
+ * Foreign keys that BACK A PRISMA RELATION, per model (rule 3 create-policing).
+ *
+ * modelName(camel) -> array of { fkColumn, relationField, target }:
+ *   - `fkColumn`      the scalar FK column in `data` (e.g. "categoryId")
+ *   - `relationField` the relation field a nested `connect` may use (e.g. "category")
+ *   - `target`        the referenced model (camel)
+ *
+ * Only forward/belongs-to relations have `relationFromFields`, so polymorphic id
+ * columns with NO relation field (stockMovement.refId / transferId) are excluded
+ * automatically and never validated as tenant refs.
+ */
+interface FkRef {
+  fkColumn: string;
+  relationField: string;
+  target: string;
+}
+const FK_REFS: Record<string, FkRef[]> = {};
 
 function camel(name: string): string {
   return name.charAt(0).toLowerCase() + name.slice(1);
@@ -72,12 +90,20 @@ function camel(name: string): string {
 for (const model of Prisma.dmmf.datamodel.models) {
   const key = camel(model.name);
   const rels: Record<string, string> = {};
+  const fks: FkRef[] = [];
   for (const field of model.fields) {
     if (field.kind === 'object') {
-      rels[field.name] = camel(field.type);
+      const target = camel(field.type);
+      rels[field.name] = target;
+      const from = field.relationFromFields ?? [];
+      // Single-column belongs-to FKs (all FKs in this schema are single-column).
+      if (from.length === 1) {
+        fks.push({ fkColumn: from[0], relationField: field.name, target });
+      }
     }
   }
   RELATION_TARGET[key] = rels;
+  FK_REFS[key] = fks;
 }
 
 /** Every model in this schema carries `deletedAt` (soft-deletable). */
@@ -181,6 +207,86 @@ async function branchToBusiness(
   const businessId = row?.businessId ?? null;
   map.set(branchId, businessId);
   return businessId;
+}
+
+/**
+ * Camel-cased FK column that points a child-only model at its declared parent
+ * (from the scope map's CHILD_PARENT), derived once from the DMMF.
+ */
+const CHILD_PARENT_FK: Record<string, string> = {};
+for (const [child, parent] of Object.entries(CHILD_PARENT)) {
+  const m = Prisma.dmmf.datamodel.models.find((x) => camel(x.name) === child);
+  const rel = m?.fields.find(
+    (f) =>
+      f.kind === 'object' &&
+      camel(f.type) === parent &&
+      (f.relationFromFields ?? []).length === 1,
+  );
+  if (rel) CHILD_PARENT_FK[child] = rel.relationFromFields![0];
+}
+
+/**
+ * Resolve the owning businessId of a referenced tenant row, walking parent
+ * chains for branch-scoped and child-only models. Returns `null` if the row
+ * does not exist (caller treats that as out-of-scope). Cached per request.
+ * Platform models (owner/user/...) return `undefined` → "not a tenant ref".
+ */
+async function resolveRefBusinessId(
+  base: PrismaService,
+  ctx: RequestContext,
+  model: string,
+  id: string,
+): Promise<string | null | undefined> {
+  if (PLATFORM_MODEL_SET.has(model)) return undefined;
+  const cache = cacheMap(ctx);
+  let map = cache.get('refBusiness') as Map<string, string | null> | undefined;
+  if (!map) {
+    map = new Map();
+    cache.set('refBusiness', map);
+  }
+  const cacheKey = `${model}:${id}`;
+  if (map.has(cacheKey)) return map.get(cacheKey) ?? null;
+
+  let result: string | null = null;
+  const col = TENANT_DIRECT[model];
+
+  if (model === 'business') {
+    const row = await base.business.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    result = row ? row.id : null;
+  } else if (col === 'businessId') {
+    const row = await delegateOf(base, model).findUnique({
+      where: { id },
+      select: { businessId: true },
+    });
+    result = row ? (row as AnyArgs).businessId : null;
+  } else if (col === 'branchId') {
+    const row = await delegateOf(base, model).findUnique({
+      where: { id },
+      select: { branchId: true },
+    });
+    result =
+      row && (row as AnyArgs).branchId != null
+        ? await branchToBusiness(base, ctx, (row as AnyArgs).branchId)
+        : null;
+  } else if (CHILD_PARENT[model]) {
+    const parent = CHILD_PARENT[model];
+    const fk = CHILD_PARENT_FK[model];
+    const row = await delegateOf(base, model).findUnique({
+      where: { id },
+      select: { [fk]: true },
+    });
+    const parentId = row ? (row as AnyArgs)[fk] : null;
+    result =
+      parentId != null
+        ? ((await resolveRefBusinessId(base, ctx, parent, parentId)) ?? null)
+        : null;
+  }
+
+  map.set(cacheKey, result);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -303,11 +409,12 @@ async function policeCreateData(
 ): Promise<AnyArgs> {
   const col = TENANT_DIRECT[model];
   if (!col) return data; // child-only handled elsewhere; nothing to police
-  const out = { ...data };
+  let out = { ...data };
 
   if (col === 'ownerId') {
     // business.create: ownerId forced to context.
     out.ownerId = ctx.ownerId;
+    // business has no tenant FKs to validate beyond ownerId.
     return out;
   }
 
@@ -326,28 +433,86 @@ async function policeCreateData(
         `create on ${model} requires a businessId within the owner's scope`,
       );
     }
-    return out;
+  } else {
+    // branchId-scoped
+    if (ctx.actor?.type === 'terminal') {
+      // Pin to the terminal's branch.
+      out.branchId = ctx.branchId;
+    } else {
+      const branchIds = await allowedBranchIds(base, ctx);
+      if (out.branchId != null) {
+        if (!branchIds.has(out.branchId)) {
+          throw new TenantScopeError(
+            `create on ${model} targets branchId outside the owner's scope`,
+          );
+        }
+      } else {
+        throw new TenantScopeError(
+          `create on ${model} requires a branchId within the owner's scope`,
+        );
+      }
+    }
   }
 
-  // branchId-scoped
-  if (ctx.actor?.type === 'terminal') {
-    // Pin to the terminal's branch.
-    out.branchId = ctx.branchId;
-    return out;
-  }
-  const branchIds = await allowedBranchIds(base, ctx);
-  if (out.branchId != null) {
-    if (!branchIds.has(out.branchId)) {
+  // Rule 3: sibling FKs and nested connects must resolve inside the caller's
+  // scope. This also protects branch-scoped models whose branch was pinned above
+  // (their product/variant/discount refs still get validated).
+  out = await policeCreateRefs(base, ctx, model, out);
+  return out;
+}
+
+/**
+ * Validate every scalar FK (that backs a real tenant relation) and every nested
+ * `connect: { id }` in `data` against the caller's allowed business set.
+ *
+ * SKIPS: null/absent optional FKs (e.g. a misc-line saleItem.productId = null),
+ * platform targets (owner/user — the direct scope column already governs those),
+ * and any id column with no relation field (polymorphic refId/transferId are
+ * absent from FK_REFS entirely, so they are never validated here).
+ */
+async function policeCreateRefs(
+  base: PrismaService,
+  ctx: RequestContext,
+  model: string,
+  data: AnyArgs,
+): Promise<AnyArgs> {
+  const allowed = await allowedBusinessIds(base, ctx);
+  const refs = FK_REFS[model] ?? [];
+
+  const assertInScope = async (target: string, id: string, label: string) => {
+    const bizId = await resolveRefBusinessId(base, ctx, target, id);
+    if (bizId === undefined) return; // platform target — not a tenant ref
+    if (bizId === null || !allowed.has(bizId)) {
       throw new TenantScopeError(
-        `create on ${model} targets branchId outside the owner's scope`,
+        `create on ${model} references ${label} outside the owner's scope`,
       );
     }
-  } else {
-    throw new TenantScopeError(
-      `create on ${model} requires a branchId within the owner's scope`,
-    );
+  };
+
+  for (const ref of refs) {
+    // Scalar FK column present in data (non-null).
+    const scalar = data[ref.fkColumn];
+    if (scalar != null && typeof scalar === 'string') {
+      // Skip the model's OWN direct scope column — already validated above.
+      if (ref.fkColumn === TENANT_DIRECT[model]) continue;
+      await assertInScope(ref.target, scalar, ref.fkColumn);
+    }
+
+    // Nested relation write: { connect: { id } } (or array of connects).
+    const relWrite = data[ref.relationField];
+    if (relWrite && typeof relWrite === 'object' && 'connect' in relWrite) {
+      const connects = Array.isArray(relWrite.connect)
+        ? relWrite.connect
+        : [relWrite.connect];
+      for (const c of connects) {
+        if (c && typeof c === 'object' && typeof c.id === 'string') {
+          await assertInScope(ref.target, c.id, ref.relationField);
+        }
+      }
+    }
   }
-  return out;
+
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +654,6 @@ async function stampScope(
   model: string,
   entity: AnyArgs | undefined,
 ): Promise<{ businessId: string | null; branchId: string | null }> {
-  const col = TENANT_DIRECT[model];
   let businessId: string | null = ctx.businessId ?? null;
   let branchId: string | null = ctx.branchId ?? null;
 
@@ -512,10 +676,6 @@ async function stampScope(
     businessId = await branchToBusiness(base, ctx, branchId);
   }
 
-  // For businessId-scoped child captures whose entity lacks businessId but has a
-  // parent chain, we still fall back to context. (Handled by callers pre-reading
-  // the parent where needed.)
-  void col;
   return { businessId, branchId };
 }
 
@@ -764,9 +924,11 @@ async function runMutation(
 
   // ---- upsert ----
   if (operation === 'upsert') {
-    // Determine whether the target row (within scope) exists.
+    // Determine whether a LIVE target row (within scope) exists. A soft-deleted
+    // in-scope row must NOT be treated as existing (that would resurrect it via
+    // the update branch), so exclude deletedAt — consistent with delete/update.
     const existing = await delegateOf(base, delegate).findFirst({
-      where: { AND: [args.where, scopeWhere] },
+      where: { AND: [args.where, scopeWhere, { deletedAt: null }] },
     });
     if (existing) {
       // update branch — police nothing beyond scope; scope pins via where.

@@ -8,6 +8,7 @@
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-call */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
+import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
 import { resetDb, closeDb } from './helpers/db';
 import { PrismaService } from '../src/prisma/prisma.service';
@@ -61,11 +62,13 @@ function terminalCtx(
   ownerId: string,
   businessId: string,
   branchId: string,
+  terminalId?: string,
   patch: Partial<RequestContext> = {},
 ) {
   return baseCtx({
     scope: 'tenant',
-    actor: { type: 'terminal', id: 'term-' + branchId },
+    // actorId is a UUID column — use the real terminal id (or a valid uuid).
+    actor: { type: 'terminal', id: terminalId ?? randomUUID() },
     ownerId,
     businessId,
     branchId,
@@ -244,7 +247,7 @@ describe('Tenancy + audit choke-point extension (e2e)', () => {
     });
 
     const rows = await runAs(
-      terminalCtx(a.owner.id, a.business.id, a.branch.id),
+      terminalCtx(a.owner.id, a.business.id, a.branch.id, a.terminal.id),
       () => scoped.sale.findMany(),
     );
     expect(rows.map((r) => r.id)).toEqual([saleA.id]);
@@ -521,6 +524,131 @@ describe('Tenancy + audit choke-point extension (e2e)', () => {
   });
 
   // =========================================================================
+  // Rule 3: sibling FK + nested connect create-policing (cross-link defense)
+  // =========================================================================
+
+  it('owner A product.create with own businessId but owner B categoryId throws (sibling FK)', async () => {
+    const a = await seedOwnerTree('A');
+    const b = await seedOwnerTree('B');
+
+    await runAs(ownerCtx(a.owner.id), async () => {
+      await expect(
+        scoped.product.create({
+          data: {
+            businessId: a.business.id, // A's own business (passes direct-scope)
+            categoryId: b.category.id, // but B's category — must be rejected
+            name: 'CrossLink',
+            price: 500,
+          },
+        }),
+      ).rejects.toThrow(/scope/i);
+    });
+
+    const leaked = await raw.product.findMany({ where: { name: 'CrossLink' } });
+    expect(leaked).toHaveLength(0);
+  });
+
+  it('owner A product.create with nested connect to owner B category throws', async () => {
+    const a = await seedOwnerTree('A');
+    const b = await seedOwnerTree('B');
+
+    await runAs(ownerCtx(a.owner.id), async () => {
+      await expect(
+        scoped.product.create({
+          data: {
+            name: 'NestedConnect',
+            price: 500,
+            business: { connect: { id: a.business.id } },
+            category: { connect: { id: b.category.id } }, // B's category
+          },
+        }),
+      ).rejects.toThrow(/scope/i);
+    });
+
+    const leaked = await raw.product.findMany({
+      where: { name: 'NestedConnect' },
+    });
+    expect(leaked).toHaveLength(0);
+  });
+
+  it('owner A branchStock.create referencing owner B product throws', async () => {
+    const a = await seedOwnerTree('A');
+    const b = await seedOwnerTree('B');
+
+    await runAs(ownerCtx(a.owner.id), async () => {
+      await expect(
+        scoped.branchStock.create({
+          data: {
+            branchId: a.branch.id, // A's own branch
+            productId: b.product.id, // but B's product — reject
+            qty: 5,
+          },
+        }),
+      ).rejects.toThrow(/scope/i);
+    });
+
+    const leaked = await raw.branchStock.findMany({
+      where: { productId: b.product.id },
+    });
+    expect(leaked).toHaveLength(0);
+  });
+
+  it('REGRESSION: create with a null optional FK is NOT rejected (misc-line style)', async () => {
+    const a = await seedOwnerTree('A');
+
+    // (a) top-level: branchStock.variantId is an optional FK backing a relation —
+    // passing null must succeed (not be treated as an out-of-scope ref).
+    const created = await runAs(ownerCtx(a.owner.id), () =>
+      scoped.branchStock.create({
+        data: {
+          branchId: a.branch.id,
+          productId: a.product.id,
+          variantId: null, // legitimate absence — must not throw
+          qty: 7,
+        },
+      }),
+    );
+    expect(created.id).toBeDefined();
+    expect(created.variantId).toBeNull();
+
+    // (b) nested: a misc-line saleItem with productId = null inside a sale create
+    // must also succeed (the canonical §-example the policing must not break).
+    const sale = await runAs(
+      terminalCtx(a.owner.id, a.business.id, a.branch.id, a.terminal.id),
+      () =>
+        scoped.sale.create({
+          data: {
+            branchId: a.branch.id,
+            terminalId: a.terminal.id,
+            receiptNo: 'R-MISC-1',
+            orderType: 'none',
+            status: 'completed',
+            subtotal: 100,
+            tax: 12,
+            total: 112,
+            createdAtDevice: new Date(),
+            draft: {},
+            items: {
+              create: [
+                {
+                  productId: null, // misc line — no product
+                  nameSnapshot: 'Misc item',
+                  qty: 1,
+                  unitPrice: 100,
+                  modifiers: {},
+                },
+              ],
+            },
+          },
+        }),
+    );
+    expect(sale.id).toBeDefined();
+    const items = await raw.saleItem.findMany({ where: { saleId: sale.id } });
+    expect(items).toHaveLength(1);
+    expect(items[0].productId).toBeNull();
+  });
+
+  // =========================================================================
   // Owner context on branch-scoped models
   // =========================================================================
 
@@ -711,5 +839,50 @@ describe('Tenancy + audit choke-point extension (e2e)', () => {
     expect(ids).toContain(authRow.id);
     expect(ids).toContain(bizRow.id);
     expect(rows.every((r) => r.actorType !== 'platform_admin')).toBe(true);
+  });
+
+  // =========================================================================
+  // Notification (spec §6) — businessId scoping via the scoped client
+  // =========================================================================
+
+  it('notification create + read scope by businessId (A cannot see B notifications)', async () => {
+    const a = await seedOwnerTree('A');
+    const b = await seedOwnerTree('B');
+
+    // Owner A creates a notification (scoped businessId forced/validated to A).
+    const created = await runAs(ownerCtx(a.owner.id), () =>
+      scoped.notification.create({
+        data: {
+          businessId: a.business.id,
+          recipientType: 'user',
+          recipientId: a.owner.id,
+          type: 'low_stock',
+          title: 'Low stock',
+          body: 'Product running low',
+        },
+      }),
+    );
+    expect(created.id).toBeDefined();
+    expect(created.businessId).toBe(a.business.id);
+
+    // Seed a notification under owner B directly.
+    const bNotif = await raw.notification.create({
+      data: {
+        businessId: b.business.id,
+        recipientType: 'user',
+        recipientId: b.owner.id,
+        type: 'low_stock',
+        title: 'B low stock',
+        body: 'B product low',
+      },
+    });
+
+    // Owner A's scoped read sees only A's notification.
+    const rows = await runAs(ownerCtx(a.owner.id), () =>
+      scoped.notification.findMany(),
+    );
+    const ids = rows.map((r) => r.id);
+    expect(ids).toContain(created.id);
+    expect(ids).not.toContain(bNotif.id);
   });
 });
