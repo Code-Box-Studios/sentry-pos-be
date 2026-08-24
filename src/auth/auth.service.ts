@@ -1,0 +1,235 @@
+import { Injectable } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
+import { createHash, randomBytes } from 'crypto';
+import { OwnerStatus } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { LockoutService } from '../common/lockout/lockout.service';
+import { AuditService } from './audit.service';
+import { verifySecret } from './hashing';
+import {
+  LoginInvalidError,
+  UnauthorizedError,
+  OwnerSuspendedError,
+} from '../common/errors/api-errors';
+
+const ACCESS_TTL = '15m';
+const PREAUTH_TTL = '5m';
+const REFRESH_TTL_DAYS = 30;
+
+const SUSPENDED_STATUSES: ReadonlySet<OwnerStatus> = new Set<OwnerStatus>([
+  OwnerStatus.suspended,
+  OwnerStatus.hard_suspended,
+  OwnerStatus.closed,
+]);
+
+export type LoginResult =
+  | { accessToken: string; refreshToken: string; role: 'owner' }
+  | { totpRequired: true; preAuthToken: string }
+  | { totpSetupRequired: true; preAuthToken: string };
+
+function sha256(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function generateRefreshToken(): string {
+  return randomBytes(32).toString('hex');
+}
+
+@Injectable()
+export class AuthService {
+  private readonly accessSecret: string;
+
+  constructor(
+    private readonly raw: PrismaService,
+    private readonly jwt: JwtService,
+    private readonly config: ConfigService,
+    private readonly lockout: LockoutService,
+    private readonly audit: AuditService,
+  ) {
+    this.accessSecret = this.config.getOrThrow<string>('JWT_ACCESS_SECRET');
+  }
+
+  // -------------------------------------------------------------------------
+  // Login
+  // -------------------------------------------------------------------------
+
+  async login(email: string, password: string): Promise<LoginResult> {
+    const user = await this.raw.user.findUnique({ where: { email } });
+
+    // Unknown email: fail like a wrong password, but there is no user row to
+    // track lockout against, so we simply return the invalid error. This keeps
+    // the response indistinguishable in shape from a genuine wrong password.
+    if (!user) {
+      throw new LoginInvalidError(3);
+    }
+
+    // Lockout gate first (cheap DB fields already loaded on `user`).
+    this.lockout.assertNotLocked(user, 'login');
+
+    // A pre-activation user (passwordHash === null) MUST fail exactly like a
+    // wrong password — never reveal that the account is not yet activated.
+    const valid =
+      user.passwordHash != null
+        ? await verifySecret(user.passwordHash, password)
+        : false;
+
+    if (!valid) {
+      // Audit the failure BEFORE recordFailure (which throws login_invalid).
+      await this.audit.logAuth(
+        'auth.login_failed',
+        user.id,
+        user.ownerId ?? null,
+      );
+      await this.lockout.recordFailure(user.id, 'login'); // always throws
+      throw new LoginInvalidError(0); // unreachable; satisfies control flow
+    }
+
+    // Password correct — clear the failure counter.
+    await this.lockout.recordSuccess(user.id, 'login');
+
+    // Owner status gate: suspended/hard_suspended/closed → 403 owner_suspended.
+    if (user.ownerId) {
+      const owner = await this.raw.owner.findUnique({
+        where: { id: user.ownerId },
+      });
+      if (owner && SUSPENDED_STATUSES.has(owner.status)) {
+        // Failed logins for a suspended owner are still audited above only on
+        // wrong password; here the password was right but access is denied.
+        await this.audit.logAuth('auth.login_suspended', user.id, user.ownerId);
+        throw new OwnerSuspendedError();
+      }
+    }
+
+    // Platform admin path: never issue an access token from a password alone —
+    // hand back a 5-minute preauth token that ONLY Task 8's TOTP endpoints
+    // accept. Every access-token guard rejects `kind: "preauth"`.
+    if (user.role === 'platform_admin') {
+      const preAuthToken = this.jwt.sign(
+        { sub: user.id, kind: 'preauth' },
+        { secret: this.accessSecret, expiresIn: PREAUTH_TTL },
+      );
+      await this.audit.logAuth('auth.login_preauth', user.id, null);
+      if (user.totpSecret) {
+        return { totpRequired: true, preAuthToken };
+      }
+      return { totpSetupRequired: true, preAuthToken };
+    }
+
+    // Owner path: mint the access/refresh pair.
+    const { accessToken, refreshToken } = await this.mintTokenPair(
+      user.id,
+      user.role,
+      user.ownerId ?? undefined,
+    );
+    await this.audit.logAuth('auth.login', user.id, user.ownerId ?? null);
+    return { accessToken, refreshToken, role: 'owner' };
+  }
+
+  // -------------------------------------------------------------------------
+  // Refresh — rolling rotation with reuse detection
+  // -------------------------------------------------------------------------
+
+  async refresh(
+    rawToken: string,
+  ): Promise<{ accessToken: string; refreshToken: string }> {
+    const tokenHash = sha256(rawToken);
+    const row = await this.raw.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
+
+    if (!row) {
+      throw new UnauthorizedError('Invalid refresh token.');
+    }
+
+    // Reuse detection: a previously-revoked token was presented again → an
+    // attacker (or a race) is replaying a rotated token. Revoke EVERY active
+    // token for this user and reject.
+    if (row.revokedAt !== null) {
+      await this.raw.refreshToken.updateMany({
+        where: { userId: row.userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      await this.audit.logAuth(
+        'auth.refresh_reuse',
+        row.userId,
+        row.user.ownerId ?? null,
+      );
+      throw new UnauthorizedError('Refresh token reuse detected.');
+    }
+
+    if (row.expiresAt < new Date()) {
+      await this.raw.refreshToken.update({
+        where: { id: row.id },
+        data: { revokedAt: new Date() },
+      });
+      throw new UnauthorizedError('Refresh token has expired.');
+    }
+
+    // Rotate: revoke the presented row, mint a fresh 30-day pair.
+    await this.raw.refreshToken.update({
+      where: { id: row.id },
+      data: { revokedAt: new Date() },
+    });
+
+    const { accessToken, refreshToken } = await this.mintTokenPair(
+      row.user.id,
+      row.user.role,
+      row.user.ownerId ?? undefined,
+    );
+    return { accessToken, refreshToken };
+  }
+
+  // -------------------------------------------------------------------------
+  // Logout — idempotent revoke
+  // -------------------------------------------------------------------------
+
+  async logout(rawToken: string): Promise<void> {
+    const tokenHash = sha256(rawToken);
+    const row = await this.raw.refreshToken.findUnique({
+      where: { tokenHash },
+    });
+    if (!row || row.revokedAt !== null) {
+      return; // unknown or already revoked — succeed silently
+    }
+    await this.raw.refreshToken.update({
+      where: { id: row.id },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Token minting (shared by login + refresh)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Mint an access token whose `sid` is the id of the refresh-token row created
+   * alongside it (§11 session/token id). The raw refresh token is returned to
+   * the caller; only its SHA-256 hash is persisted.
+   */
+  async mintTokenPair(
+    userId: string,
+    role: string,
+    ownerId?: string,
+  ): Promise<{ accessToken: string; refreshToken: string }> {
+    const rawRefresh = generateRefreshToken();
+    const expiresAt = new Date(
+      Date.now() + REFRESH_TTL_DAYS * 24 * 60 * 60 * 1000,
+    );
+
+    const row = await this.raw.refreshToken.create({
+      data: { tokenHash: sha256(rawRefresh), userId, expiresAt },
+    });
+
+    const payload: Record<string, unknown> = { sub: userId, role, sid: row.id };
+    if (ownerId) payload.ownerId = ownerId;
+
+    const accessToken = this.jwt.sign(payload, {
+      secret: this.accessSecret,
+      expiresIn: ACCESS_TTL,
+    });
+
+    return { accessToken, refreshToken: rawRefresh };
+  }
+}

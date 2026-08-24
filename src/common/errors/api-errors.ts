@@ -75,3 +75,57 @@ export class ValidationFailedError extends ApiHttpException {
     super(HttpStatus.UNPROCESSABLE_ENTITY, 'validation', message);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Auth / authorization errors (Task 7)
+// ---------------------------------------------------------------------------
+
+export class UnauthorizedError extends ApiHttpException {
+  constructor(message = 'Authentication is required.') {
+    super(HttpStatus.UNAUTHORIZED, 'unauthorized', message);
+  }
+}
+
+export class ForbiddenError extends ApiHttpException {
+  constructor(message = 'You do not have permission to perform this action.') {
+    super(HttpStatus.FORBIDDEN, 'forbidden', message);
+  }
+}
+
+/**
+ * Portal access is locked whenever the owner is suspended/hard_suspended/closed
+ * (§8). Returned by both login and the PortalAuthGuard.
+ */
+export class OwnerSuspendedError extends ApiHttpException {
+  constructor() {
+    super(
+      HttpStatus.FORBIDDEN,
+      'owner_suspended',
+      'This account is suspended. Contact support.',
+    );
+  }
+}
+
+/**
+ * The tenancy choke point throws a plain `PlatformWriteError` when platform
+ * scope attempts a tenant write. The global filter maps that to this HTTP error
+ * so the response carries the stable `platform_write_forbidden` code and the
+ * denial is audited.
+ */
+export class PlatformWriteForbiddenError extends ApiHttpException {
+  constructor(message = 'Platform scope may not write tenant data.') {
+    super(HttpStatus.FORBIDDEN, 'platform_write_forbidden', message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Domain errors
+// ---------------------------------------------------------------------------
+
+export class StockConflictHttpError extends ApiHttpException {
+  constructor(conflicts: unknown[]) {
+    super(HttpStatus.CONFLICT, 'stock_conflict', 'Stock conflict detected.', {
+      conflicts,
+    });
+  }
+}
