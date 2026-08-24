@@ -151,6 +151,7 @@ model User {
   ownerId            String?   @db.Uuid @map("owner_id")
   pinHash            String?   @map("pin_hash")
   totpSecret         String?   @map("totp_secret")
+  totpPendingSecret  String?   @map("totp_pending_secret")
   totpRecoveryCodes  String[]  @map("totp_recovery_codes")
   failedLoginCount   Int       @default(0) @map("failed_login_count")
   loginLockedUntil   DateTime? @map("login_locked_until")

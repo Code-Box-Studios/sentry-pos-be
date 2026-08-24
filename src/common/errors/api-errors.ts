@@ -67,6 +67,20 @@ export class LoginLockedError extends ApiHttpException {
 }
 
 // ---------------------------------------------------------------------------
+// TOTP errors (Task 8)
+// ---------------------------------------------------------------------------
+
+export class TotpInvalidError extends ApiHttpException {
+  constructor() {
+    super(
+      HttpStatus.UNAUTHORIZED,
+      'totp_invalid',
+      'TOTP code or recovery code is invalid.',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Validation error
 // ---------------------------------------------------------------------------
 
