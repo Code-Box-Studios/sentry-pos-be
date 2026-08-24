@@ -326,12 +326,21 @@ describe('LockoutService (e2e)', () => {
     expect(fresh.pinLockedUntil).toBeNull();
   });
 
-  it('verifyPinWithLockout throws ValidationFailedError when no PIN is set', async () => {
+  it('verifyPinWithLockout throws ValidationFailedError with the exact message when no PIN is set', async () => {
     const { owner } = await seedOwnerAndUser('no-pin'); // pinHash=null
 
-    await expect(
-      lockout.verifyPinWithLockout(owner.id, '1234'),
-    ).rejects.toBeInstanceOf(ValidationFailedError);
+    const err = await lockout
+      .verifyPinWithLockout(owner.id, '1234')
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(ValidationFailedError);
+    // Pin the exact-message contract: a refactor must not silently change it.
+    expect((err as ValidationFailedError).message).toBe(
+      'set the refund PIN in the portal',
+    );
+    const resp = err.getResponse() as { code: string; message: string };
+    expect(resp.code).toBe('validation');
+    expect(resp.message).toBe('set the refund PIN in the portal');
   });
 
   it('verifyPinWithLockout short-circuits at assertNotLocked when locked', async () => {
