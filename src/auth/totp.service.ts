@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { randomBytes } from 'crypto';
-import { generateSecret, generateSync, generateURI, verifySync } from 'otplib';
+import { generateSecret, generateURI, verifySync } from 'otplib';
 import { PrismaService } from '../prisma/prisma.service';
 import { hashSecret, verifySecret } from './hashing';
 import { TotpInvalidError } from '../common/errors/api-errors';
@@ -13,7 +13,14 @@ const ISSUER = 'Sentry POS';
  * TOTP enrollment and verification (Task 8).
  *
  * Uses otplib 13.x functional API (RFC 6238 TOTP, SHA-1 HMAC, 30-second window).
- * Verification uses a ±1 step tolerance (window: 1) to handle minor clock skew.
+ * Verification uses a ±1 step tolerance (epochTolerance 30s) to handle minor
+ * clock skew.
+ *
+ * Replay protection: on every successful TOTP verify, the matched `timeStep` is
+ * persisted in `totpLastTimeStep`. Subsequent verifies pass it to otplib as
+ * `afterTimeStep`, so a code from that step or earlier is rejected — a used code
+ * cannot be replayed within its 30s validity window. A genuine fresh code from a
+ * LATER step still succeeds (higher timeStep), so legitimate next logins work.
  *
  * Recovery codes are random 20-char hex strings stored as argon2id hashes;
  * they are single-use — the matching hash is removed from `totpRecoveryCodes`
@@ -79,14 +86,22 @@ export class TotpService {
       throw new TotpInvalidError();
     }
 
-    // Verify against pending secret with ±1 window
-    const result = verifySync({
-      token: code,
-      secret: user.totpPendingSecret,
-      epochTolerance: 30,
-    });
+    // Verify against pending secret with ±1 window. verifySync throws
+    // TokenLengthError/TokenFormatError for non-6-digit tokens (e.g. a
+    // recovery-code-length string); map any such error to a clean 401 rather
+    // than letting it surface as a 500.
+    let valid = false;
+    try {
+      valid = verifySync({
+        token: code,
+        secret: user.totpPendingSecret,
+        epochTolerance: 30,
+      }).valid;
+    } catch {
+      valid = false;
+    }
 
-    if (!result.valid) {
+    if (!valid) {
       throw new TotpInvalidError();
     }
 
@@ -131,14 +146,32 @@ export class TotpService {
     // verifySync throws TokenLengthError/TokenFormatError for non-6-digit tokens
     // (e.g. recovery codes that are 20 hex chars) — treat any such error as "not a
     // TOTP code" and fall through to recovery code verification.
+    //
+    // Replay protection: pass the last-used timeStep as `afterTimeStep` so a code
+    // from that step or earlier is rejected. The matched timeStep is then
+    // persisted so the SAME code cannot be reused within its 30s window.
     try {
       const totpResult = verifySync({
         token: code,
         secret: user.totpSecret,
         epochTolerance: 30,
+        ...(user.totpLastTimeStep != null
+          ? { afterTimeStep: user.totpLastTimeStep }
+          : {}),
       });
 
       if (totpResult.valid) {
+        // otplib's top-level verifySync return type is a TOTP|HOTP union; the
+        // TOTP success variant carries `timeStep`, the HOTP one does not. We only
+        // ever call the TOTP (default) strategy, so `timeStep` is always present
+        // at runtime — narrow to read it for replay protection.
+        const timeStep = (totpResult as { timeStep: number }).timeStep;
+
+        // Persist the matched timeStep to block replay of this exact code.
+        await this.raw.user.update({
+          where: { id: userId },
+          data: { totpLastTimeStep: timeStep },
+        });
         return; // success — TOTP code matched
       }
     } catch {
@@ -161,13 +194,5 @@ export class TotpService {
     }
 
     throw new TotpInvalidError();
-  }
-
-  /**
-   * Helper used in tests: generate a TOTP code for a given secret.
-   * Delegates to otplib's generateSync functional API.
-   */
-  static generateTokenSync(secret: string): string {
-    return generateSync({ secret });
   }
 }

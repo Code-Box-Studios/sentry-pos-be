@@ -34,6 +34,18 @@ import { resetDb, closeDb } from './helpers/db';
 
 const raw = new PrismaClient();
 
+/**
+ * Local test helper: generate a 6-digit TOTP code for a Base32 secret.
+ * Optionally target a specific Unix epoch (seconds) to produce a code for a
+ * particular 30s time step — used by the replay-protection test to build a
+ * genuine "later step" code.
+ */
+function generateCode(secret: string, epoch?: number): string {
+  return epoch != null
+    ? generateSync({ secret, epoch })
+    : generateSync({ secret });
+}
+
 async function seedAdmin(label: string) {
   const admin = await raw.user.create({
     data: {
@@ -134,7 +146,7 @@ describe('TOTP 2FA (e2e)', () => {
     const secret = setupRes.body.secret as string;
 
     // Generate a valid TOTP code from the returned secret using otplib 13 functional API
-    const code = generateSync({ secret });
+    const code = generateCode(secret);
 
     // Enable: activate with the TOTP code
     const enableRes = await request(server())
@@ -172,7 +184,7 @@ describe('TOTP 2FA (e2e)', () => {
       .set('Authorization', `Bearer ${preAuthToken}`)
       .expect(201);
     const secret = setupRes.body.secret as string;
-    const code = generateSync({ secret });
+    const code = generateCode(secret);
 
     await request(server())
       .post('/v1/auth/totp/enable')
@@ -211,7 +223,7 @@ describe('TOTP 2FA (e2e)', () => {
       .set('Authorization', `Bearer ${preAuthToken1}`)
       .expect(201);
     const secret = setupRes.body.secret as string;
-    const code = generateSync({ secret });
+    const code = generateCode(secret);
 
     await request(server())
       .post('/v1/auth/totp/enable')
@@ -254,7 +266,7 @@ describe('TOTP 2FA (e2e)', () => {
       .set('Authorization', `Bearer ${preAuthToken1}`)
       .expect(201);
     const secret = setupRes.body.secret as string;
-    const enableCode = generateSync({ secret });
+    const enableCode = generateCode(secret);
 
     await request(server())
       .post('/v1/auth/totp/enable')
@@ -270,7 +282,7 @@ describe('TOTP 2FA (e2e)', () => {
     const preAuthToken2 = loginRes2.body.preAuthToken as string;
 
     // Generate fresh code for verify (same second is fine in test env)
-    const verifyCode = generateSync({ secret });
+    const verifyCode = generateCode(secret);
 
     const res = await request(server())
       .post('/v1/auth/totp/verify')
@@ -302,7 +314,7 @@ describe('TOTP 2FA (e2e)', () => {
       .set('Authorization', `Bearer ${preAuthToken1}`)
       .expect(201);
     const secret = setupRes.body.secret as string;
-    const enableCode = generateSync({ secret });
+    const enableCode = generateCode(secret);
 
     const enableRes = await request(server())
       .post('/v1/auth/totp/enable')
@@ -433,5 +445,147 @@ describe('TOTP 2FA (e2e)', () => {
       .expect(401);
 
     expect(res.body.code).toBe('unauthorized');
+  });
+
+  // =========================================================================
+  // 10. Access token presented to /totp/enable → 401 (missing invariant test)
+  // =========================================================================
+
+  it('access token presented to /totp/enable → 401', async () => {
+    // Seed an owner (not admin) to get a real access token
+    const owner = await raw.owner.create({
+      data: {
+        name: 'Test Owner3',
+        email: `owner-enable-probe-${Date.now()}@test.com`,
+        status: 'active',
+      },
+    });
+    const user = await raw.user.create({
+      data: {
+        email: `user-enable-probe-${Date.now()}@test.com`,
+        role: 'owner',
+        ownerId: owner.id,
+        passwordHash: await hashSecret('password123'),
+      },
+    });
+
+    const loginRes = await request(server())
+      .post('/v1/auth/login')
+      .send({ email: user.email, password: 'password123' })
+      .expect(201);
+    const accessToken = loginRes.body.accessToken as string;
+
+    // Access token must be rejected by /totp/enable
+    const res = await request(server())
+      .post('/v1/auth/totp/enable')
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({ code: '123456' })
+      .expect(401);
+
+    expect(res.body.code).toBe('unauthorized');
+  });
+
+  // =========================================================================
+  // 11. Bad-length code to /totp/enable → 401 totp_invalid (not 500)
+  // =========================================================================
+
+  it('bad-length code to /totp/enable → 401 totp_invalid (not 500)', async () => {
+    const { admin } = await seedAdmin('enable-badlen');
+
+    const loginRes = await request(server())
+      .post('/v1/auth/login')
+      .send({ email: admin.email, password: 'adminpass123' })
+      .expect(201);
+    const preAuthToken = loginRes.body.preAuthToken as string;
+
+    // Setup stores a pending secret
+    await request(server())
+      .post('/v1/auth/totp/setup')
+      .set('Authorization', `Bearer ${preAuthToken}`)
+      .expect(201);
+
+    // A recovery-code-length (20 hex chars) string is NOT a 6-digit TOTP code.
+    // otplib's verifySync throws TokenLengthError — the service must map this to
+    // a clean 401 (totp_invalid), never a 500.
+    const res = await request(server())
+      .post('/v1/auth/totp/enable')
+      .set('Authorization', `Bearer ${preAuthToken}`)
+      .send({ code: 'abcdef0123456789abcd' })
+      .expect(401);
+
+    expect(res.body.code).toBe('totp_invalid');
+  });
+
+  // =========================================================================
+  // 12. TOTP replay protection — same code twice fails; later-step code works
+  // =========================================================================
+
+  it('same TOTP code cannot be replayed within its window; a later-step code still succeeds', async () => {
+    const { admin } = await seedAdmin('replay');
+
+    // Enroll
+    const loginRes = await request(server())
+      .post('/v1/auth/login')
+      .send({ email: admin.email, password: 'adminpass123' })
+      .expect(201);
+    const preAuthTokenSetup = loginRes.body.preAuthToken as string;
+
+    const setupRes = await request(server())
+      .post('/v1/auth/totp/setup')
+      .set('Authorization', `Bearer ${preAuthTokenSetup}`)
+      .expect(201);
+    const secret = setupRes.body.secret as string;
+
+    await request(server())
+      .post('/v1/auth/totp/enable')
+      .set('Authorization', `Bearer ${preAuthTokenSetup}`)
+      .send({ code: generateCode(secret) })
+      .expect(201);
+
+    // Build a code for the PREVIOUS 30s step (still inside the ±1 window). Using
+    // the previous step lets a genuine CURRENT-step code succeed afterwards,
+    // proving the window still works for legitimate next logins.
+    const now = Math.floor(Date.now() / 1000);
+    const prevStepCode = generateCode(secret, now - 30);
+
+    // First login + verify with the previous-step code → succeeds, persists its timeStep
+    const login1 = await request(server())
+      .post('/v1/auth/login')
+      .send({ email: admin.email, password: 'adminpass123' })
+      .expect(201);
+    const preAuth1 = login1.body.preAuthToken as string;
+
+    const first = await request(server())
+      .post('/v1/auth/totp/verify')
+      .send({ preAuthToken: preAuth1, code: prevStepCode })
+      .expect(201);
+    expect(first.body.accessToken).toBeDefined();
+
+    // Second login + REPLAY the exact same code → must be rejected (replay)
+    const login2 = await request(server())
+      .post('/v1/auth/login')
+      .send({ email: admin.email, password: 'adminpass123' })
+      .expect(201);
+    const preAuth2 = login2.body.preAuthToken as string;
+
+    const replay = await request(server())
+      .post('/v1/auth/totp/verify')
+      .send({ preAuthToken: preAuth2, code: prevStepCode })
+      .expect(401);
+    expect(replay.body.code).toBe('totp_invalid');
+
+    // Third login + a fresh CURRENT-step code (later step) → must still succeed
+    const login3 = await request(server())
+      .post('/v1/auth/login')
+      .send({ email: admin.email, password: 'adminpass123' })
+      .expect(201);
+    const preAuth3 = login3.body.preAuthToken as string;
+
+    const currentStepCode = generateCode(secret);
+    const later = await request(server())
+      .post('/v1/auth/totp/verify')
+      .send({ preAuthToken: preAuth3, code: currentStepCode })
+      .expect(201);
+    expect(later.body.accessToken).toBeDefined();
   });
 });
