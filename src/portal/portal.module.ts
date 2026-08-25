@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { CatalogModule } from './catalog/catalog.module';
+import { StockModule } from './stock/stock.module';
 import { BusinessesController } from './businesses/businesses.controller';
 import { BusinessesService } from './businesses/businesses.service';
 import { BranchesController } from './branches/branches.controller';
@@ -25,7 +26,7 @@ import { TerminalsService } from './terminals/terminals.service';
  * global `PrismaModule`.
  */
 @Module({
-  imports: [AuthModule, CatalogModule],
+  imports: [AuthModule, CatalogModule, StockModule],
   controllers: [
     BusinessesController,
     BranchesController,
