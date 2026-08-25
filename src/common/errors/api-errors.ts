@@ -106,6 +106,22 @@ export class ForbiddenError extends ApiHttpException {
   }
 }
 
+export class NotFoundError extends ApiHttpException {
+  constructor(message = 'The requested resource was not found.') {
+    super(HttpStatus.NOT_FOUND, 'not_found', message);
+  }
+}
+
+/**
+ * A unique email collided with an existing owner/user row (Prisma P2002). Mapped
+ * from the raw constraint error so the client gets a stable 409 instead of a 500.
+ */
+export class EmailTakenError extends ApiHttpException {
+  constructor(message = 'This email is already in use.') {
+    super(HttpStatus.CONFLICT, 'email_taken', message);
+  }
+}
+
 /**
  * Portal access is locked whenever the owner is suspended/hard_suspended/closed
  * (§8). Returned by both login and the PortalAuthGuard.

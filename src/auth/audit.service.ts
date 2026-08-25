@@ -62,4 +62,58 @@ export class AuditService {
       },
     });
   }
+
+  /**
+   * Task 10 — explicit platform-admin audit helper (§11).
+   *
+   * Owner/user provisioning + suspend/reinstate and every read-only tenant
+   * browse run on the RAW client (or platform-scope ScopedPrisma, which does
+   * NOT audit platform-model writes), so those admin actions are NOT captured by
+   * the tenancy choke point. This writes the admin audit row directly.
+   *
+   * `actorType` is ALWAYS `platform_admin` and `businessId` is ALWAYS null (the
+   * actor id comes from the platform-scope RequestContext). A null businessId +
+   * the `platform_admin` actorType are the two locks that keep every admin row
+   * out of a BO's tenant-scope activity log (Task 4 rule 2). The browse target
+   * is recorded as `entityType`/`entityId` (+ `metadata.browsedBusinessId`), so
+   * the admin log stays filterable per tenant.
+   */
+  async logAdmin(
+    action: string,
+    entityType: string,
+    entityId: string | null,
+    changes: Record<string, unknown> = {},
+    meta: Record<string, unknown> = {},
+    client: AuditClient = this.raw,
+  ): Promise<void> {
+    let ctx: RequestContext | null = null;
+    try {
+      ctx = getContext();
+    } catch {
+      // called outside a request scope (e.g. unit tests) — use empty metadata
+    }
+
+    await client.auditLog.create({
+      data: {
+        actorType: 'platform_admin',
+        actorId: ctx?.actor?.id ?? null,
+        ownerId: null,
+        // Immovable second lock: a platform-read/admin row NEVER carries a
+        // businessId, so it can never match a tenant scope filter.
+        businessId: null,
+        branchId: null,
+        action,
+        entityType,
+        entityId,
+        changes: changes as Prisma.InputJsonValue,
+        metadata: {
+          requestId: ctx?.requestId ?? null,
+          ip: ctx?.ip ?? null,
+          userAgent: ctx?.userAgent ?? null,
+          sessionId: ctx?.sessionId ?? null,
+          ...meta,
+        },
+      },
+    });
+  }
 }
