@@ -8,6 +8,7 @@ import {
   NotFoundError,
   ValidationFailedError,
 } from '../../common/errors/api-errors';
+import { assertBusinessOwned } from '../shared/tenant-guards';
 import { CreateBranchDto } from './dto/create-branch.dto';
 import { UpdateBranchDto } from './dto/update-branch.dto';
 
@@ -39,7 +40,7 @@ export class BranchesService {
   constructor(@Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma) {}
 
   async list(businessId: string): Promise<Branch[]> {
-    await this.assertBusiness(businessId);
+    await assertBusinessOwned(this.scoped, businessId);
     return this.scoped.branch.findMany({
       where: { businessId },
       orderBy: { createdAt: 'desc' },
@@ -47,7 +48,7 @@ export class BranchesService {
   }
 
   async create(businessId: string, dto: CreateBranchDto): Promise<Branch> {
-    await this.assertBusiness(businessId);
+    await assertBusinessOwned(this.scoped, businessId);
     try {
       return await this.scoped.branch.create({
         data: {
@@ -90,18 +91,5 @@ export class BranchesService {
   async remove(id: string): Promise<Branch> {
     await this.get(id); // 404 if missing / not owned
     return this.scoped.branch.delete({ where: { id } });
-  }
-
-  /**
-   * The parent business must exist AND belong to the caller. The scoped read is
-   * auto-filtered to the owner, so a foreign or missing business returns null →
-   * 404 (no cross-tenant existence leak).
-   */
-  private async assertBusiness(businessId: string): Promise<void> {
-    const biz = await this.scoped.business.findFirst({
-      where: { id: businessId },
-      select: { id: true },
-    });
-    if (!biz) throw new NotFoundError('Business not found.');
   }
 }
