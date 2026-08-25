@@ -9,6 +9,7 @@ import { ContextMiddleware } from './common/context/context.middleware';
 import { AuthModule } from './auth/auth.module';
 import { MailModule } from './mail/mail.module';
 import { AdminModule } from './admin/admin.module';
+import { PortalModule } from './portal/portal.module';
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { AdminModule } from './admin/admin.module';
     HealthModule,
     AuthModule,
     AdminModule,
+    PortalModule,
   ],
   controllers: [AppController],
   providers: [AppService],

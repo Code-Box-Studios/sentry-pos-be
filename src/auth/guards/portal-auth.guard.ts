@@ -5,6 +5,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import {
   UnauthorizedError,
   OwnerSuspendedError,
+  ForbiddenError,
 } from '../../common/errors/api-errors';
 import { setAuthContext } from '../../common/context/request-context';
 import { JwtPayload } from '../jwt.strategy';
@@ -43,15 +44,18 @@ export class PortalAuthGuard extends AuthGuard('jwt') {
     const user = await this.raw.user.findUnique({ where: { id: payload.sub } });
     if (!user || user.deletedAt) throw new UnauthorizedError();
 
-    if (user.ownerId) {
-      const owner = await this.raw.owner.findUnique({
-        where: { id: user.ownerId },
-      });
-      // Fail closed: deny if the owner row is missing OR suspended. A dangling
-      // ownerId (owner deleted/absent) must never grant portal access.
-      if (!owner || SUSPENDED_STATUSES.has(owner.status)) {
-        throw new OwnerSuspendedError();
-      }
+    // Portal is owner-only: a user without an owner (e.g. a platform admin) is
+    // denied here so access control is explicit and fails closed at the boundary.
+    if (!user.ownerId) {
+      throw new ForbiddenError('Portal access requires an owner account.');
+    }
+    const owner = await this.raw.owner.findUnique({
+      where: { id: user.ownerId },
+    });
+    // Fail closed: deny if the owner row is missing OR suspended. A dangling
+    // ownerId (owner deleted/absent) must never grant portal access.
+    if (!owner || SUSPENDED_STATUSES.has(owner.status)) {
+      throw new OwnerSuspendedError();
     }
 
     setAuthContext({

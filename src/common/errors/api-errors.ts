@@ -123,6 +123,18 @@ export class EmailTakenError extends ApiHttpException {
 }
 
 /**
+ * The owner has reached the `max_businesses` limit on their account (Task 11 §7).
+ * Demo businesses are excluded from the count.
+ */
+export class MaxBusinessesReachedError extends ApiHttpException {
+  constructor(
+    message = 'You have reached the maximum number of businesses for your account.',
+  ) {
+    super(HttpStatus.FORBIDDEN, 'max_businesses_reached', message);
+  }
+}
+
+/**
  * Portal access is locked whenever the owner is suspended/hard_suspended/closed
  * (§8). Returned by both login and the PortalAuthGuard.
  */
