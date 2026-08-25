@@ -1,45 +1,46 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
+import { CatalogModule } from './catalog/catalog.module';
 import { BusinessesController } from './businesses/businesses.controller';
 import { BusinessesService } from './businesses/businesses.service';
 import { BranchesController } from './branches/branches.controller';
 import { BranchesService } from './branches/branches.service';
-import { CategoriesController } from './catalog/categories.controller';
-import { CategoriesService } from './catalog/categories.service';
-import { ProductsController } from './catalog/products.controller';
-import { ProductsService } from './catalog/products.service';
-import { ModifierGroupsController } from './catalog/modifier-groups.controller';
-import { ModifierGroupsService } from './catalog/modifier-groups.service';
 import { DiscountsController } from './discounts/discounts.controller';
 import { DiscountsService } from './discounts/discounts.service';
+import { SettingsController } from './settings/settings.controller';
+import { SettingsService } from './settings/settings.service';
+import { ActivityLogController } from './activity-log/activity-log.controller';
+import { ActivityLogService } from './activity-log/activity-log.service';
+import { TerminalsController } from './terminals/terminals.controller';
+import { TerminalsService } from './terminals/terminals.service';
 
 /**
- * Portal module (tenant scope). Task 11 — businesses + branches; Task 12 —
- * catalog (categories, products + variants); Task 13 — modifier groups, product↔
- * group links, discounts.
+ * Portal module (tenant scope). Task 11 — businesses + branches; Task 13 —
+ * discounts; Task 14 — settings (refund PIN), activity log, terminals. The
+ * catalog features (categories/products/modifiers, built in Tasks 12/13) now
+ * live in `CatalogModule`, imported here.
  *
- * Imports `AuthModule` for `PortalAuthGuard`. `PrismaService` (raw, for the
- * platform-model maxBusinesses read + sales-history / link reads) and
- * `SCOPED_PRISMA` (tenant scope, for all CRUD) come from the global
- * `PrismaModule`.
+ * Imports `AuthModule` for `PortalAuthGuard` and `CatalogModule` for the catalog
+ * routes. `PrismaService` (raw) and `SCOPED_PRISMA` (tenant scope) come from the
+ * global `PrismaModule`.
  */
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, CatalogModule],
   controllers: [
     BusinessesController,
     BranchesController,
-    CategoriesController,
-    ProductsController,
-    ModifierGroupsController,
     DiscountsController,
+    SettingsController,
+    ActivityLogController,
+    TerminalsController,
   ],
   providers: [
     BusinessesService,
     BranchesService,
-    CategoriesService,
-    ProductsService,
-    ModifierGroupsService,
     DiscountsService,
+    SettingsService,
+    ActivityLogService,
+    TerminalsService,
   ],
 })
 export class PortalModule {}

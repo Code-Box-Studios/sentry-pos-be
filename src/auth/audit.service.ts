@@ -116,4 +116,48 @@ export class AuditService {
       },
     });
   }
+
+  /**
+   * Task 14 — explicit TENANT-scope audit helper for events the choke point does
+   * NOT auto-capture: notably sensitive READS (e.g. the activity-log browse, §11)
+   * and platform-model writes owned by a BO (e.g. the refund PIN could also use
+   * `logAuth`). Stamps actor + owner from the RequestContext and the supplied
+   * `businessId`, so the row surfaces in that business's own activity log.
+   */
+  async logPortal(
+    action: string,
+    entityType: string,
+    entityId: string | null,
+    businessId: string | null,
+    meta: Record<string, unknown> = {},
+    client: AuditClient = this.raw,
+  ): Promise<void> {
+    let ctx: RequestContext | null = null;
+    try {
+      ctx = getContext();
+    } catch {
+      // called outside a request scope (e.g. unit tests) — use empty metadata
+    }
+
+    await client.auditLog.create({
+      data: {
+        actorType: ctx?.actor?.type ?? 'owner',
+        actorId: ctx?.actor?.id ?? null,
+        ownerId: ctx?.ownerId ?? null,
+        businessId,
+        branchId: null,
+        action,
+        entityType,
+        entityId,
+        changes: {},
+        metadata: {
+          requestId: ctx?.requestId ?? null,
+          ip: ctx?.ip ?? null,
+          userAgent: ctx?.userAgent ?? null,
+          sessionId: ctx?.sessionId ?? null,
+          ...meta,
+        },
+      },
+    });
+  }
 }
