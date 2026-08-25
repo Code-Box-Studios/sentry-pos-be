@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomBytes } from 'crypto';
-import { OwnerStatus } from '@prisma/client';
+import { OwnerStatus, Owner, User } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { LockoutService } from '../common/lockout/lockout.service';
 import { AuditService } from './audit.service';
@@ -11,10 +11,12 @@ import {
   LoginInvalidError,
   UnauthorizedError,
   OwnerSuspendedError,
+  ForbiddenError,
 } from '../common/errors/api-errors';
 
 const ACCESS_TTL = '15m';
 const PREAUTH_TTL = '5m';
+const PAIRING_TTL = '10m';
 const REFRESH_TTL_DAYS = 30;
 
 const SUSPENDED_STATUSES: ReadonlySet<OwnerStatus> = new Set<OwnerStatus>([
@@ -252,5 +254,69 @@ export class AuthService {
     });
 
     return { accessToken, refreshToken: rawRefresh };
+  }
+
+  // -------------------------------------------------------------------------
+  // POS pairing (Task 16)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Shared owner-credential verification for POS pairing sign-in and unpair
+   * re-auth. Runs the SAME constant-work + lockout path as `login` (no account
+   * enumeration; a wrong/pre-activation/unknown credential all cost one argon2
+   * verify and end in `login_invalid`), then requires an OWNER account. Owner
+   * SUSPENSION is deliberately NOT gated here — callers decide (pairing sign-in
+   * rejects suspended owners; unpair allows them so a device can be offboarded).
+   * Failures are audited with `failAction` before `recordFailure` throws.
+   */
+  async verifyOwnerCredentials(
+    email: string,
+    password: string,
+    failAction: string,
+  ): Promise<{ user: User; owner: Owner }> {
+    const user = await this.raw.user.findUnique({ where: { email } });
+    if (!user) {
+      await verifySecret(DECOY_HASH, password);
+      throw new LoginInvalidError(3);
+    }
+
+    this.lockout.assertNotLocked(user, 'login');
+
+    const valid =
+      user.passwordHash != null
+        ? await verifySecret(user.passwordHash, password)
+        : await verifySecret(DECOY_HASH, password).then(() => false);
+
+    if (!valid) {
+      await this.audit.logAuth(failAction, user.id, user.ownerId ?? null);
+      await this.lockout.recordFailure(user.id, 'login'); // always throws
+      throw new LoginInvalidError(0); // unreachable; satisfies control flow
+    }
+
+    // Pairing is owner-only. Gate role + soft-delete BEFORE resetting the
+    // lockout counter so a valid non-owner/deleted credential neither resets its
+    // lockout nor proceeds.
+    if (user.deletedAt || user.role !== 'owner' || !user.ownerId) {
+      throw new ForbiddenError('This account cannot pair terminals.');
+    }
+
+    await this.lockout.recordSuccess(user.id, 'login');
+
+    const owner = await this.raw.owner.findUnique({
+      where: { id: user.ownerId },
+    });
+    if (!owner) {
+      // Dangling ownerId — fail closed.
+      throw new ForbiddenError('This account cannot pair terminals.');
+    }
+    return { user, owner };
+  }
+
+  /** A 10-minute pairing-scoped JWT (`aud: "pairing"`), owner-only. */
+  mintPairingToken(userId: string, ownerId: string): string {
+    return this.jwt.sign(
+      { sub: userId, ownerId, role: 'owner', aud: 'pairing' },
+      { secret: this.accessSecret, expiresIn: PAIRING_TTL },
+    );
   }
 }

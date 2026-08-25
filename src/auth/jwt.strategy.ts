@@ -12,13 +12,17 @@ export interface JwtPayload {
   sid: string;
   /** Present ONLY on preauth tokens; the strategy rejects those outright. */
   kind?: string;
+  /** Present ONLY on scoped tokens (e.g. pairing); the strategy rejects those. */
+  aud?: string;
 }
 
 /**
  * The access-token strategy. Passport verifies signature + expiry using
- * JWT_ACCESS_SECRET; `validate()` then rejects any token carrying
- * `kind: "preauth"` so a password-only preauth token can never authenticate a
- * protected route (only Task 8's TOTP endpoints consume preauth tokens).
+ * JWT_ACCESS_SECRET; `validate()` then rejects scoped tokens signed with the
+ * same secret so they can never authenticate a normal protected route: a
+ * `kind: "preauth"` token (only Task 8's TOTP endpoints consume it) and any
+ * `aud`-bearing token (e.g. Task 16's pairing token, which is verified directly
+ * by its own PairingGuard, never here).
  */
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
@@ -34,6 +38,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if (payload.kind === 'preauth') {
       throw new UnauthorizedError(
         'Pre-auth tokens cannot access protected routes.',
+      );
+    }
+    if (payload.aud) {
+      throw new UnauthorizedError(
+        'Scoped tokens cannot access protected routes.',
       );
     }
     return payload;
