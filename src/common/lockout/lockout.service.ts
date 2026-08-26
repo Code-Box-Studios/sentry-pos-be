@@ -151,7 +151,10 @@ export class LockoutService {
   ): Promise<void> {
     // Collect request context metadata (may be partial depending on caller)
     let ctx: {
-      actor?: { type: string; id: string } | null;
+      actor?: {
+        type: 'owner' | 'terminal' | 'platform_admin';
+        id: string;
+      } | null;
       ip?: string;
       requestId?: string;
       sessionId?: string | null;
@@ -164,7 +167,9 @@ export class LockoutService {
 
     await this.raw.auditLog.create({
       data: {
-        actorType: 'owner',
+        // Attribute to the ACTUAL actor (a POS refund is a terminal, not the
+        // owner) so (actorType, actorId) stays a consistent pair.
+        actorType: ctx.actor?.type ?? 'owner',
         actorId: ctx.actor?.id ?? userId,
         ownerId,
         action: 'auth.pin_failure',

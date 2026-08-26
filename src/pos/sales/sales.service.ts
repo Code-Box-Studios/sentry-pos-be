@@ -17,6 +17,7 @@ import {
 import { computeTotals, type CartTotals } from '../../common/totals/totals';
 import type { Cart } from '../../common/totals/cart';
 import { qtyToMilli, milliToQty } from '../../common/totals/qty';
+import { LockoutService } from '../../common/lockout/lockout.service';
 import { SaleDraftDto, CartLineDto } from './dto/sale-draft.dto';
 
 // ---------------------------------------------------------------------------
@@ -114,6 +115,7 @@ export class SalesService {
   constructor(
     @Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma,
     private readonly raw: PrismaService,
+    private readonly lockout: LockoutService,
   ) {}
 
   async completeSale(
@@ -217,6 +219,174 @@ export class SalesService {
     const row = await this.scoped.sale.findFirst({ where: { id } });
     if (!row) throw new NotFoundError('Sale not found.');
     return this.assemble(row);
+  }
+
+  // -------------------------------------------------------------------------
+  // Void / refund (Task 20)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Ungated void — but only while the sale's shift is still open (§7): a closed
+   * shift's sale must be refunded instead. Restores stock and flags the sale.
+   */
+  async voidSale(id: string, reason: string): Promise<CompletedSale> {
+    const trimmed = reason.trim();
+    if (!trimmed) throw new ValidationFailedError('A reason is required.');
+    const ctx = getContext();
+    const branchId = ctx.branchId!;
+    const terminalId = ctx.actor!.id;
+
+    return this.raw.$transaction((tx) =>
+      runWithTxClient(tx, async () => {
+        const locked = await this.lockSale(tx, id, branchId);
+        if (!locked) throw new NotFoundError('Sale not found.');
+        if (locked.status !== 'completed') {
+          throw new ValidationFailedError(
+            `A ${locked.status} sale cannot be voided.`,
+          );
+        }
+        const open = await this.scoped.shift.findFirst({
+          where: { terminalId, closedAt: null },
+          select: { id: true },
+        });
+        if (!open || open.id !== locked.shiftId) {
+          throw new ValidationFailedError(
+            "Voids are only allowed while the sale's shift is open.",
+          );
+        }
+        const after = await this.scoped.sale.update({
+          where: { id },
+          data: {
+            status: 'voided',
+            voidedAt: new Date(),
+            statusReason: trimmed,
+          },
+        });
+        await this.restoreStock(id, 'void');
+        return this.assemble(after);
+      }),
+    );
+  }
+
+  /**
+   * PIN-gated refund. The PIN gate runs FIRST (its own lockout + failure audit on
+   * the raw client, outside the refund tx) so a locked terminal never reveals
+   * whether the sale is refundable. `refund_shift_id` is set only when the refund
+   * happens during the sale's OWN open shift, else null (out-of-shift — skips the
+   * shift's cash math, §8). Restores stock mirroring the sale's own movements.
+   */
+  async refundSale(
+    id: string,
+    reason: string,
+    pin: string,
+  ): Promise<CompletedSale> {
+    const ctx = getContext();
+    await this.lockout.verifyPinWithLockout(ctx.ownerId!, pin);
+
+    const trimmed = reason.trim();
+    if (!trimmed) throw new ValidationFailedError('A reason is required.');
+    const branchId = ctx.branchId!;
+    const terminalId = ctx.actor!.id;
+
+    return this.raw.$transaction((tx) =>
+      runWithTxClient(tx, async () => {
+        const locked = await this.lockSale(tx, id, branchId);
+        if (!locked) throw new NotFoundError('Sale not found.');
+        if (locked.status !== 'completed') {
+          throw new ValidationFailedError(
+            `A ${locked.status} sale cannot be refunded.`,
+          );
+        }
+        const open = await this.scoped.shift.findFirst({
+          where: { terminalId, closedAt: null },
+          select: { id: true },
+        });
+        const refundShiftId =
+          open && open.id === locked.shiftId ? open.id : null;
+
+        const after = await this.scoped.sale.update({
+          where: { id },
+          data: {
+            status: 'refunded',
+            refundedAt: new Date(),
+            statusReason: trimmed,
+            refundShiftId,
+          },
+        });
+        await this.restoreStock(id, 'refund');
+        return this.assemble(after);
+      }),
+    );
+  }
+
+  /** Row-lock the sale within the tx; returns its status + shiftId (or null). */
+  private async lockSale(
+    tx: Prisma.TransactionClient,
+    id: string,
+    branchId: string,
+  ): Promise<{ status: Sale['status']; shiftId: string | null } | null> {
+    if (!UUID_RE.test(id)) return null;
+    const rows = await tx.$queryRaw<
+      { status: Sale['status']; shift_id: string | null }[]
+    >(Prisma.sql`
+      SELECT status, shift_id
+      FROM sales
+      WHERE id = ${id}::uuid AND branch_id = ${branchId}::uuid AND deleted_at IS NULL
+      FOR UPDATE
+    `);
+    if (rows.length === 0) return null;
+    return { status: rows[0].status, shiftId: rows[0].shift_id };
+  }
+
+  /**
+   * Put the goods back (§9). Restoration MIRRORS the sale's own `stock_movements`
+   * (type=sale, ref_id=sale.id) with negated qty — never derived from the
+   * product's CURRENT trackStock flag, which may have changed since the sale.
+   */
+  private async restoreStock(
+    saleId: string,
+    type: 'void' | 'refund',
+  ): Promise<void> {
+    const saleMoves = await this.scoped.stockMovement.findMany({
+      where: { refId: saleId, type: 'sale' },
+    });
+    for (const m of saleMoves) {
+      const restore = -m.qtyDelta.toNumber(); // qtyDelta was negative → positive
+      const existing = await this.scoped.branchStock.findFirst({
+        where: {
+          branchId: m.branchId,
+          productId: m.productId,
+          variantId: m.variantId,
+          deletedAt: null,
+        },
+        select: { id: true },
+      });
+      if (existing) {
+        await this.scoped.branchStock.update({
+          where: { id: existing.id },
+          data: { qty: { increment: restore } },
+        });
+      } else {
+        await this.scoped.branchStock.create({
+          data: {
+            branchId: m.branchId,
+            productId: m.productId,
+            variantId: m.variantId,
+            qty: restore,
+          },
+        });
+      }
+      await this.scoped.stockMovement.create({
+        data: {
+          branchId: m.branchId,
+          productId: m.productId,
+          variantId: m.variantId,
+          type,
+          refId: saleId,
+          qtyDelta: restore,
+        },
+      });
+    }
   }
 
   // -------------------------------------------------------------------------

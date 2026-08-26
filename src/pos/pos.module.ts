@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { AuthModule } from '../auth/auth.module';
 import { StockModule } from '../portal/stock/stock.module';
+import { LockoutModule } from '../common/lockout/lockout.module';
 import { PairingController } from './pairing/pairing.controller';
 import { PairingService } from './pairing/pairing.service';
 import { PosController } from './pos.controller';
@@ -22,7 +23,7 @@ import { TerminalGuard } from './guards/terminal.guard';
  * (raw) + `SCOPED_PRISMA` come from the global `PrismaModule`.
  */
 @Module({
-  imports: [AuthModule, JwtModule.register({}), StockModule],
+  imports: [AuthModule, JwtModule.register({}), StockModule, LockoutModule],
   controllers: [
     PairingController,
     PosController,

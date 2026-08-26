@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
   Param,
   Post,
   Query,
@@ -17,6 +18,8 @@ import {
 } from './sales.service';
 import { SaleDraftDto } from './dto/sale-draft.dto';
 import { ListSalesQueryDto } from './dto/list-sales-query.dto';
+import { VoidSaleDto } from './dto/void-sale.dto';
+import { RefundSaleDto } from './dto/refund-sale.dto';
 
 /**
  * Task 19 — POS sales (all TerminalGuard). `completeSale` is idempotent: a first
@@ -47,5 +50,23 @@ export class SalesController {
   @Get(':id')
   getSale(@Param('id') id: string): Promise<CompletedSale> {
     return this.sales.getSale(id);
+  }
+
+  @Post(':id/void')
+  @HttpCode(200)
+  voidSale(
+    @Param('id') id: string,
+    @Body() dto: VoidSaleDto,
+  ): Promise<CompletedSale> {
+    return this.sales.voidSale(id, dto.reason);
+  }
+
+  @Post(':id/refund')
+  @HttpCode(200)
+  refundSale(
+    @Param('id') id: string,
+    @Body() dto: RefundSaleDto,
+  ): Promise<CompletedSale> {
+    return this.sales.refundSale(id, dto.reason, dto.pin);
   }
 }
