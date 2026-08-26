@@ -9,6 +9,8 @@ import { PosCatalogController } from './catalog/pos-catalog.controller';
 import { PosCatalogService } from './catalog/pos-catalog.service';
 import { ShiftsController } from './shifts/shifts.controller';
 import { ShiftsService } from './shifts/shifts.service';
+import { SalesController } from './sales/sales.controller';
+import { SalesService } from './sales/sales.service';
 import { PairingGuard } from './guards/pairing.guard';
 import { TerminalGuard } from './guards/terminal.guard';
 
@@ -26,6 +28,7 @@ import { TerminalGuard } from './guards/terminal.guard';
     PosController,
     PosCatalogController,
     ShiftsController,
+    SalesController,
   ],
   providers: [
     PairingService,
@@ -33,6 +36,7 @@ import { TerminalGuard } from './guards/terminal.guard';
     TerminalGuard,
     PosCatalogService,
     ShiftsService,
+    SalesService,
   ],
 })
 export class PosModule {}
