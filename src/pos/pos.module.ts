@@ -12,6 +12,7 @@ import { ShiftsController } from './shifts/shifts.controller';
 import { ShiftsService } from './shifts/shifts.service';
 import { SalesController } from './sales/sales.controller';
 import { SalesService } from './sales/sales.service';
+import { PosStockController } from './stock/pos-stock.controller';
 import { PairingGuard } from './guards/pairing.guard';
 import { TerminalGuard } from './guards/terminal.guard';
 
@@ -30,6 +31,7 @@ import { TerminalGuard } from './guards/terminal.guard';
     PosCatalogController,
     ShiftsController,
     SalesController,
+    PosStockController,
   ],
   providers: [
     PairingService,

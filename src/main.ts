@@ -1,8 +1,10 @@
 import { NestFactory } from '@nestjs/core';
 import { HttpStatus, ValidationPipe } from '@nestjs/common';
+import { SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { ApiExceptionFilter } from './common/filters/api-exception.filter';
 import { PrismaService } from './prisma/prisma.service';
+import { buildOpenApiDocument } from './openapi';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -29,6 +31,12 @@ async function bootstrap() {
     ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim())
     : [];
   app.enableCors({ origin: corsOrigins });
+
+  // Swagger UI at /docs (non-production only). Stable operationIds so the FE can
+  // generate a typed client whose method names match its PosApi.
+  if (process.env.NODE_ENV !== 'production') {
+    SwaggerModule.setup('docs', app, buildOpenApiDocument(app));
+  }
 
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 4000;
   await app.listen(port);
