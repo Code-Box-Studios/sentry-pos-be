@@ -1,98 +1,156 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Sentry POS — Backend
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+A multi-tenant Point-of-Sale API for small Philippine businesses: a **platform
+admin** provisions owners, each **owner** manages businesses/branches/catalog/stock
+through a portal, and paired **POS terminals** sell, run shifts, and reconcile
+cash — offline-first on the device and idempotent on sync.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+Built with **NestJS 11 + Prisma (PostgreSQL)**. Money is integer centavos; the
+totals engine is byte-for-byte identical to the frontend's.
 
-## Description
+---
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Quick start
 
-## Project setup
+Prerequisites: Node 20+, Docker (for Postgres).
 
 ```bash
-$ npm install
+npm install
+npm run db:up                 # Postgres 16 on localhost:54400 (docker compose)
+cp .env.example .env          # then edit secrets if you like
+npx prisma migrate deploy     # apply migrations
+npm run db:seed               # FE-parity dev tenant (prints the admin password once)
+npm run start:dev             # API on http://localhost:4000, Swagger UI at /docs
 ```
 
-## Compile and run the project
+All routes are under the `/v1` prefix (e.g. `GET http://localhost:4000/v1/health`).
+
+### Seed credentials
+
+`npm run db:seed` resets the DB and inserts a tenant that mirrors the FE mock
+(`frontend/pos/src/api/mock/seed.ts`) byte-for-byte. It **refuses to run when
+`NODE_ENV=production`**.
+
+| Role | Email | Secret |
+|---|---|---|
+| Platform admin | `admin@sentry.local` | random password **printed once** by the seed; TOTP enrolls on first login |
+| Owner (POS sign-in) | `maria@kapediaria.ph` | password `sentry-demo`, refund PIN `123456` |
+
+Business **Kape Diaria** (mixed, VAT 12%, service charge 5%, day start 04:00) with
+branches **Marikit (MKT)** and **Bayanihan (BYN)**, the full catalog (coffee /
+bakery / grocery / meals, modifier groups, named discounts) and the FE stock
+levels (Pan de sal 8 → low, Ube loaf 0 → out, Jasmine rice 23.450, …), plus a
+separate **Kape Diaria (Demo)** business.
+
+---
+
+## Environment variables
+
+| Var | Purpose |
+|---|---|
+| `DATABASE_URL` / `DIRECT_URL` | Postgres connection (compose default: `…@localhost:54400/sentry_pos_dev`) |
+| `JWT_ACCESS_SECRET` | Portal/admin access-token signing secret |
+| `JWT_REFRESH_SECRET` | Rotating refresh-token secret |
+| `JWT_PAIRING_SECRET` | 10-minute pairing-token secret (POS sign-in → pair) |
+| `CORS_ORIGINS` | Comma-separated allow-list |
+| `RESEND_API_KEY` | Transactional mail; **unset in dev → mail logs to console** |
+| `MAIL_FROM` | From header for outbound mail |
+| `PORT` | HTTP port (default 4000) |
+| `NODE_ENV` | `production` disables `/docs` and blocks `db:seed` |
+
+---
+
+## Architecture
+
+Every request flows through one pipeline, and every tenant DB operation through
+one choke point:
+
+```
+HTTP request
+  → ContextMiddleware        stamps a per-request AsyncLocalStorage RequestContext
+  → Guard                    AdminGuard | PortalAuthGuard | PairingGuard | TerminalGuard
+                             — resolves the actor and sets the scope on the context
+  → Controller / Service     business logic
+  → ScopedPrisma  (the choke point, src/prisma/scoped-prisma.ts)
+        · filters every read to the caller's owner / business / branch
+        · forces FKs on create, rewrites deletes to soft-deletes
+        · writes an append-only audit_logs row on the SAME transaction as each mutation
+  → ApiExceptionFilter       renders { code, message, requestId }; audits denials
+```
+
+- **Tenancy** is enforced centrally: business modules inject `SCOPED_PRISMA`, never
+  the raw client. A terminal actor is pinned to its branch; an owner sees only
+  their own businesses. Auth/system/seed paths use the raw `PrismaService`
+  deliberately.
+- **Money**: integer centavos everywhere; `src/common/totals` is the shared engine
+  (parity with the FE). Decimal columns serialize as numbers (`.toNumber()`).
+- **Auth**: argon2id hashing, 4-strike lockout, rotating refresh tokens, mandatory
+  TOTP 2FA for platform admins, PIN-gated refunds.
+
+---
+
+## API surface (FE `PosApi` contract)
+
+The POS endpoints map 1:1 to the frontend's `PosApi`. `test/contract.e2e-spec.ts`
+walks this table; `openapi.json` carries a stable `operationId` per row so a
+generated client's method names line up exactly.
+
+| FE method | Endpoint | Notes / error semantics |
+|---|---|---|
+| `ownerSignIn` | `POST /v1/pos/pairing/sign-in` | 401 `login_invalid` / 423 `login_locked` |
+| `listBusinesses` / `listBranches` | `GET /v1/pos/pairing/businesses[/:id/branches]` | 401 on bad pairing token |
+| `pairTerminal` | `POST /v1/pos/pairing/pair` | codes never reused; returns `receiptSeq` + device token |
+| `unpair` | `POST /v1/pos/unpair` | 401 on bad owner re-auth |
+| `health` | `GET /v1/health` | — |
+| `pullCatalog` | `GET /v1/pos/catalog` | active products only; **cost excluded**; 401 after remote unpair |
+| `getCurrentShift` / `openShift` | `GET`·`POST /v1/pos/shifts[/current]` | 422 double-open |
+| `addCashMovement` / `getShiftTotals` / `closeShift` | `/v1/pos/shifts/current/…` | 422 when no shift is open |
+| `completeSale` | `POST /v1/pos/sales` | idempotent by id; 409 `stock_conflict {conflicts}`; 422 totals mismatch |
+| `listSales` / `getSale` | `GET /v1/pos/sales[?date]` · `/:id` | Manila-day filter; assembled from the stored draft |
+| `voidSale` / `refundSale` | `POST /v1/pos/sales/:id/void` · `/refund` | refund is PIN-gated: 403 `pin_invalid {attemptsRemaining}` · 423 `pin_locked {retryAfterSeconds}` |
+| `getStockLevels` / `adjustStock` | `GET`·`POST /v1/pos/stock[/adjustments]` | 422 on a negative target |
+
+Owner **portal** (`/v1/portal/…`) and **platform admin** (`/v1/admin/…`) surfaces
+exist alongside the POS surface; see the Swagger doc for the full list.
+
+---
+
+## OpenAPI / generating the FE client
 
 ```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+npm run db:up            # a DB must be reachable (the emit boots the app, which connects Prisma)
+npm run openapi:emit     # writes openapi.json at the repo root (/v1 prefix; the 19 FE PosApi methods carry stable operationIds)
 ```
 
-## Run tests
+Swagger UI is served at **`/docs`** in non-production. The FE consumes `openapi.json`
+via `openapi-typescript` and swaps its adapter with `NEXT_PUBLIC_API_MODE=http` +
+`NEXT_PUBLIC_API_URL`. Two deliberate divergences from the FE mock the HTTP adapter
+maps: sign-in returns 401 `login_invalid` (→ the FE wrong-credentials path) and
+surfaces 423 `login_locked`.
+
+---
+
+## Testing
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+npm run lint             # eslint + prettier
+npm run build            # nest build (tsc)
+npm test                 # unit specs (totals engine, guards) — no DB needed
+npm run test:e2e         # full e2e (boots the app against the compose DB)
 ```
 
-## Deployment
+The e2e suite brings the DB up via `globalSetup`. On Windows the compose port
+`54400` can fall in a reserved range; if it fails to bind, restart `winnat`
+(`net stop winnat && net start winnat`) or point `DATABASE_URL` at another Postgres.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+---
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+## Scripts
 
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+| Script | Does |
+|---|---|
+| `db:up` / `db:down` | start / stop the compose Postgres |
+| `db:seed` | reset + seed the FE-parity dev tenant (dev only) |
+| `openapi:emit` | write `openapi.json` for FE client generation |
+| `start:dev` | watch-mode dev server |
+| `build` / `start:prod` | production build / run |
