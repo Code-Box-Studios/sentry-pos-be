@@ -7,6 +7,8 @@ import { PairingService } from './pairing/pairing.service';
 import { PosController } from './pos.controller';
 import { PosCatalogController } from './catalog/pos-catalog.controller';
 import { PosCatalogService } from './catalog/pos-catalog.service';
+import { ShiftsController } from './shifts/shifts.controller';
+import { ShiftsService } from './shifts/shifts.service';
 import { PairingGuard } from './guards/pairing.guard';
 import { TerminalGuard } from './guards/terminal.guard';
 
@@ -19,7 +21,18 @@ import { TerminalGuard } from './guards/terminal.guard';
  */
 @Module({
   imports: [AuthModule, JwtModule.register({}), StockModule],
-  controllers: [PairingController, PosController, PosCatalogController],
-  providers: [PairingService, PairingGuard, TerminalGuard, PosCatalogService],
+  controllers: [
+    PairingController,
+    PosController,
+    PosCatalogController,
+    ShiftsController,
+  ],
+  providers: [
+    PairingService,
+    PairingGuard,
+    TerminalGuard,
+    PosCatalogService,
+    ShiftsService,
+  ],
 })
 export class PosModule {}
