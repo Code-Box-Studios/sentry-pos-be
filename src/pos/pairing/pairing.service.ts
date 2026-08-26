@@ -10,6 +10,10 @@ import {
   UnauthorizedError,
 } from '../../common/errors/api-errors';
 import { PairDto } from './dto/pair.dto';
+import {
+  BusinessSettings,
+  serializeBusinessSettings,
+} from '../business-settings';
 
 function sha256(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -35,21 +39,6 @@ export interface BranchInfo {
   address: string;
 }
 
-export interface BusinessSettings {
-  id: string;
-  name: string;
-  type: Business['type'];
-  currency: string;
-  taxRate: number;
-  serviceChargeRate: number;
-  allowMiscItems: boolean;
-  dayStartTime: string;
-  expiryWarningDays: number;
-  receiptHeader: string;
-  receiptFooter: string;
-  isDemo: boolean;
-}
-
 export interface PairResult {
   deviceToken: string;
   business: BusinessSettings;
@@ -57,23 +46,6 @@ export interface PairResult {
   terminalName: string;
   terminalCode: string;
   receiptSeq: number;
-}
-
-function serializeBusinessSettings(b: Business): BusinessSettings {
-  return {
-    id: b.id,
-    name: b.name,
-    type: b.type,
-    currency: b.currency,
-    taxRate: b.taxRate.toNumber(),
-    serviceChargeRate: b.serviceChargeRate.toNumber(),
-    allowMiscItems: b.allowMiscItems,
-    dayStartTime: b.dayStartTime,
-    expiryWarningDays: b.expiryWarningDays,
-    receiptHeader: b.receiptHeader,
-    receiptFooter: b.receiptFooter,
-    isDemo: b.isDemo,
-  };
 }
 
 /**
