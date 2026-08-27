@@ -12,6 +12,7 @@
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
+    "postinstall": "prisma generate",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
     "test": "jest",
     "test:watch": "jest --watch",
@@ -21,7 +22,9 @@
     "openapi:emit": "ts-node -r tsconfig-paths/register scripts/emit-openapi.ts",
     "db:up": "docker compose up -d db",
     "db:down": "docker compose down",
-    "db:seed": "ts-node -r tsconfig-paths/register prisma/seed.ts"
+    "db:seed": "ts-node -r tsconfig-paths/register prisma/seed.ts",
+    "migrate:deploy": "prisma migrate deploy",
+    "bootstrap:admin": "ts-node -r tsconfig-paths/register prisma/bootstrap-admin.ts"
   },
   "prisma": {
     "seed": "ts-node -r tsconfig-paths/register prisma/seed.ts"
@@ -89,5 +92,8 @@
     ],
     "coverageDirectory": "../coverage",
     "testEnvironment": "node"
+  },
+  "engines": {
+    "node": ">=20 <23"
   }
 }
