@@ -1,6 +1,6 @@
 # Sentry — Design Language
 
-**Adopted:** 2026-08-19 · **Applies to:** `sentry-pos-fe` (portal, POS terminal, future landing)
+**Adopted:** 2026-08-19 · **Applies to:** every Sentry surface — the landing site (`sentry-pos-landing`), the future owner portal, and the POS terminal (`sentry-pos-fe`)
 
 Sentry's UI follows the token system below. Surface mapping: the **portal and landing** use the full language (white doc-style surfaces, deep-teal bands, green pill CTAs); the **POS terminal** inherits tokens only — palette, type scale, radii, pill buttons, card language — in a dense operational layout with no hero bands; **receipts** are exempt entirely (business branding only). Token references like `{colors.brand-green}` resolve in the design.md tooling — the build maps them into the Tailwind theme; this file is the structural source of truth. Typeface: **Figtree** (OFL, Google Fonts) substitutes Euclid Circular A throughout — same weights and scale, self-hosted via `next/font` so no surface depends on a font CDN. Source Code Pro stays for code.
 

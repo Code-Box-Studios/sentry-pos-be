@@ -1,6 +1,6 @@
 # Sentry — POS Terminal Spec
 
-**App:** `sentry-pos-fe/pos` · **Status:** MVP scope locked · owner walkthrough completed 2026-08-19 · **Updated:** 2026-08-19
+**App:** `sentry-pos-fe` · **Status:** MVP scope locked · owner walkthrough completed 2026-08-19 · **Updated:** 2026-08-19
 
 Companion to `project-spec.md`, which owns architecture, stack, tenancy, data model, money rules, and sync design. This document owns what the terminal does.
 
