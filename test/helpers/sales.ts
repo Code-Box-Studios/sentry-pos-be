@@ -118,9 +118,7 @@ export async function seedSale(
       discount: totals.promoDiscountC,
       discountId,
       serviceCharge: totals.serviceChargeC,
-      ...(scPwd
-        ? { scPwd: scPwd as unknown as Prisma.InputJsonValue }
-        : {}),
+      ...(scPwd ? { scPwd: scPwd } : {}),
       scPwdDiscount: totals.scPwdDiscountC,
       vatExemptSales: totals.vatExemptSalesC,
       tax: totals.vatC,

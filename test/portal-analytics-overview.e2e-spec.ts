@@ -6,6 +6,7 @@
 
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-argument */
+/* eslint-disable @typescript-eslint/no-unsafe-return */
 import { INestApplication, ValidationPipe, HttpStatus } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
