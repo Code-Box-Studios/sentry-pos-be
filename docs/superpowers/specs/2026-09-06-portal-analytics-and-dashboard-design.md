@@ -58,6 +58,36 @@ definitions below are exact rather than approximate:
   never both — higher wins, ties to SC/PWD).
 - `sales.total` = subtotal − discount − scPwdDiscount + serviceCharge.
 
+**`sale_items.unit_price` excludes modifier prices.** It stores `line.unitPriceC`
+— the base price locked at add-to-cart (`sales.service.ts:507`) — while the
+engine computes line gross from `lineUnitWithModsC()`, which is
+`unitPriceC + Σ modifiers[].priceDeltaC` (`cart.ts:49`). The chosen modifiers
+live in the `sale_items.modifiers` jsonb array, each carrying its own
+`priceDeltaC`.
+
+So a naive `qty × unit_price` **understates revenue on every line that has a
+priced modifier**, and `Σ` over a sale would not equal `sales.subtotal`. Every
+revenue expression in every report must therefore read:
+
+```sql
+round(si.qty * (si.unit_price + COALESCE(mods.mods_c, 0)))   -- line gross
+LEFT JOIN LATERAL (
+  SELECT COALESCE(SUM((m->>'priceDeltaC')::int), 0) AS mods_c
+  FROM jsonb_array_elements(si.modifiers) AS m
+  WHERE jsonb_typeof(si.modifiers) = 'array'
+) mods ON true
+```
+
+Line net is that minus `si.discount`; line cost is
+`round(si.qty * si.cost_snapshot)`, since `cost_snapshot` is the **unit** cost
+(`sales.service.ts:664`), not an extended one. Postgres `round(numeric)` rounds
+half away from zero, which matches the engine's `halfUp` for the non-negative
+values involved.
+
+This is guarded by an invariant test, not by care: for a sale whose lines carry
+priced modifiers, Σ line gross computed by the report SQL must equal that sale's
+`subtotal` to the centavo.
+
 **The order-level discount is not attributable to any line.** So
 `Σ sale_items.discount` ≠ `sales.discount + sales.scPwdDiscount`; the difference
 is exactly the order discount. Per-product profit therefore uses line-level
@@ -73,15 +103,34 @@ Every report answers the same two questions: which branches, and what window.
 `AnalyticsScopeService.resolve(dto)` turns the shared query DTO into:
 
 ```ts
-interface ResolvedScope {
-  businesses: { id: string; name: string; dayStartTime: string; taxRate: number }[];
-  branchIds: string[];       // never empty — an empty result throws NotFound
-  fromUtc: Date;             // inclusive
+interface ScopedBusiness {
+  id: string;
+  name: string;
+  dayStartTime: string;      // 'HH:mm'
+  dayStartMinutes: number;   // parsed once
+  taxRate: number;
+  branchIds: string[];       // this business's branches, in scope
+  fromUtc: Date;             // inclusive — this business's window
   toUtc: Date;               // exclusive
+  previousFromUtc: Date;     // the equal period immediately before
+  previousToUtc: Date;
+}
+
+interface ResolvedScope {
+  businesses: ScopedBusiness[];  // never empty — an empty result throws NotFound
+  branchIds: string[];           // the union, for messages and guards
+  from: string;                  // YYYY-MM-DD, as asked
+  to: string;
   dayCount: number;
-  previous: { fromUtc: Date; toUtc: Date };  // the equal period immediately before
 }
 ```
+
+The window lives on the **business**, not the scope, because `dayStartTime`
+differs per business: a 00:00 business and an 04:00 café asked for "2026-09-01
+to 2026-09-07" are asking about two different UTC intervals. Consequently
+**every analytics query runs per business and its results are merged in
+TypeScript** — there is no query that spans businesses, and that single rule
+removes any chance of cross-bucketing.
 
 It resolves ids **through the scoped Prisma client** (`scoped.business`,
 `scoped.branch`), so the tenant choke point — not this service — decides what
@@ -104,16 +153,18 @@ single helper that makes the safe path the only path:
 // analytics/scoped-sql.ts
 export async function runScoped<T>(
   raw: PrismaService,
-  scope: ResolvedScope,
-  build: (branchIds: string[]) => Prisma.Sql,
+  business: ScopedBusiness,
+  build: (business: ScopedBusiness) => Prisma.Sql,
 ): Promise<T[]>
 ```
 
-`build` receives the branch-id list and must interpolate it; `runScoped` refuses
-to execute when `scope.branchIds` is empty. Every analytics query goes through
-it. No analytics SQL names `sales`, `sale_items`, `stock_movements` or
-`branch_stock` without a `branch_id IN (...)` predicate bound from a list the
-choke point produced.
+`build` receives the business and must interpolate its `branchIds`. `runScoped`
+refuses to execute on two conditions: an empty `branchIds`, and SQL whose text
+does not contain `branch_id`. The second check is crude on purpose — it is a
+runtime tripwire for a builder that forgot its scope predicate, and it costs
+nothing. Every analytics query goes through this helper. No analytics SQL names
+`sales`, `sale_items`, `stock_movements` or `branch_stock` without a
+`branch_id IN (...)` predicate bound from a list the choke point produced.
 
 This is enforced by tests, not by convention alone: a tenancy e2e spec calls
 **every** report endpoint as owner B with owner A's `businessId` and asserts 404,
