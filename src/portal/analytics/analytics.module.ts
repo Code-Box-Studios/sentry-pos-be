@@ -4,6 +4,8 @@ import { AnalyticsScopeService } from './scope/analytics-scope.service';
 import { ReportAuditService } from './report-audit.service';
 import { OverviewController } from './overview/overview.controller';
 import { OverviewService } from './overview/overview.service';
+import { SalesReportController } from './sales/sales-report.controller';
+import { SalesReportService } from './sales/sales-report.service';
 
 /**
  * Analytics (tenant scope) — `analytics-spec.md`. Controllers arrive one report
@@ -15,7 +17,12 @@ import { OverviewService } from './overview/overview.service';
  */
 @Module({
   imports: [AuthModule],
-  controllers: [OverviewController],
-  providers: [AnalyticsScopeService, ReportAuditService, OverviewService],
+  controllers: [OverviewController, SalesReportController],
+  providers: [
+    AnalyticsScopeService,
+    ReportAuditService,
+    OverviewService,
+    SalesReportService,
+  ],
 })
 export class AnalyticsModule {}
