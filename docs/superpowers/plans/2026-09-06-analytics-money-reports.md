@@ -4122,3 +4122,905 @@ git commit -m "feat(analytics): tax summary reported per business with no blende
 ```
 
 ---
+
+## Task 10: Dashboard (§0)
+
+The portal landing — "is everything okay?" in zero clicks. It spans every non-demo business and deliberately ignores the business switcher.
+
+**Files:**
+- Create: `src/portal/analytics/reports/dashboard.sql.ts`
+- Create: `src/portal/analytics/dashboard/dashboard.service.ts`
+- Create: `src/portal/analytics/dashboard/dashboard.controller.ts`
+- Modify: `src/portal/analytics/analytics.module.ts`
+- Test: `test/portal-analytics-dashboard.e2e-spec.ts`
+
+**Interfaces:**
+- Consumes: `AnalyticsScopeService.resolveBusinesses`, `withWindow`, `businessDayOf`, `addDays`, `runScoped`, `saleAggregateSql`, `lineAggregateSql`, `branchBreakdownSql`, `bucketedSalesSql`, `ReportAuditService`, `SCOPED_PRISMA`.
+- Produces:
+  - `lowStockCountSql(business): Prisma.Sql`, `LowStockRow`
+  - `interface DashboardReport`
+  - `DashboardService.run(): Promise<DashboardReport>`
+  - `GET /v1/portal/dashboard`
+
+- [ ] **Step 1: Write the failing e2e test**
+
+Create `test/portal-analytics-dashboard.e2e-spec.ts` with the same bootstrap as Task 7 (renamed `'Analytics dashboard (e2e)'`), then:
+
+```ts
+  const get = (token: string) =>
+    request(server())
+      .get('/v1/portal/dashboard')
+      .set('Authorization', `Bearer ${token}`);
+
+  it("reports today's sales, profit and transactions per business", async () => {
+    const c = await ctx();
+    await seedSale(raw, {
+      branchId: c.branch.id,
+      terminalId: c.terminalId,
+      createdAt: new Date(),
+      lines: [{ qty: 1, unitPriceC: 10000, costC: 6000 }],
+    });
+
+    const res = await get(c.token).expect(200);
+
+    const row = res.body.businesses.find((b: any) => b.businessId === c.business.id);
+    expect(row.today.salesC).toBe(10000);
+    expect(row.today.grossProfitC).toBe(4000);
+    expect(row.today.transactions).toBe(1);
+  });
+
+  it('compares against the same day last week', async () => {
+    const c = await ctx();
+    const lastWeek = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    await seedSale(raw, {
+      branchId: c.branch.id,
+      terminalId: c.terminalId,
+      createdAt: lastWeek,
+      lines: [{ qty: 1, unitPriceC: 5000 }],
+    });
+
+    const res = await get(c.token).expect(200);
+
+    const row = res.body.businesses.find((b: any) => b.businessId === c.business.id);
+    expect(row.sameDayLastWeek.salesC).toBe(5000);
+    expect(row.today.salesC).toBe(0);
+  });
+
+  it('returns a 7-point sparkline ending today', async () => {
+    const c = await ctx();
+    const res = await get(c.token).expect(200);
+    const row = res.body.businesses.find((b: any) => b.businessId === c.business.id);
+    expect(row.sparkline).toHaveLength(7);
+    expect(row.sparkline.every((p: any) => typeof p.salesC === 'number')).toBe(true);
+  });
+
+  it('lists per-branch rows under each business', async () => {
+    const c = await ctx();
+    await seedSale(raw, {
+      branchId: c.branch.id,
+      terminalId: c.terminalId,
+      createdAt: new Date(),
+      lines: [{ qty: 1, unitPriceC: 10000 }],
+    });
+
+    const res = await get(c.token).expect(200);
+    const row = res.body.businesses.find((b: any) => b.businessId === c.business.id);
+    expect(row.branches).toEqual([
+      expect.objectContaining({ branchId: c.branch.id, name: 'Main', salesC: 10000 }),
+    ]);
+  });
+
+  it('shows open shifts in the live strip', async () => {
+    const c = await ctx();
+    await raw.shift.create({
+      data: {
+        branchId: c.branch.id,
+        terminalId: c.terminalId,
+        openedAt: new Date(),
+        openingCash: 100000,
+      },
+    });
+
+    const res = await get(c.token).expect(200);
+
+    expect(res.body.live.openShifts).toHaveLength(1);
+    expect(res.body.live.openShifts[0]).toMatchObject({
+      businessId: c.business.id,
+      branchId: c.branch.id,
+      branchName: 'Main',
+    });
+  });
+
+  it('flags a shift left open longer than 24 hours', async () => {
+    const c = await ctx();
+    await raw.shift.create({
+      data: {
+        branchId: c.branch.id,
+        terminalId: c.terminalId,
+        openedAt: new Date(Date.now() - 30 * 60 * 60 * 1000),
+        openingCash: 100000,
+      },
+    });
+
+    const res = await get(c.token).expect(200);
+
+    const flag = res.body.attention.unclosedShifts.find(
+      (u: any) => u.businessId === c.business.id,
+    );
+    expect(flag.count).toBe(1);
+  });
+
+  it('counts low stock from branch_stock against each products threshold', async () => {
+    const c = await ctx();
+    const category = await raw.category.create({
+      data: { businessId: c.business.id, name: 'Grocery' },
+    });
+    const low = await raw.product.create({
+      data: {
+        businessId: c.business.id,
+        categoryId: category.id,
+        name: 'Rice',
+        price: 5000,
+        lowStockThreshold: '10',
+      },
+    });
+    const fine = await raw.product.create({
+      data: {
+        businessId: c.business.id,
+        categoryId: category.id,
+        name: 'Beans',
+        price: 5000,
+        lowStockThreshold: '10',
+      },
+    });
+    const untracked = await raw.product.create({
+      data: {
+        businessId: c.business.id,
+        categoryId: category.id,
+        name: 'Salt',
+        price: 5000,
+      },
+    });
+    await raw.branchStock.createMany({
+      data: [
+        { branchId: c.branch.id, productId: low.id, qty: '3' },
+        { branchId: c.branch.id, productId: fine.id, qty: '50' },
+        { branchId: c.branch.id, productId: untracked.id, qty: '0' },
+      ],
+    });
+
+    const res = await get(c.token).expect(200);
+
+    // Only the product below its threshold counts. A product with no threshold
+    // set is not "low" — it is unmonitored, which is a different thing.
+    const flag = res.body.attention.lowStock.find(
+      (l: any) => l.businessId === c.business.id,
+    );
+    expect(flag.count).toBe(1);
+  });
+
+  it('reports zero unread notifications until the notification feature exists', async () => {
+    const c = await ctx();
+    const res = await get(c.token).expect(200);
+    expect(res.body.live.unreadNotifications).toBe(0);
+  });
+
+  it('lists terminals with their last-seen and paired state', async () => {
+    const c = await ctx();
+    const res = await get(c.token).expect(200);
+    expect(res.body.live.terminals).toEqual([
+      expect.objectContaining({
+        terminalId: c.terminalId,
+        branchId: c.branch.id,
+        paired: false,
+      }),
+    ]);
+  });
+
+  it('excludes demo businesses entirely', async () => {
+    const c = await ctx();
+    const demo = await raw.business.create({
+      data: {
+        ownerId: c.owner.id,
+        name: 'Demo',
+        type: 'retail',
+        taxRate: '0.12',
+        isDemo: true,
+      },
+    });
+    await raw.branch.create({
+      data: { businessId: demo.id, name: 'D', code: 'DM', address: 'x' },
+    });
+
+    const res = await get(c.token).expect(200);
+
+    expect(
+      res.body.businesses.some((b: any) => b.businessId === demo.id),
+    ).toBe(false);
+  });
+
+  it('never shows another owners business', async () => {
+    const c = await ctx();
+    const other = await ctx();
+    await seedSale(raw, {
+      branchId: other.branch.id,
+      terminalId: other.terminalId,
+      createdAt: new Date(),
+      lines: [{ qty: 1, unitPriceC: 99900 }],
+    });
+
+    const res = await get(c.token).expect(200);
+
+    expect(
+      res.body.businesses.some((b: any) => b.businessId === other.business.id),
+    ).toBe(false);
+  });
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+npm run test:e2e -- portal-analytics-dashboard
+```
+
+Expected: 404 on every case.
+
+- [ ] **Step 3: Write the low-stock SQL**
+
+Create `src/portal/analytics/reports/dashboard.sql.ts`:
+
+```ts
+import { Prisma } from '@prisma/client';
+import type { ScopedBusiness } from '../scope/analytics-scope.service';
+
+export interface LowStockRow {
+  low_count: bigint;
+}
+
+/**
+ * Low stock counted straight from `branch_stock`, not from `notifications` —
+ * nothing writes that table until sub-project B, and the dashboard has to work
+ * today.
+ *
+ * A product with NO `low_stock_threshold` is never counted: it is unmonitored,
+ * which is a different state from "low", and treating it as low would fill the
+ * attention list with noise on day one.
+ *
+ * Prisma cannot express this: comparing a column on `branch_stock` to a column
+ * on `products` is a cross-table predicate, not a filter.
+ */
+export function lowStockCountSql(business: ScopedBusiness): Prisma.Sql {
+  return Prisma.sql`
+    SELECT COUNT(*)::bigint AS low_count
+    FROM branch_stock bs
+    JOIN products p ON p.id = bs.product_id
+    WHERE bs.branch_id = ANY(${business.branchIds}::uuid[])
+      AND bs.deleted_at IS NULL
+      AND p.deleted_at IS NULL
+      AND p.active = true
+      AND p.track_stock = true
+      AND p.low_stock_threshold IS NOT NULL
+      AND bs.qty <= p.low_stock_threshold
+  `;
+}
+```
+
+- [ ] **Step 4: Write the dashboard service**
+
+Create `src/portal/analytics/dashboard/dashboard.service.ts`:
+
+```ts
+import { Inject, Injectable } from '@nestjs/common';
+import { PrismaService } from '../../../prisma/prisma.service';
+import {
+  SCOPED_PRISMA,
+  type ScopedPrisma,
+} from '../../../prisma/scoped-prisma.provider';
+import {
+  AnalyticsScopeService,
+  withWindow,
+  type BusinessBranches,
+  type ScopedBusiness,
+} from '../scope/analytics-scope.service';
+import { addDays, businessDayOf } from '../scope/business-day';
+import { ReportAuditService } from '../report-audit.service';
+import { runScoped } from '../scoped-sql';
+import {
+  lineAggregateSql,
+  saleAggregateSql,
+  type LineAggregateRow,
+  type SaleAggregateRow,
+} from '../reports/sales-aggregate.sql';
+import {
+  branchBreakdownSql,
+  bucketedSalesSql,
+  type BranchBreakdownRow,
+  type BucketSalesRow,
+} from '../reports/sales-buckets.sql';
+import { lowStockCountSql, type LowStockRow } from '../reports/dashboard.sql';
+
+const SPARKLINE_DAYS = 7;
+const UNCLOSED_SHIFT_HOURS = 24;
+
+export interface DayFigures {
+  salesC: number;
+  grossProfitC: number | null;
+  transactions: number;
+}
+
+export interface DashboardBusiness {
+  businessId: string;
+  name: string;
+  today: DayFigures;
+  sameDayLastWeek: DayFigures;
+  branches: { branchId: string; name: string; salesC: number; transactions: number }[];
+  sparkline: { date: string; salesC: number }[];
+}
+
+export interface DashboardReport {
+  businesses: DashboardBusiness[];
+  live: {
+    openShifts: {
+      shiftId: string;
+      businessId: string;
+      branchId: string;
+      branchName: string;
+      terminalName: string;
+      openedAt: Date;
+    }[];
+    terminals: {
+      terminalId: string;
+      businessId: string;
+      branchId: string;
+      name: string;
+      code: string;
+      lastSeenAt: Date | null;
+      paired: boolean;
+    }[];
+    unreadNotifications: number;
+  };
+  attention: {
+    lowStock: { businessId: string; count: number }[];
+    unclosedShifts: { businessId: string; count: number }[];
+  };
+}
+
+/**
+ * §0 Dashboard — the portal landing.
+ *
+ * Spans every non-demo business and IGNORES the business switcher by design:
+ * it is the one view that answers "is everything okay?" across the whole
+ * account.
+ *
+ * "Today" is computed per business, because a 00:00 business and an 04:00 café
+ * genuinely disagree about which day it is at 3 AM. That is why this service
+ * builds its own windows from `resolveBusinesses()` + `withWindow()` rather
+ * than taking a shared range.
+ *
+ * The live strip and attention items read through the SCOPED client wherever
+ * Prisma can express the query; only the low-stock count needs raw SQL, because
+ * it compares `branch_stock.qty` against a column on `products`.
+ */
+@Injectable()
+export class DashboardService {
+  constructor(
+    private readonly raw: PrismaService,
+    @Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma,
+    private readonly scope: AnalyticsScopeService,
+    private readonly reportAudit: ReportAuditService,
+  ) {}
+
+  async run(): Promise<DashboardReport> {
+    const businesses = await this.scope.resolveBusinesses({});
+    const now = new Date();
+
+    const rows: DashboardBusiness[] = [];
+    const lowStock: { businessId: string; count: number }[] = [];
+
+    for (const business of businesses) {
+      const today = businessDayOf(now, business.dayStartMinutes);
+      const lastWeek = addDays(today, -7);
+      const sparkFrom = addDays(today, -(SPARKLINE_DAYS - 1));
+
+      const todayScope = withWindow(business, today, today);
+      const lastWeekScope = withWindow(business, lastWeek, lastWeek);
+      const sparkScope = withWindow(business, sparkFrom, today);
+
+      const [figuresToday, figuresLastWeek, branches, sparkline, low] =
+        await Promise.all([
+          this.figures(todayScope),
+          this.figures(lastWeekScope),
+          this.branches(todayScope),
+          this.sparkline(sparkScope, sparkFrom, today),
+          this.lowStockCount(todayScope),
+        ]);
+
+      rows.push({
+        businessId: business.id,
+        name: business.name,
+        today: figuresToday,
+        sameDayLastWeek: figuresLastWeek,
+        branches,
+        sparkline,
+      });
+      lowStock.push({ businessId: business.id, count: low });
+    }
+
+    const live = await this.live(businesses);
+    const unclosedShifts = await this.unclosedShifts(businesses, now);
+
+    await this.reportAudit.log(
+      {
+        businesses: businesses.map((b) => withWindow(b, '2026-01-01', '2026-01-01')),
+        branchIds: businesses.flatMap((b) => b.branchIds),
+        from: businessDayOf(now, 0),
+        to: businessDayOf(now, 0),
+        dayCount: 1,
+      },
+      'dashboard',
+      'json',
+    );
+
+    return { businesses: rows, live, attention: { lowStock, unclosedShifts } };
+  }
+
+  private async figures(business: ScopedBusiness): Promise<DayFigures> {
+    const [sales] = await runScoped<SaleAggregateRow>(this.raw, business, (b) =>
+      saleAggregateSql(b, b.fromUtc, b.toUtc),
+    );
+    const [lines] = await runScoped<LineAggregateRow>(this.raw, business, (b) =>
+      lineAggregateSql(b, b.fromUtc, b.toUtc),
+    );
+
+    const costedItems = Number(lines.costed_items);
+    return {
+      salesC: Number(sales.gross_sales_c) - Number(sales.discounts_c),
+      grossProfitC:
+        costedItems === 0
+          ? null
+          : Number(lines.costed_revenue_c) - Number(lines.costed_cost_c),
+      transactions: Number(sales.transactions),
+    };
+  }
+
+  private async branches(
+    business: ScopedBusiness,
+  ): Promise<DashboardBusiness['branches']> {
+    const rows = await runScoped<BranchBreakdownRow>(
+      this.raw,
+      business,
+      branchBreakdownSql,
+    );
+    return rows.map((row) => ({
+      branchId: row.branch_id,
+      name: row.name,
+      salesC: Number(row.sales_c),
+      transactions: Number(row.transactions),
+    }));
+  }
+
+  private async sparkline(
+    business: ScopedBusiness,
+    from: string,
+    to: string,
+  ): Promise<{ date: string; salesC: number }[]> {
+    const rows = await runScoped<BucketSalesRow>(this.raw, business, (b) =>
+      bucketedSalesSql(b, 'day'),
+    );
+    const byDate = new Map(
+      rows.map((row) => [
+        row.bucket.toISOString().slice(0, 10),
+        Number(row.sales_c),
+      ]),
+    );
+
+    const points: { date: string; salesC: number }[] = [];
+    for (let date = from; ; date = addDays(date, 1)) {
+      points.push({ date, salesC: byDate.get(date) ?? 0 });
+      if (date === to) break;
+    }
+    return points;
+  }
+
+  private async lowStockCount(business: ScopedBusiness): Promise<number> {
+    const [row] = await runScoped<LowStockRow>(
+      this.raw,
+      business,
+      lowStockCountSql,
+    );
+    return Number(row.low_count);
+  }
+
+  /**
+   * Read through the scoped client and joined in TypeScript rather than with
+   * nested `include`s: branches and terminals are small, and three flat scoped
+   * reads are easier to reason about than one include tree passing through the
+   * choke point's arg walker.
+   */
+  private async live(
+    businesses: BusinessBranches[],
+  ): Promise<DashboardReport['live']> {
+    const branchToBusiness = new Map<string, string>();
+    for (const business of businesses) {
+      for (const branchId of business.branchIds) {
+        branchToBusiness.set(branchId, business.id);
+      }
+    }
+    const branchIds = [...branchToBusiness.keys()];
+
+    const [branches, terminals, shifts, unreadNotifications] = await Promise.all([
+      this.scoped.branch.findMany({
+        where: { id: { in: branchIds } },
+        select: { id: true, name: true },
+      }),
+      this.scoped.terminal.findMany({
+        where: { branchId: { in: branchIds } },
+        select: {
+          id: true,
+          branchId: true,
+          name: true,
+          code: true,
+          lastSeenAt: true,
+          deviceTokenHash: true,
+        },
+        orderBy: { createdAt: 'asc' },
+      }),
+      this.scoped.shift.findMany({
+        where: { branchId: { in: branchIds }, closedAt: null },
+        select: { id: true, branchId: true, terminalId: true, openedAt: true },
+        orderBy: { openedAt: 'asc' },
+      }),
+      this.scoped.notification.count({ where: { readAt: null } }),
+    ]);
+
+    const branchName = new Map(branches.map((b) => [b.id, b.name]));
+    const terminalName = new Map(terminals.map((t) => [t.id, t.name]));
+
+    return {
+      openShifts: shifts.map((shift) => ({
+        shiftId: shift.id,
+        businessId: branchToBusiness.get(shift.branchId) ?? '',
+        branchId: shift.branchId,
+        branchName: branchName.get(shift.branchId) ?? '',
+        terminalName: terminalName.get(shift.terminalId) ?? '',
+        openedAt: shift.openedAt,
+      })),
+      terminals: terminals.map((terminal) => ({
+        terminalId: terminal.id,
+        businessId: branchToBusiness.get(terminal.branchId) ?? '',
+        branchId: terminal.branchId,
+        name: terminal.name,
+        code: terminal.code,
+        lastSeenAt: terminal.lastSeenAt,
+        paired: terminal.deviceTokenHash !== null,
+      })),
+      unreadNotifications,
+    };
+  }
+
+  private async unclosedShifts(
+    businesses: BusinessBranches[],
+    now: Date,
+  ): Promise<{ businessId: string; count: number }[]> {
+    const cutoff = new Date(
+      now.getTime() - UNCLOSED_SHIFT_HOURS * 60 * 60 * 1000,
+    );
+
+    const counts: { businessId: string; count: number }[] = [];
+    for (const business of businesses) {
+      counts.push({
+        businessId: business.id,
+        count: await this.scoped.shift.count({
+          where: {
+            branchId: { in: business.branchIds },
+            closedAt: null,
+            openedAt: { lt: cutoff },
+          },
+        }),
+      });
+    }
+    return counts;
+  }
+}
+```
+
+- [ ] **Step 5: Write the controller and register it**
+
+Create `src/portal/analytics/dashboard/dashboard.controller.ts`:
+
+```ts
+import { Controller, Get, UseGuards } from '@nestjs/common';
+import { PortalAuthGuard } from '../../../auth/guards/portal-auth.guard';
+import { DashboardService, type DashboardReport } from './dashboard.service';
+
+/**
+ * §0 Dashboard — `GET /v1/portal/dashboard`.
+ *
+ * No query parameters: it deliberately spans every non-demo business and
+ * ignores the business switcher.
+ */
+@Controller('portal')
+@UseGuards(PortalAuthGuard)
+export class DashboardController {
+  constructor(private readonly dashboard: DashboardService) {}
+
+  @Get('dashboard')
+  get(): Promise<DashboardReport> {
+    return this.dashboard.run();
+  }
+}
+```
+
+Add `DashboardController` to `controllers` and `DashboardService` to `providers` in `src/portal/analytics/analytics.module.ts`.
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+```bash
+npm run test:e2e -- portal-analytics-dashboard
+```
+
+Expected: PASS, all cases.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/portal/analytics test/portal-analytics-dashboard.e2e-spec.ts
+git commit -m "feat(analytics): portal dashboard spanning every non-demo business"
+```
+
+---
+
+## Task 11: The invariants that keep the design honest
+
+Three cross-cutting properties, each cheap to assert here and expensive to discover in production. The modifier-revenue case already lives in this file from Task 6.
+
+**Files:**
+- Modify: `test/portal-analytics-invariants.e2e-spec.ts`
+
+**Interfaces:**
+- Consumes: every endpoint built in Tasks 7–10, plus `seedSale`/`seedBranchInfra`.
+- Produces: nothing — this task adds no source files.
+
+- [ ] **Step 1: Add the Nest bootstrap to the invariants spec**
+
+`test/portal-analytics-invariants.e2e-spec.ts` currently uses only a raw client. Add the same `beforeAll`/`afterAll` app bootstrap and the `ctx()` helper used in `test/portal-analytics-overview.e2e-spec.ts`, so the file can call the endpoints.
+
+- [ ] **Step 2: Write the failing tenancy cases**
+
+Append to the same describe block:
+
+```ts
+  const RANGE = 'from=2026-03-01&to=2026-03-07';
+  const inRange = new Date('2026-03-03T04:00:00.000Z');
+
+  // Every analytics endpoint. Any route added later belongs in this list —
+  // that is the point of listing them rather than testing one.
+  const REPORTS = [
+    'analytics/overview',
+    'analytics/sales/heatmap',
+    'analytics/sales/trend',
+    'analytics/sales/patterns',
+    'analytics/sales/breakdowns',
+    'analytics/tax',
+  ];
+
+  describe.each(REPORTS)('%s', (path) => {
+    it('404s when asked about a business the caller does not own', async () => {
+      const mine = await ctx();
+      const theirs = await ctx();
+      await request(server())
+        .get(`/v1/portal/${path}?${RANGE}&businessId=${theirs.business.id}`)
+        .set('Authorization', `Bearer ${mine.token}`)
+        .expect(404);
+    });
+
+    it('404s when asked about a branch the caller does not own', async () => {
+      const mine = await ctx();
+      const theirs = await ctx();
+      await request(server())
+        .get(
+          `/v1/portal/${path}?${RANGE}&businessId=${mine.business.id}&branchId=${theirs.branch.id}`,
+        )
+        .set('Authorization', `Bearer ${mine.token}`)
+        .expect(404);
+    });
+
+    it('never includes another tenants sales in an all-businesses rollup', async () => {
+      const mine = await ctx();
+      const theirs = await ctx();
+      await seedSale(raw, {
+        branchId: theirs.branch.id,
+        terminalId: theirs.terminalId,
+        createdAt: inRange,
+        lines: [{ qty: 1, unitPriceC: 99900 }],
+      });
+
+      const res = await request(server())
+        .get(`/v1/portal/${path}?${RANGE}`)
+        .set('Authorization', `Bearer ${mine.token}`)
+        .expect(200);
+
+      // 99900 is unmistakable: if raw SQL ever loses its branch predicate, it
+      // shows up here as somebody else's money.
+      expect(JSON.stringify(res.body)).not.toContain('99900');
+    });
+
+    it('requires authentication', async () => {
+      await request(server()).get(`/v1/portal/${path}?${RANGE}`).expect(401);
+    });
+  });
+```
+
+- [ ] **Step 3: Write the failing null-cost case**
+
+```ts
+  it('never reports an uncosted product as zero-margin anywhere', async () => {
+    const c = await ctx();
+    await seedSale(raw, {
+      branchId: c.branch.id,
+      terminalId: c.terminalId,
+      createdAt: inRange,
+      lines: [{ qty: 1, unitPriceC: 10000, costC: null }],
+    });
+
+    const overview = await request(server())
+      .get(`/v1/portal/analytics/overview?${RANGE}&businessId=${c.business.id}`)
+      .set('Authorization', `Bearer ${c.token}`)
+      .expect(200);
+
+    // A zero here would claim 100% margin on a product whose cost nobody knows.
+    expect(overview.body.grossProfitC.value).toBeNull();
+    expect(overview.body.marginPct.value).toBeNull();
+
+    const trend = await request(server())
+      .get(
+        `/v1/portal/analytics/sales/trend?${RANGE}&businessId=${c.business.id}&granularity=day`,
+      )
+      .set('Authorization', `Bearer ${c.token}`)
+      .expect(200);
+
+    const day = trend.body.buckets.find((b: any) => b.bucket === '2026-03-03');
+    expect(day.salesC).toBe(10000);
+    expect(day.grossProfitC).toBeNull();
+  });
+
+  it('writes an empty CSV field for an unknown margin, not a zero', async () => {
+    const c = await ctx();
+    await seedSale(raw, {
+      branchId: c.branch.id,
+      terminalId: c.terminalId,
+      createdAt: inRange,
+      lines: [{ qty: 1, unitPriceC: 10000, costC: null }],
+    });
+
+    const res = await request(server())
+      .get(
+        `/v1/portal/analytics/overview?${RANGE}&businessId=${c.business.id}&format=csv`,
+      )
+      .set('Authorization', `Bearer ${c.token}`)
+      .expect(200);
+
+    expect(res.text).toContain('Gross profit,,,');
+  });
+```
+
+- [ ] **Step 4: Write the failing business-day case**
+
+```ts
+  it('agrees with the SQL bucketing about which business day a 3 AM sale belongs to', async () => {
+    const cafe = await ctx({ dayStartTime: '04:00' });
+    // 2026-03-03 03:00 Manila == 2026-03-02T19:00Z — the previous business day.
+    await seedSale(raw, {
+      branchId: cafe.branch.id,
+      terminalId: cafe.terminalId,
+      createdAt: new Date('2026-03-02T19:00:00.000Z'),
+      lines: [{ qty: 1, unitPriceC: 10000 }],
+    });
+
+    const res = await request(server())
+      .get(
+        `/v1/portal/analytics/sales/heatmap?${RANGE}&businessId=${cafe.business.id}`,
+      )
+      .set('Authorization', `Bearer ${cafe.token}`)
+      .expect(200);
+
+    const byDate = Object.fromEntries(
+      res.body.days.map((d: any) => [d.date, d.salesC]),
+    );
+    expect(byDate['2026-03-02']).toBe(10000);
+    expect(byDate['2026-03-03']).toBe(0);
+  });
+
+  it('keeps two businesses with different day starts in their own buckets', async () => {
+    const midnight = await ctx({ dayStartTime: '00:00' });
+    const cafe = await raw.business.create({
+      data: {
+        ownerId: midnight.owner.id,
+        name: 'Cafe',
+        type: 'fnb',
+        taxRate: '0.12',
+        dayStartTime: '04:00',
+      },
+    });
+    const cafeBranch = await raw.branch.create({
+      data: { businessId: cafe.id, name: 'C', code: 'CF', address: 'x' },
+    });
+    const { terminalId } = await seedBranchInfra(raw, cafeBranch.id);
+
+    const at3am = new Date('2026-03-02T19:00:00.000Z');
+    await seedSale(raw, {
+      branchId: midnight.branch.id,
+      terminalId: midnight.terminalId,
+      createdAt: at3am,
+      lines: [{ qty: 1, unitPriceC: 10000 }],
+    });
+    await seedSale(raw, {
+      branchId: cafeBranch.id,
+      terminalId,
+      createdAt: at3am,
+      lines: [{ qty: 1, unitPriceC: 20000 }],
+    });
+
+    const res = await request(server())
+      .get(`/v1/portal/analytics/sales/heatmap?${RANGE}`)
+      .set('Authorization', `Bearer ${midnight.token}`)
+      .expect(200);
+
+    const byDate = Object.fromEntries(
+      res.body.days.map((d: any) => [d.date, d.salesC]),
+    );
+    // The SAME instant lands on different business days for the two businesses,
+    // and the rollup sums the buckets rather than picking one calendar.
+    expect(byDate['2026-03-02']).toBe(20000);
+    expect(byDate['2026-03-03']).toBe(10000);
+  });
+```
+
+- [ ] **Step 5: Run the tests to verify they fail, then pass**
+
+```bash
+npm run test:e2e -- portal-analytics-invariants
+```
+
+Expected: every case passes against the code from Tasks 7–10. Any failure here is a real defect in that code, not in the test — fix the source, not the assertion. In particular:
+- a `99900` appearing in a rollup means a report query lost its branch predicate;
+- a `0` where `null` was expected means a costed/uncosted split is missing its `costed_items` guard;
+- a heatmap date one day out means `businessDayExpr` and `businessDayOf` have drifted apart.
+
+- [ ] **Step 6: Run the whole suite and the linter**
+
+```bash
+npm test && npm run test:e2e && npm run lint && npm run build
+```
+
+Expected: everything green.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add test/portal-analytics-invariants.e2e-spec.ts
+git commit -m "test(analytics): tenancy, null-cost and business-day invariants across every report"
+```
+
+---
+
+## Self-review notes
+
+Checked against the spec after writing:
+
+**Spec coverage.** §0 dashboard → Task 10. §1 overview → Task 7. §2 sales (heatmap, trend, patterns, breakdowns) → Task 8. §6 tax → Task 9. CSV on every report → Task 3 + each report's `*.csv.ts`. Scope resolver → Task 4. `runScoped` → Task 5. Business-day bucketing → Tasks 2 and 8. Null-cost rule → Tasks 7 and 11. Sensitive reads → Task 5, asserted in Task 7. Catalog modifier-group read → Task 1. §3, §4 and §5 are plan 2, as the spec states.
+
+**Deliberate deviation from the spec, recorded here.** The spec's §2 lists heatmap, trend and patterns as one "Sales" group; this plan exposes `patterns` as its own endpoint rather than folding it into `trend`, because the two have different shapes (24+7 fixed buckets versus a variable date series) and one endpoint returning both would force every caller to fetch what it does not need.
+
+**Interface consistency.** `ScopedBusiness` is produced in Task 4 and consumed by name in Tasks 5, 7, 8, 9, 10. `LINE_MODS_JOIN`/`LINE_NET_C`/`LINE_COST_C` are produced in Task 7 and reused in Task 8. `bucketedSalesSql` and `branchBreakdownSql` are produced in Task 8 and reused in Task 10 — **Task 10 therefore depends on Task 8 and must not be reordered before it.** `saleAggregateSql`/`lineAggregateSql` are produced in Task 7 and reused in Task 10. `centavosToPesos`/`formatPct`/`CsvSection` are produced in Task 3 and used by every `*.csv.ts`. `seedSale` is produced in Task 6 and used by Tasks 7–11.
+
+**Task order is a dependency order.** 1 is independent. 2 and 3 are independent of each other. 4 needs 2. 5 needs 3 and 4. 6 is independent of 2–5 but needed by 7. 7 needs 5 and 6. 8 needs 7. 9 needs 5 and 6. 10 needs 7 and 8. 11 needs 7–10.
+
+## Execution handoff
+
+Plan complete and saved to `docs/superpowers/plans/2026-09-06-analytics-money-reports.md`. Two execution options:
+
+**1. Subagent-Driven (recommended)** — a fresh subagent per task, review between tasks, fast iteration.
+
+**2. Inline Execution** — execute tasks in this session using executing-plans, batch execution with checkpoints.
+
