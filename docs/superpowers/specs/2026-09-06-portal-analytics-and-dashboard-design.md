@@ -117,7 +117,7 @@ interface ScopedBusiness {
 }
 
 interface ResolvedScope {
-  businesses: ScopedBusiness[];  // never empty — an empty result throws NotFound
+  businesses: ScopedBusiness[];  // may be empty — see the NotFound rule below
   branchIds: string[];           // the union, for messages and guards
   from: string;                  // YYYY-MM-DD, as asked
   to: string;
@@ -134,10 +134,16 @@ removes any chance of cross-bucketing.
 
 It resolves ids **through the scoped Prisma client** (`scoped.business`,
 `scoped.branch`), so the tenant choke point — not this service — decides what
-the caller may see. A `businessId` the caller does not own resolves to zero
-businesses and raises `NotFoundError`, matching `assertBusinessOwned`'s
-no-existence-leak behaviour. Demo businesses are dropped unless the caller asked
-for one by id.
+the caller may see. Demo businesses are dropped unless the caller asked for one
+by id.
+
+**404 is for a named id that isn't yours, and nothing else.** A `businessId` or
+`branchId` the caller does not own resolves to nothing and raises
+`NotFoundError`, matching `assertBusinessOwned`'s no-existence-leak behaviour.
+But an owned business that simply has no branches yet yields an empty
+`businesses` list, and every report returns its zero shape — a 200 with zeros,
+not a 404. A new business with nothing in it is a legitimate thing to ask about,
+and answering "not found" would be a lie.
 
 ### 2. Raw SQL, and the one rule that makes it safe
 
