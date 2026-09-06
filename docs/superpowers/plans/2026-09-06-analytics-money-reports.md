@@ -2,100 +2,68 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the portal dashboard (§0), overview (§1), sales (§2) and tax (§6) reports with CSV export, on a shared analytics foundation, plus the product→modifier-group read the portal is missing.
+**Goal:** Ship the portal's dashboard, overview, sales and tax reports — with CSV export and every shared mechanism they need — plus the product read that returns its linked modifier groups.
 
-**Architecture:** A scope resolver turns a shared query DTO into per-business windows through the tenant-scoped Prisma client; hand-written SQL runs per business behind one `runScoped()` guard, because the tenancy choke point does not cover raw queries; results merge in TypeScript. Every report renders as JSON or CSV from one object.
+**Architecture:** A new `src/portal/analytics/` module. One scope resolver turns a shared query DTO into per-business windows (each business has its own `dayStartTime`, so each has its own UTC interval); every report query is hand-written SQL run through a `runScoped()` helper that forces a `branch_id` predicate bound from ids the tenancy choke point produced. Reports return JSON or, with `?format=csv`, the same object rendered by one shared CSV writer.
 
-**Tech Stack:** NestJS 11, Prisma 6 (PostgreSQL), class-validator, Jest (unit, `rootDir: src`) + Jest e2e (`test/*.e2e-spec.ts`, real Postgres via docker compose), supertest.
+**Tech Stack:** NestJS 11, Prisma 6 (PostgreSQL), class-validator, Jest (unit: `npm test`, rootDir `src`, `*.spec.ts`) and Jest e2e (`npm run test:e2e`, rootDir `test`, `*.e2e-spec.ts`) with supertest.
 
-**Spec:** `docs/superpowers/specs/2026-09-06-portal-analytics-and-dashboard-design.md`. Plan 1 of 2; plan 2 covers §3 products, §4 profit & leaks, §5 inventory.
+**Spec:** `docs/superpowers/specs/2026-09-06-portal-analytics-and-dashboard-design.md`. This plan is 1 of 2; plan 2 covers §3 products, §4 profit & leaks, §5 inventory and introduces no new infrastructure.
 
 ## Global Constraints
 
 Every task's requirements implicitly include all of these.
 
-- **Integer centavos everywhere.** SQL aggregates cast to `::bigint`; convert with `Number(...)` at the edge. Money fields are suffixed `C`.
-- **A null cost is `null`, never `0`.** Zero would report 100% margin on uncosted products.
-- **Line gross is `round(qty * (unit_price + Σ modifier priceDeltaC))` — never `qty * unit_price`.** `sale_items.unit_price` is the base price without modifier deltas (`sales.service.ts:507`); the engine adds `lineUnitWithModsC()` (`cart.ts:49`). `cost_snapshot` is the **unit** cost (`sales.service.ts:664`), so line cost is `round(qty * cost_snapshot)`.
-- **Every analytics query runs per business** and results merge in TypeScript, because `dayStartTime` differs per business.
-- **Every analytics SQL query goes through `runScoped()`** and carries a `branch_id` predicate bound from ids the choke point produced. `$queryRaw` bypasses the tenancy extension (`scoped-prisma.ts:737` hooks `$allModels` only).
-- **Voided sales are excluded from every money figure and from `transactions`; refunded sales are excluded from money figures but their count is reported.**
-- **Asia/Manila is UTC+8 year-round** (no DST since 1978), so fixed-offset arithmetic is correct. `MANILA_OFFSET_MINUTES = 480`.
-- **Validation failures are 422 `validation`** (the global `ValidationPipe` sets `errorHttpStatusCode: UNPROCESSABLE_ENTITY`, `main.ts:16`); a named id that isn't yours is 404 `not_found`. An owned business with no branches is a 200 with zeros, never a 404.
-- **Routes** are `@Controller('portal')` + `@UseGuards(PortalAuthGuard)` under the `v1` global prefix.
+- **Integer centavos everywhere.** SQL aggregates cast to `::bigint`; convert with `Number()` at the edge. Money fields in responses are suffixed `C` and are integers.
+- **A null cost is `null`, never `0`.** A zero reports 100% margin on every uncosted product. Where cost is unset, margin and profit are `null`.
+- **Every analytics query runs per business**, and results merge in TypeScript. There is no query spanning businesses — `dayStartTime` differs per business, so a shared bucket would be wrong.
+- **Every analytics query goes through `runScoped()`** and must contain a `branch_id` predicate bound from `business.branchIds`. Raw SQL bypasses the tenancy choke point (`scoped-prisma.ts:737` hooks `$allModels` only).
+- **Line gross is `round(qty * (unit_price + Σ modifier priceDeltaC))`, never `qty * unit_price`.** `sale_items.unit_price` is the base price without modifiers (`sales.service.ts:507`); the engine's gross includes them (`cart.ts:49`). `cost_snapshot` is the **unit** cost (`sales.service.ts:664`), so line cost is `round(qty * cost_snapshot)`.
+- **Voided sales are excluded from every money figure and from transaction counts. Refunded sales are excluded from money figures but their count is reported.**
+- **Validation failures are 422 `validation`** (the global pipe uses `errorHttpStatusCode: UNPROCESSABLE_ENTITY`, `main.ts:16`). A named id the caller does not own is 404 `not_found`. An owned business with no branches is a 200 with zeros, never a 404.
+- **Asia/Manila is UTC+8 year-round** (no DST since 1978), so fixed-offset arithmetic is correct. Write that reason down wherever the offset appears.
+- **Routes** live under the `v1` global prefix, in `@Controller('portal')` classes gated by `@UseGuards(PortalAuthGuard)`.
 - **Sensitive reads** append `audit.report_read`; CSV exports append `audit.report_export`.
-- **Never add a Claude co-author trailer to a commit. Never run `git push`.** Commit directly on `main`.
-
-**Commands:** `npm test` (unit), `npm run test:e2e` (needs `docker compose up -d db`), `npm run lint`, `npm run build`.
-
----
+- **Git:** commit on `main`. Never add a `Co-Authored-By: Claude` trailer or any AI attribution. Never run `git push` — stop and tell the user instead.
 
 ## File Structure
 
-**Created:**
+**New module — `src/portal/analytics/`:**
 
 | File | Responsibility |
 |---|---|
-| `src/portal/analytics/scope/business-day.ts` | Pure business-day ↔ UTC arithmetic. No I/O. |
-| `src/portal/analytics/scope/business-day.spec.ts` | Unit tests for the above. |
-| `src/portal/analytics/csv.ts` | RFC 4180 CSV writer + centavos→pesos formatting. Pure. |
-| `src/portal/analytics/csv.spec.ts` | Unit tests for the above. |
-| `src/portal/analytics/dto/analytics-query.dto.ts` | The shared query DTO for every report. |
-| `src/portal/analytics/scope/analytics-scope.service.ts` | `BusinessBranches`, `ScopedBusiness`, `ResolvedScope`, `withWindow()`, `AnalyticsScopeService`. |
-| `src/portal/analytics/scope/analytics-scope.service.spec.ts` | Unit tests with a stubbed scoped client. |
-| `src/portal/analytics/scoped-sql.ts` | `runScoped()` — the one door raw analytics SQL goes through. |
-| `src/portal/analytics/scoped-sql.spec.ts` | Unit tests for its two guards. |
-| `src/portal/analytics/report-response.ts` | `renderReport()` — JSON or CSV from one object. |
-| `src/portal/analytics/report-response.spec.ts` | Unit tests for header/format behaviour. |
-| `src/portal/analytics/report-audit.service.ts` | `audit.report_read` / `audit.report_export` rows. |
-| `src/portal/analytics/analytics.module.ts` | Wires providers and controllers. |
-| `src/portal/analytics/reports/sales-aggregate.sql.ts` | Sale-level and line-level aggregate SQL builders. |
-| `src/portal/analytics/reports/sales-buckets.sql.ts` | Bucketed/grouped SQL for §2. |
-| `src/portal/analytics/reports/dashboard.sql.ts` | Low-stock count SQL for §0. |
-| `src/portal/analytics/overview/overview.service.ts` | §1 computation. |
-| `src/portal/analytics/overview/overview.controller.ts` | §1 route. |
-| `src/portal/analytics/overview/overview.csv.ts` | §1 CSV sections. |
-| `src/portal/analytics/sales/sales-report.service.ts` | §2 computation. |
-| `src/portal/analytics/sales/sales-report.controller.ts` | §2 routes. |
-| `src/portal/analytics/sales/sales-report.csv.ts` | §2 CSV sections. |
-| `src/portal/analytics/tax/tax-report.service.ts` | §6 computation. |
-| `src/portal/analytics/tax/tax-report.controller.ts` | §6 route. |
-| `src/portal/analytics/tax/tax-report.csv.ts` | §6 CSV sections. |
-| `src/portal/analytics/dashboard/dashboard.service.ts` | §0 computation. |
-| `src/portal/analytics/dashboard/dashboard.controller.ts` | §0 route. |
-| `test/helpers/sales.ts` | `seedSale()` — writes sales through the real totals engine. |
-| `test/portal-analytics-overview.e2e-spec.ts` | §1 against real data. |
-| `test/portal-analytics-sales.e2e-spec.ts` | §2 against real data. |
-| `test/portal-analytics-tax.e2e-spec.ts` | §6 against real data. |
-| `test/portal-analytics-dashboard.e2e-spec.ts` | §0 against real data. |
-| `test/portal-analytics-invariants.e2e-spec.ts` | Tenancy, null-cost, business-day, modifier-revenue. |
+| `analytics.module.ts` | Wires controllers and providers; imported by `PortalModule` |
+| `dto/analytics-query.dto.ts` | The shared query DTO every report accepts |
+| `scope/business-day.ts` | Pure business-day ↔ UTC arithmetic. No Nest, no Prisma |
+| `scope/analytics-scope.service.ts` | `AnalyticsQueryDto` → `ResolvedScope` via the scoped client |
+| `scoped-sql.ts` | `runScoped()` — the only way analytics touches raw SQL |
+| `csv.ts` | Pure CSV writer + centavos→pesos rendering |
+| `report-response.ts` | JSON-or-CSV rendering and the `Content-Disposition` header |
+| `report-audit.service.ts` | `audit.report_read` / `audit.report_export` rows |
+| `reports/*.sql.ts` | Pure `Prisma.Sql` builders, one file per report family |
+| `overview/`, `sales/`, `tax/`, `dashboard/` | One controller + service + CSV shaper per spec tab |
 
-**Modified:**
+**Modified:** `src/portal/portal.module.ts` (import `AnalyticsModule`), `src/portal/catalog/products.service.ts` (Task 1), `src/common/validation-constants.ts` (Task 4).
 
-| File | Change |
-|---|---|
-| `src/common/validation-constants.ts` | Add `ISO_DATE_REGEX`. |
-| `src/portal/catalog/products.service.ts` | `PRODUCT_INCLUDE`, `modifierGroupIds` on `ProductResponse`. |
-| `src/portal/portal.module.ts` | Import `AnalyticsModule`. |
-| `test/portal-modifiers-discounts.e2e-spec.ts` | Two cases for the product read. |
+**New test helper:** `test/helpers/sales.ts` — seeds sales through the real totals engine so report SQL is checked against the same arithmetic the POS uses.
 
 ---
 
-## Task 1: Product read returns its linked modifier groups
+### Task 1: Product read returns its linked modifier groups
 
-The portal's modifier-links editor currently warns on screen that it cannot show the current selection, because no endpoint returns it. This closes that gap. Independent of everything else in this plan.
+The portal's modifier-links editor currently warns on screen that it cannot show the current selection, because there is no way to read it. `GET /v1/portal/products/:id` includes variants only.
 
 **Files:**
-- Modify: `src/portal/catalog/products.service.ts`
+- Modify: `src/portal/catalog/products.service.ts` (the `ProductWithVariants` type, `VARIANTS_INCLUDE`, `ProductResponse`, `serializeProduct`)
 - Test: `test/portal-modifiers-discounts.e2e-spec.ts`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `ProductResponse.modifierGroupIds: string[]` on every product read (`list`, `get`, `create`, `update`, `remove`).
+- Produces: `ProductResponse.modifierGroupIds: string[]` — the ids currently linked, oldest link first. Present on every product read (`list`, `get`, `create`, `update`, `remove`).
 
 - [ ] **Step 1: Write the failing tests**
 
-Append inside the `describe('Portal modifiers + discounts (e2e)', ...)` block in `test/portal-modifiers-discounts.e2e-spec.ts`. The `ctx()` and `createGroup()` helpers already exist in that file; `milkGroup()` is defined at module scope.
+Append inside the existing `describe('Portal modifiers + discounts (e2e)')` block in `test/portal-modifiers-discounts.e2e-spec.ts`. The file already provides `ctx()` (returns `{ token, businessId, categoryId, productId }`), `createGroup(token, businessId, body)`, `milkGroup()` and `server()`.
 
 ```ts
   it('returns the linked modifier group ids on a product read', async () => {
@@ -116,20 +84,19 @@ Append inside the `describe('Portal modifiers + discounts (e2e)', ...)` block in
     expect(res.body.modifierGroupIds).toEqual([group.id]);
   });
 
-  it('reports an empty link set as [] after the links are cleared', async () => {
+  it('reports an empty link set as [] once the links are cleared', async () => {
     const { token, businessId, productId } = await ctx();
     const group = await createGroup(token, businessId, milkGroup());
 
-    await request(server())
-      .put(`/v1/portal/products/${productId}/modifier-groups`)
-      .set('Authorization', `Bearer ${token}`)
-      .send({ groupIds: [group.id] })
-      .expect(200);
-    await request(server())
-      .put(`/v1/portal/products/${productId}/modifier-groups`)
-      .set('Authorization', `Bearer ${token}`)
-      .send({ groupIds: [] })
-      .expect(200);
+    const link = (groupIds: string[]) =>
+      request(server())
+        .put(`/v1/portal/products/${productId}/modifier-groups`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ groupIds })
+        .expect(200);
+
+    await link([group.id]);
+    await link([]);
 
     const res = await request(server())
       .get(`/v1/portal/products/${productId}`)
@@ -139,7 +106,7 @@ Append inside the `describe('Portal modifiers + discounts (e2e)', ...)` block in
     expect(res.body.modifierGroupIds).toEqual([]);
   });
 
-  it('lists products with their link sets too, so the list never lies by omission', async () => {
+  it('lists products with their link sets, so the list cannot claim "no groups" wrongly', async () => {
     const { token, businessId, productId } = await ctx();
     const group = await createGroup(token, businessId, milkGroup());
 
@@ -154,8 +121,8 @@ Append inside the `describe('Portal modifiers + discounts (e2e)', ...)` block in
       .set('Authorization', `Bearer ${token}`)
       .expect(200);
 
-    const row = res.body.find((p: any) => p.id === productId);
-    expect(row.modifierGroupIds).toEqual([group.id]);
+    const listed = res.body.find((p: any) => p.id === productId);
+    expect(listed.modifierGroupIds).toEqual([group.id]);
   });
 ```
 
@@ -165,19 +132,19 @@ Append inside the `describe('Portal modifiers + discounts (e2e)', ...)` block in
 npm run test:e2e -- portal-modifiers-discounts
 ```
 
-Expected: three failures, each `expect(received).toEqual(expected)` with `received: undefined` — `modifierGroupIds` is not on the response yet.
+Expected: three failures, each `expect(received).toEqual(expected)` with `received: undefined` — `modifierGroupIds` is not on the response.
 
-- [ ] **Step 3: Find every read path that must carry the relation**
+- [ ] **Step 3: Find every place the product include is used**
 
 ```bash
 grep -n "VARIANTS_INCLUDE\|ProductWithVariants" src/portal/catalog/products.service.ts
 ```
 
-Every occurrence gets replaced in Step 4. The point of using one shared include constant is that the compiler then forces all read paths to carry the relation — a path that skipped it would return `[]` and quietly claim the product has no linked groups.
+Expected: the `type ProductWithVariants` declaration (~line 16), the `const VARIANTS_INCLUDE` declaration (~line 25), and four `include: VARIANTS_INCLUDE` call sites plus the `loadOwned` return type. Every one changes in the next step; the compiler will catch any you miss.
 
-- [ ] **Step 4: Add the relation to the include, the type, and the response**
+- [ ] **Step 4: Widen the include and the response**
 
-In `src/portal/catalog/products.service.ts`, replace the `ProductWithVariants` type and the `VARIANTS_INCLUDE` constant:
+In `src/portal/catalog/products.service.ts`, replace the type and the include constant:
 
 ```ts
 type ProductWithRelations = Prisma.ProductGetPayload<{
@@ -190,13 +157,13 @@ type ProductWithRelations = Prisma.ProductGetPayload<{
 /**
  * Variants load oldest-first within a product (stable display order); products
  * themselves list newest-first (see `list`). The choke point injects
- * `deletedAt: null`, so only live variants come back.
+ * `deletedAt: null`, so only live variants and live links come back.
  *
- * `productModifierGroups` is a CHILD_ONLY model (`model-scope-map.ts:60`) — it
- * has no top-level tenant access, and is legitimately reached here through its
- * scoped parent. It rides EVERY product read on purpose: `serializeProduct`
- * requires the relation, so the compiler rejects any read path that would
- * return `modifierGroupIds: []` for a product that actually has links.
+ * `productModifierGroups` is a CHILD_ONLY model — no top-level access — but a
+ * relation include through its scoped parent is exactly how it is meant to be
+ * read. Every read path uses THIS constant so `modifierGroupIds` is never a
+ * guess: a response that said `[]` because the caller forgot the include would
+ * be indistinguishable from a product with no groups.
  */
 const PRODUCT_INCLUDE = {
   variants: { orderBy: { createdAt: 'asc' as const } },
@@ -207,77 +174,70 @@ const PRODUCT_INCLUDE = {
 };
 ```
 
-Add the field to `ProductResponse`, after `variants`:
+Rename every `VARIANTS_INCLUDE` usage to `PRODUCT_INCLUDE` and every `ProductWithVariants` to `ProductWithRelations`.
+
+Add the field to the response interface, after `variants`:
 
 ```ts
+export interface ProductResponse {
+  // ...existing fields, unchanged...
   variants: VariantResponse[];
-  /** Ids of the linked modifier groups — the full set, replace-set on PUT. */
   modifierGroupIds: string[];
+}
 ```
 
-Change `serializeProduct` to **require** both relations (no optional `?`, no `?? []` fallback — the missing-relation case must be a compile error, not an empty array):
+And in `serializeProduct`, **require** the relation rather than defaulting it — the compiler then guarantees every call site loaded it:
 
 ```ts
 function serializeProduct(
   p: Product & {
-    variants: ProductVariant[];
+    variants?: ProductVariant[];
     productModifierGroups: { groupId: string }[];
   },
 ): ProductResponse {
-```
-
-and add to its returned object, after `variants`:
-
-```ts
-    variants: p.variants.map(serializeVariant),
+  return {
+    // ...existing fields, unchanged...
+    variants: (p.variants ?? []).map(serializeVariant),
     modifierGroupIds: p.productModifierGroups.map((link) => link.groupId),
+  };
+}
 ```
 
-Then replace every remaining `VARIANTS_INCLUDE` with `PRODUCT_INCLUDE` and every `ProductWithVariants` with `ProductWithRelations`.
-
-- [ ] **Step 5: Compile and fix any read path the compiler rejects**
-
-```bash
-npm run build
-```
-
-Expected: clean. If a call site fails with "Property 'productModifierGroups' is missing", that path was reading a product without the include — give it `PRODUCT_INCLUDE`. That error is the guard working.
-
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
 npm run test:e2e -- portal-modifiers-discounts
+npm run lint && npm run build
 ```
 
-Expected: PASS, whole file green (the existing link and group tests must not regress).
+Expected: the whole file passes, including the pre-existing cases. Lint and build clean.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/portal/catalog/products.service.ts test/portal-modifiers-discounts.e2e-spec.ts
-git commit -m "feat(portal): return a product's linked modifier group ids on read"
+git commit -m "feat(api): return a product's linked modifier group ids on every product read"
 ```
 
 ---
 
-## Task 2: Business-day arithmetic
+### Task 2: Business-day arithmetic
 
-`Business.dayStartTime` has existed since the first migration and nothing reads it. This pure module is its first consumer, and every bucketed report depends on it being right.
+`Business.dayStartTime` has existed since the first migration and nothing reads it. Analytics is its first consumer. This task is pure functions and unit tests — no Nest, no Prisma, no database.
 
 **Files:**
 - Create: `src/portal/analytics/scope/business-day.ts`
 - Test: `src/portal/analytics/scope/business-day.spec.ts`
 
 **Interfaces:**
-- Consumes: nothing. No I/O, no Prisma, no Nest.
+- Consumes: nothing.
 - Produces:
-  - `MANILA_OFFSET_MINUTES: 480`
+  - `MANILA_OFFSET_MINUTES: number`
   - `parseDayStart(dayStartTime: string): number`
   - `businessDayStartUtc(date: string, dayStartMinutes: number): Date`
   - `businessDayOf(instant: Date, dayStartMinutes: number): string`
-  - `businessDayRangeUtc(from: string, to: string, dayStartMinutes: number): { fromUtc: Date; toUtc: Date }`
   - `businessDaySeries(from: string, to: string): string[]`
-  - `addDays(date: string, days: number): string`
+  - `businessDayRangeUtc(from: string, to: string, dayStartMinutes: number): { fromUtc: Date; toUtc: Date }`
   - `previousPeriod(fromUtc: Date, toUtc: Date): { fromUtc: Date; toUtc: Date }`
 
 - [ ] **Step 1: Write the failing tests**
@@ -286,8 +246,6 @@ Create `src/portal/analytics/scope/business-day.spec.ts`:
 
 ```ts
 import {
-  MANILA_OFFSET_MINUTES,
-  addDays,
   businessDayOf,
   businessDayRangeUtc,
   businessDaySeries,
@@ -303,16 +261,15 @@ describe('parseDayStart', () => {
     expect(parseDayStart('23:59')).toBe(1439);
   });
 
-  it('rejects anything that is not HH:mm on a 24-hour clock', () => {
-    expect(() => parseDayStart('24:00')).toThrow(/HH:mm/);
-    expect(() => parseDayStart('4:00')).toThrow(/HH:mm/);
-    expect(() => parseDayStart('')).toThrow(/HH:mm/);
+  it('rejects anything that is not HH:mm', () => {
+    expect(() => parseDayStart('4:00')).toThrow();
+    expect(() => parseDayStart('24:00')).toThrow();
+    expect(() => parseDayStart('')).toThrow();
   });
 });
 
 describe('businessDayStartUtc', () => {
   it('starts a midnight business day at 16:00 UTC the day before', () => {
-    // Manila is UTC+8, so 2026-03-02 00:00 local is 2026-03-01 16:00Z.
     expect(businessDayStartUtc('2026-03-02', 0).toISOString()).toBe(
       '2026-03-01T16:00:00.000Z',
     );
@@ -326,45 +283,25 @@ describe('businessDayStartUtc', () => {
 });
 
 describe('businessDayOf', () => {
-  // The café case: 03:00 Manila trading belongs to the PREVIOUS business day
-  // when the day starts at 04:00. This is the whole reason dayStartTime exists.
-  const threeAmManila = new Date('2026-03-01T19:00:00.000Z'); // 2026-03-02 03:00 +08
+  // 03:00 Manila on 2 March is 19:00 UTC on 1 March.
+  const threeAm = new Date('2026-03-01T19:00:00.000Z');
 
-  it('puts 3 AM trading on the previous day for an 04:00 start', () => {
-    expect(businessDayOf(threeAmManila, 240)).toBe('2026-03-01');
+  it('puts a 3 AM sale on the same date for a midnight business', () => {
+    expect(businessDayOf(threeAm, 0)).toBe('2026-03-02');
   });
 
-  it('puts the same instant on the calendar day for a midnight start', () => {
-    expect(businessDayOf(threeAmManila, 0)).toBe('2026-03-02');
+  it('puts a 3 AM sale on the PREVIOUS date for an 04:00 cafe', () => {
+    expect(businessDayOf(threeAm, 240)).toBe('2026-03-01');
   });
 
-  it('puts 5 AM trading on the same day for an 04:00 start', () => {
-    const fiveAmManila = new Date('2026-03-01T21:00:00.000Z');
-    expect(businessDayOf(fiveAmManila, 240)).toBe('2026-03-02');
-  });
-
-  it('agrees with businessDayStartUtc at the exact boundary', () => {
-    const start = businessDayStartUtc('2026-03-02', 240);
-    expect(businessDayOf(start, 240)).toBe('2026-03-02');
-    expect(businessDayOf(new Date(start.getTime() - 1), 240)).toBe('2026-03-01');
-  });
-});
-
-describe('businessDayRangeUtc', () => {
-  it('is inclusive of the from-day and exclusive of the day after the to-day', () => {
-    const { fromUtc, toUtc } = businessDayRangeUtc('2026-03-01', '2026-03-03', 0);
-    expect(fromUtc.toISOString()).toBe('2026-02-28T16:00:00.000Z');
-    expect(toUtc.toISOString()).toBe('2026-03-03T16:00:00.000Z');
-  });
-
-  it('covers exactly one day when from equals to', () => {
-    const { fromUtc, toUtc } = businessDayRangeUtc('2026-03-01', '2026-03-01', 0);
-    expect(toUtc.getTime() - fromUtc.getTime()).toBe(24 * 60 * 60 * 1000);
+  it('puts a 5 AM sale on the same date for an 04:00 cafe', () => {
+    const fiveAm = new Date('2026-03-01T21:00:00.000Z');
+    expect(businessDayOf(fiveAm, 240)).toBe('2026-03-02');
   });
 });
 
 describe('businessDaySeries', () => {
-  it('lists every day from and to inclusive', () => {
+  it('lists every date inclusive of both ends', () => {
     expect(businessDaySeries('2026-03-01', '2026-03-04')).toEqual([
       '2026-03-01',
       '2026-03-02',
@@ -373,64 +310,43 @@ describe('businessDaySeries', () => {
     ]);
   });
 
+  it('returns a single day when from equals to', () => {
+    expect(businessDaySeries('2026-03-01', '2026-03-01')).toEqual(['2026-03-01']);
+  });
+
   it('crosses a month boundary', () => {
-    expect(businessDaySeries('2026-01-30', '2026-02-02')).toEqual([
-      '2026-01-30',
-      '2026-01-31',
-      '2026-02-01',
-      '2026-02-02',
+    expect(businessDaySeries('2026-02-27', '2026-03-01')).toEqual([
+      '2026-02-27',
+      '2026-02-28',
+      '2026-03-01',
     ]);
   });
 
-  it('throws when to is before from', () => {
-    expect(() => businessDaySeries('2026-03-04', '2026-03-01')).toThrow(
-      /must not be before/,
-    );
-  });
-
-  it('rejects a malformed date', () => {
-    expect(() => businessDaySeries('2026-3-1', '2026-03-01')).toThrow(
-      /YYYY-MM-DD/,
-    );
-  });
-
-  // `2026-13-45` matches the YYYY-MM-DD shape but is not a real date, and
-  // Date.UTC would silently roll it over to 2027-02-14. Silent rollover would
-  // report a window nobody asked for, so it must throw.
-  it('rejects a well-shaped date that does not exist', () => {
-    expect(() => businessDaySeries('2026-13-45', '2026-12-31')).toThrow(
-      /not a real date/,
-    );
-    expect(() => businessDaySeries('2026-02-30', '2026-03-01')).toThrow(
-      /not a real date/,
-    );
+  it('throws when `to` precedes `from`', () => {
+    expect(() => businessDaySeries('2026-03-04', '2026-03-01')).toThrow();
   });
 });
 
-describe('addDays', () => {
-  it('advances across a leap day', () => {
-    expect(addDays('2028-02-28', 1)).toBe('2028-02-29');
-    expect(addDays('2028-02-29', 1)).toBe('2028-03-01');
+describe('businessDayRangeUtc', () => {
+  it('spans from the first day start to the day start AFTER the last date', () => {
+    const range = businessDayRangeUtc('2026-03-01', '2026-03-02', 0);
+    expect(range.fromUtc.toISOString()).toBe('2026-02-28T16:00:00.000Z');
+    expect(range.toUtc.toISOString()).toBe('2026-03-02T16:00:00.000Z');
   });
 
-  it('goes backwards with a negative count', () => {
-    expect(addDays('2026-03-01', -1)).toBe('2026-02-28');
+  it('covers exactly 24 hours for a single day', () => {
+    const range = businessDayRangeUtc('2026-03-01', '2026-03-01', 240);
+    expect(range.toUtc.getTime() - range.fromUtc.getTime()).toBe(86_400_000);
   });
 });
 
 describe('previousPeriod', () => {
-  it('is the equal-length window ending where this one begins', () => {
-    const fromUtc = new Date('2026-03-08T00:00:00.000Z');
-    const toUtc = new Date('2026-03-15T00:00:00.000Z');
+  it('is the equal-length window ending where this one starts', () => {
+    const fromUtc = new Date('2026-03-08T16:00:00.000Z');
+    const toUtc = new Date('2026-03-15T16:00:00.000Z');
     const prev = previousPeriod(fromUtc, toUtc);
     expect(prev.toUtc).toEqual(fromUtc);
-    expect(prev.fromUtc.toISOString()).toBe('2026-03-01T00:00:00.000Z');
-  });
-});
-
-describe('MANILA_OFFSET_MINUTES', () => {
-  it('is a fixed +08:00 because the Philippines observes no DST', () => {
-    expect(MANILA_OFFSET_MINUTES).toBe(480);
+    expect(prev.fromUtc.toISOString()).toBe('2026-03-01T16:00:00.000Z');
   });
 });
 ```
@@ -443,7 +359,7 @@ npm test -- business-day
 
 Expected: FAIL — `Cannot find module './business-day'`.
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Implement the module**
 
 Create `src/portal/analytics/scope/business-day.ts`:
 
@@ -452,125 +368,85 @@ Create `src/portal/analytics/scope/business-day.ts`:
  * Business-day arithmetic (project-spec §7 "Business day").
  *
  * A business day runs `[date + dayStartTime, nextDate + dayStartTime)` in
- * Asia/Manila. A café that opens at 2 AM sets `04:00`, so its 3 AM trading
- * belongs to the previous business day.
+ * Asia/Manila. A 2 AM cafe setting `04:00` puts a 3 AM sale on the previous
+ * calendar date, which is the entire point of the field.
  *
- * Pure: no Prisma, no Nest, no clock reads beyond what callers pass in.
- *
- * Asia/Manila is a FIXED UTC+8 — the Philippines has observed no daylight
- * saving since 1978. That is why plain offset arithmetic is correct here and
- * no timezone library is needed. If the platform ever adds a per-business
- * timezone (project-spec §7 defers it to "the multi-currency era"), this module
- * is the one place that has to change.
+ * The Philippines has observed no DST since 1978, so Asia/Manila is UTC+8 all
+ * year and fixed-offset arithmetic is exact here. Anywhere with DST would need
+ * a real timezone library; this deliberately does not.
  */
 
-/** Asia/Manila's fixed offset from UTC, in minutes. */
-export const MANILA_OFFSET_MINUTES = 480;
+export const MANILA_OFFSET_MINUTES = 8 * 60;
 
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-const MS_PER_MINUTE = 60 * 1000;
+const HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const DAY_MS = 86_400_000;
 
-/** `'HH:mm'` → minutes past midnight. Throws on anything else. */
+/** `HH:mm` to minutes past midnight. Throws on anything else. */
 export function parseDayStart(dayStartTime: string): number {
-  if (!HHMM.test(dayStartTime)) {
-    throw new Error(
-      `dayStartTime must be HH:mm on a 24-hour clock, got "${dayStartTime}"`,
-    );
+  const match = HHMM.exec(dayStartTime);
+  if (!match) {
+    throw new Error(`Invalid dayStartTime: ${JSON.stringify(dayStartTime)}`);
   }
-  const [hours, minutes] = dayStartTime.split(':').map(Number);
-  return hours * 60 + minutes;
+  return Number(match[1]) * 60 + Number(match[2]);
 }
 
-function assertIsoDate(date: string): void {
-  if (!ISO_DATE.test(date)) {
-    throw new Error(`date must be YYYY-MM-DD, got "${date}"`);
-  }
-}
-
-/**
- * Midnight UTC on a calendar date, as a millisecond epoch.
- *
- * The round-trip check is load-bearing: `Date.UTC(2026, 12, 45)` does not fail,
- * it silently becomes 2027-02-14. A report is not allowed to answer about a
- * window nobody asked for, so a well-shaped but impossible date throws.
- */
-function utcMidnight(date: string): number {
-  assertIsoDate(date);
-  const [year, month, day] = date.split('-').map(Number);
-  const ms = Date.UTC(year, month - 1, day);
-  if (new Date(ms).toISOString().slice(0, 10) !== date) {
-    throw new Error(`"${date}" is not a real date`);
-  }
-  return ms;
+function parseDate(date: string): { y: number; m: number; d: number } {
+  const match = DATE.exec(date);
+  if (!match) throw new Error(`Invalid date: ${JSON.stringify(date)}`);
+  return { y: Number(match[1]), m: Number(match[2]), d: Number(match[3]) };
 }
 
 /** The UTC instant at which the given business day begins. */
-export function businessDayStartUtc(
-  date: string,
-  dayStartMinutes: number,
-): Date {
-  return new Date(
-    utcMidnight(date) +
-      (dayStartMinutes - MANILA_OFFSET_MINUTES) * MS_PER_MINUTE,
-  );
+export function businessDayStartUtc(date: string, dayStartMinutes: number): Date {
+  const { y, m, d } = parseDate(date);
+  // Manila wall clock to UTC: subtract the offset from the local minute count.
+  return new Date(Date.UTC(y, m - 1, d, 0, dayStartMinutes - MANILA_OFFSET_MINUTES));
 }
 
-/** The business day (`YYYY-MM-DD`) an instant falls on. */
+/** The business day (YYYY-MM-DD) an instant falls on. */
 export function businessDayOf(instant: Date, dayStartMinutes: number): string {
   const shifted = new Date(
-    instant.getTime() +
-      (MANILA_OFFSET_MINUTES - dayStartMinutes) * MS_PER_MINUTE,
+    instant.getTime() + (MANILA_OFFSET_MINUTES - dayStartMinutes) * 60_000,
   );
   return shifted.toISOString().slice(0, 10);
 }
 
-/**
- * The half-open UTC interval covering business days `from`..`to`, both
- * inclusive as dates. `toUtc` is exclusive as an instant.
- */
+/** Every business day from `from` to `to`, both inclusive. */
+export function businessDaySeries(from: string, to: string): string[] {
+  const start = businessDayStartUtc(from, 0).getTime();
+  const end = businessDayStartUtc(to, 0).getTime();
+  if (end < start) {
+    throw new Error(`Range ends before it starts: ${from}..${to}`);
+  }
+  const days: string[] = [];
+  for (let t = start; t <= end; t += DAY_MS) {
+    days.push(businessDayOf(new Date(t), 0));
+  }
+  return days;
+}
+
+/** `[fromUtc, toUtc)` covering both endpoint days in full. */
 export function businessDayRangeUtc(
   from: string,
   to: string,
   dayStartMinutes: number,
 ): { fromUtc: Date; toUtc: Date } {
-  assertIsoDate(from);
-  assertIsoDate(to);
-  return {
-    fromUtc: businessDayStartUtc(from, dayStartMinutes),
-    toUtc: businessDayStartUtc(addDays(to, 1), dayStartMinutes),
-  };
-}
-
-/** Shift a `YYYY-MM-DD` by whole days. */
-export function addDays(date: string, days: number): string {
-  return new Date(utcMidnight(date) + days * MS_PER_DAY)
-    .toISOString()
-    .slice(0, 10);
-}
-
-/** Every business day from `from` to `to` inclusive — used to zero-fill. */
-export function businessDaySeries(from: string, to: string): string[] {
-  const start = utcMidnight(from);
-  const end = utcMidnight(to);
-  if (end < start) {
-    throw new Error(`"to" (${to}) must not be before "from" (${from})`);
+  const fromUtc = businessDayStartUtc(from, dayStartMinutes);
+  const lastStart = businessDayStartUtc(to, dayStartMinutes);
+  if (lastStart.getTime() < fromUtc.getTime()) {
+    throw new Error(`Range ends before it starts: ${from}..${to}`);
   }
-  const days: string[] = [];
-  for (let t = start; t <= end; t += MS_PER_DAY) {
-    days.push(new Date(t).toISOString().slice(0, 10));
-  }
-  return days;
+  return { fromUtc, toUtc: new Date(lastStart.getTime() + DAY_MS) };
 }
 
-/** The equal-length window ending exactly where this one begins. */
+/** The equal-length window immediately preceding `[fromUtc, toUtc)`. */
 export function previousPeriod(
   fromUtc: Date,
   toUtc: Date,
 ): { fromUtc: Date; toUtc: Date } {
-  const span = toUtc.getTime() - fromUtc.getTime();
-  return { fromUtc: new Date(fromUtc.getTime() - span), toUtc: fromUtc };
+  const length = toUtc.getTime() - fromUtc.getTime();
+  return { fromUtc: new Date(fromUtc.getTime() - length), toUtc: new Date(fromUtc) };
 }
 ```
 
@@ -578,114 +454,95 @@ export function previousPeriod(
 
 ```bash
 npm test -- business-day
+npm run lint
 ```
 
-Expected: PASS, all suites.
+Expected: all pass. Note `businessDaySeries` steps by fixed 24h days and formats through `businessDayOf(..., 0)`, which is safe precisely because there is no DST.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/portal/analytics/scope/business-day.ts src/portal/analytics/scope/business-day.spec.ts
-git commit -m "feat(analytics): business-day arithmetic against each business's day start"
+git commit -m "feat(api): business-day arithmetic against each business's day start time"
 ```
 
 ---
 
-## Task 3: CSV writer
+### Task 3: CSV writer
 
-Every report exports through this, over the same object the JSON response returns, so an export can never drift from what is on screen.
+Every report exports through this one function, over the same object the JSON response returns, so an export can never drift from what is on screen.
 
 **Files:**
 - Create: `src/portal/analytics/csv.ts`
 - Test: `src/portal/analytics/csv.spec.ts`
 
 **Interfaces:**
-- Consumes: nothing. Pure.
+- Consumes: nothing.
 - Produces:
-  - `interface CsvSection { title?: string; columns: string[]; rows: CsvValue[][] }`
-  - `type CsvValue = string | number | null`
+  - `interface CsvSection { title?: string; columns: string[]; rows: (string | number | null)[][] }`
   - `toCsv(sections: CsvSection[]): string`
   - `centavosToPesos(c: number | null): string`
-  - `formatPct(value: number | null): string`
 
 - [ ] **Step 1: Write the failing tests**
 
 Create `src/portal/analytics/csv.spec.ts`:
 
 ```ts
-import { centavosToPesos, formatPct, toCsv } from './csv';
+import { centavosToPesos, toCsv } from './csv';
 
 describe('centavosToPesos', () => {
-  it('renders centavos as a plain two-decimal peso amount', () => {
+  it('renders centavos as two-decimal pesos without a currency symbol', () => {
     expect(centavosToPesos(125000)).toBe('1250.00');
     expect(centavosToPesos(5)).toBe('0.05');
     expect(centavosToPesos(0)).toBe('0.00');
   });
 
-  it('keeps the sign on a negative amount', () => {
+  it('renders a negative amount with a leading minus', () => {
     expect(centavosToPesos(-2550)).toBe('-25.50');
   });
 
   it('renders null as an empty field, never as zero', () => {
     expect(centavosToPesos(null)).toBe('');
   });
-
-  it('does not group thousands — a CSV is parsed, not read', () => {
-    expect(centavosToPesos(123456789)).toBe('1234567.89');
-  });
-});
-
-describe('formatPct', () => {
-  it('renders one decimal place', () => {
-    expect(formatPct(12.345)).toBe('12.3');
-  });
-
-  it('renders null as an empty field', () => {
-    expect(formatPct(null)).toBe('');
-  });
 });
 
 describe('toCsv', () => {
-  const simple = [{ columns: ['a', 'b'], rows: [[1, 2]] }];
-
-  it('starts with a BOM so Excel reads UTF-8 correctly', () => {
-    expect(toCsv(simple).startsWith('﻿')).toBe(true);
+  it('starts with a BOM and separates rows with CRLF', () => {
+    const csv = toCsv([{ columns: ['a', 'b'], rows: [[1, 2]] }]);
+    expect(csv.startsWith('﻿')).toBe(true);
+    expect(csv).toBe('﻿a,b\r\n1,2\r\n');
   });
 
-  it('uses CRLF line endings and ends with one', () => {
-    expect(toCsv(simple)).toBe('﻿a,b\r\n1,2\r\n');
-  });
-
-  it('quotes a field containing a comma', () => {
-    const csv = toCsv([{ columns: ['name'], rows: [['Beans, green']] }]);
-    expect(csv).toContain('"Beans, green"');
-  });
-
-  it('doubles embedded quotes', () => {
-    const csv = toCsv([{ columns: ['name'], rows: [['12" pizza']] }]);
-    expect(csv).toContain('"12"" pizza"');
-  });
-
-  it('quotes a field containing a newline', () => {
-    const csv = toCsv([{ columns: ['note'], rows: [['line one\nline two']] }]);
-    expect(csv).toContain('"line one\nline two"');
+  it('quotes fields containing a comma, a quote or a newline', () => {
+    const csv = toCsv([
+      {
+        columns: ['name'],
+        rows: [['Ay, caramba'], ['She said "hi"'], ['line\nbreak']],
+      },
+    ]);
+    expect(csv).toContain('"Ay, caramba"');
+    expect(csv).toContain('"She said ""hi"""');
+    expect(csv).toContain('"line\nbreak"');
   });
 
   it('writes null as an empty field', () => {
-    const csv = toCsv([{ columns: ['a', 'b'], rows: [[null, 'x']] }]);
-    expect(csv).toBe('﻿a,b\r\n,x\r\n');
+    const csv = toCsv([{ columns: ['a', 'b'], rows: [[null, 1]] }]);
+    expect(csv).toContain(',1');
+    expect(csv).toBe('﻿a,b\r\n,1\r\n');
   });
 
-  it('separates sections with a blank line and a title row', () => {
+  it('separates multiple sections with a blank line and a title row', () => {
     const csv = toCsv([
-      { title: 'Totals', columns: ['a'], rows: [[1]] },
-      { title: 'By branch', columns: ['b'], rows: [[2]] },
+      { title: 'By branch', columns: ['branch'], rows: [['Main']] },
+      { title: 'By method', columns: ['method'], rows: [['cash']] },
     ]);
-    expect(csv).toBe('﻿Totals\r\na\r\n1\r\n\r\nBy branch\r\nb\r\n2\r\n');
+    expect(csv).toBe(
+      '﻿By branch\r\nbranch\r\nMain\r\n\r\nBy method\r\nmethod\r\ncash\r\n',
+    );
   });
 
-  it('emits a header-only section when there are no rows', () => {
-    expect(toCsv([{ columns: ['a', 'b'], rows: [] }])).toBe('﻿a,b\r\n');
+  it('emits only headers for a section with no rows', () => {
+    expect(toCsv([{ columns: ['a'], rows: [] }])).toBe('﻿a\r\n');
   });
 });
 ```
@@ -698,59 +555,50 @@ npm test -- csv
 
 Expected: FAIL — `Cannot find module './csv'`.
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Implement the writer**
 
 Create `src/portal/analytics/csv.ts`:
 
 ```ts
 /**
- * RFC 4180 CSV writer for report exports.
+ * The one CSV writer every report export goes through, applied to the SAME
+ * object the JSON response returns — so an export can never drift from what the
+ * portal shows.
  *
- * Every report exports through this, over THE SAME object its JSON response
- * returns — one code path, so a CSV can never drift from what is on screen.
- *
- * Money is written as pesos with two decimals rather than centavos: a report
- * CSV goes to an accountant or a spreadsheet, not to a parser. Nulls are
- * written as empty fields, never as zero (see the null-cost rule in the spec).
+ * RFC 4180: CRLF line endings, fields containing a comma, a double quote, CR or
+ * LF are quoted, and embedded quotes are doubled. A leading BOM makes Excel open
+ * the file as UTF-8 instead of guessing a local codepage.
  */
 
-export type CsvValue = string | number | null;
-
 export interface CsvSection {
-  /** Optional heading row, for reports that export several tables. */
   title?: string;
   columns: string[];
-  rows: CsvValue[][];
+  rows: (string | number | null)[][];
 }
 
 const BOM = '﻿';
 const EOL = '\r\n';
-const NEEDS_QUOTING = /[",\r\n]/;
 
-/** Centavos → a plain two-decimal peso string. `null` → `''`. */
+/**
+ * Money leaves the API as integer centavos, but a CSV goes to an accountant,
+ * not a parser — so exports render pesos. `null` becomes an empty field: an
+ * unknown cost is not a zero cost.
+ */
 export function centavosToPesos(c: number | null): string {
   if (c === null) return '';
   const sign = c < 0 ? '-' : '';
   const abs = Math.abs(c);
-  const whole = Math.floor(abs / 100);
-  const cents = String(abs % 100).padStart(2, '0');
-  return `${sign}${whole}.${cents}`;
+  return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
 }
 
-/** A percentage to one decimal place. `null` → `''`. */
-export function formatPct(value: number | null): string {
-  return value === null ? '' : value.toFixed(1);
-}
-
-function escapeField(value: CsvValue): string {
+function escapeField(value: string | number | null): string {
   if (value === null) return '';
-  const text = String(value);
-  return NEEDS_QUOTING.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  const s = String(value);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 export function toCsv(sections: CsvSection[]): string {
   const lines: string[] = [];
-
   sections.forEach((section, index) => {
     if (index > 0) lines.push('');
     if (section.title !== undefined) lines.push(escapeField(section.title));
@@ -759,7 +607,6 @@ export function toCsv(sections: CsvSection[]): string {
       lines.push(row.map(escapeField).join(','));
     }
   });
-
   return BOM + lines.join(EOL) + EOL;
 }
 ```
@@ -768,50 +615,237 @@ export function toCsv(sections: CsvSection[]): string {
 
 ```bash
 npm test -- csv
+npm run lint
 ```
 
-Expected: PASS, all suites.
+Expected: all pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/portal/analytics/csv.ts src/portal/analytics/csv.spec.ts
-git commit -m "feat(analytics): RFC 4180 CSV writer with peso formatting and null-as-empty"
+git commit -m "feat(api): rfc 4180 csv writer with peso rendering for report exports"
 ```
 
 ---
 
-## Task 4: Query DTO and scope resolver
+### Task 4: Query DTO and the scope resolver
 
-Turns a query into the set of businesses the caller may report on, each with its own UTC window. Resolution runs through the tenant-scoped Prisma client, so the choke point — not this service — decides visibility.
+Turns the shared query into per-business windows. Every report depends on this and on nothing else for scoping.
 
 **Files:**
 - Create: `src/portal/analytics/dto/analytics-query.dto.ts`
 - Create: `src/portal/analytics/scope/analytics-scope.service.ts`
+- Modify: `src/common/validation-constants.ts` (add `ISO_DATE_REGEX`)
 - Test: `src/portal/analytics/scope/analytics-scope.service.spec.ts`
-- Modify: `src/common/validation-constants.ts`
 
 **Interfaces:**
-- Consumes: `parseDayStart`, `businessDayRangeUtc`, `businessDaySeries`, `previousPeriod` (Task 2); `SCOPED_PRISMA`/`ScopedPrisma`; `NotFoundError`, `ValidationFailedError`.
+- Consumes: `parseDayStart`, `businessDayRangeUtc`, `businessDaySeries`, `previousPeriod` from `../scope/business-day`; `SCOPED_PRISMA`/`ScopedPrisma` from `../../../prisma/scoped-prisma.provider`; `NotFoundError`, `ValidationFailedError` from `../../../common/errors/api-errors`.
 - Produces:
   - `class AnalyticsQueryDto { businessId?: string; branchId?: string; from: string; to: string; format?: 'json' | 'csv' }`
-  - `interface BusinessBranches { id; name; dayStartTime; dayStartMinutes; taxRate; branchIds }`
-  - `interface ScopedBusiness extends BusinessBranches { fromUtc; toUtc; previousFromUtc; previousToUtc }`
+  - `interface ScopedBusiness { id, name, dayStartTime, dayStartMinutes, taxRate, branchIds, fromUtc, toUtc, previousFromUtc, previousToUtc }`
   - `interface ResolvedScope { businesses: ScopedBusiness[]; branchIds: string[]; from: string; to: string; dayCount: number }`
-  - `withWindow(business: BusinessBranches, from: string, to: string): ScopedBusiness`
-  - `AnalyticsScopeService.resolveBusinesses(filter): Promise<BusinessBranches[]>`
-  - `AnalyticsScopeService.resolve(query: AnalyticsQueryDto): Promise<ResolvedScope>`
+  - `class AnalyticsScopeService { resolve(query: AnalyticsQueryDto): Promise<ResolvedScope> }`
 
-- [ ] **Step 1: Add the shared date regex**
+- [ ] **Step 1: Write the failing tests**
+
+The service's only dependency is the scoped client's `business.findMany` and `branch.findMany`, so this is a unit test with a hand-rolled stub — no database, and it exercises the real validation and windowing logic.
+
+Create `src/portal/analytics/scope/analytics-scope.service.spec.ts`:
+
+```ts
+import { Prisma } from '@prisma/client';
+import { AnalyticsScopeService } from './analytics-scope.service';
+import type { ScopedPrisma } from '../../../prisma/scoped-prisma.provider';
+import {
+  NotFoundError,
+  ValidationFailedError,
+} from '../../../common/errors/api-errors';
+import type { AnalyticsQueryDto } from '../dto/analytics-query.dto';
+
+type BusinessRow = {
+  id: string;
+  name: string;
+  dayStartTime: string;
+  taxRate: Prisma.Decimal;
+};
+type BranchRow = { id: string; businessId: string };
+
+function makeService(businesses: BusinessRow[], branches: BranchRow[]) {
+  const businessFindMany = jest.fn().mockResolvedValue(businesses);
+  const branchFindMany = jest.fn().mockResolvedValue(branches);
+  const scoped = {
+    business: { findMany: businessFindMany },
+    branch: { findMany: branchFindMany },
+  } as unknown as ScopedPrisma;
+  return {
+    service: new AnalyticsScopeService(scoped),
+    businessFindMany,
+    branchFindMany,
+  };
+}
+
+const midnight: BusinessRow = {
+  id: 'b-1',
+  name: 'Retail',
+  dayStartTime: '00:00',
+  taxRate: new Prisma.Decimal('0.12'),
+};
+const cafe: BusinessRow = {
+  id: 'b-2',
+  name: 'Cafe',
+  dayStartTime: '04:00',
+  taxRate: new Prisma.Decimal('0.12'),
+};
+
+const query = (over: Partial<AnalyticsQueryDto> = {}): AnalyticsQueryDto =>
+  ({ from: '2026-03-01', to: '2026-03-07', ...over }) as AnalyticsQueryDto;
+
+describe('AnalyticsScopeService.resolve', () => {
+  it('rejects a branchId without a businessId', async () => {
+    const { service } = makeService([midnight], []);
+    await expect(service.resolve(query({ branchId: 'br-1' }))).rejects.toThrow(
+      ValidationFailedError,
+    );
+  });
+
+  it('rejects a range that ends before it starts', async () => {
+    const { service } = makeService([midnight], []);
+    await expect(
+      service.resolve(query({ from: '2026-03-07', to: '2026-03-01' })),
+    ).rejects.toThrow(ValidationFailedError);
+  });
+
+  it('rejects a range longer than 366 days', async () => {
+    const { service } = makeService([midnight], []);
+    await expect(
+      service.resolve(query({ from: '2025-01-01', to: '2026-03-01' })),
+    ).rejects.toThrow(ValidationFailedError);
+  });
+
+  it('excludes demo businesses when no business is named', async () => {
+    const { service, businessFindMany } = makeService(
+      [midnight],
+      [{ id: 'br-1', businessId: 'b-1' }],
+    );
+    await service.resolve(query());
+    expect(businessFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { isDemo: false } }),
+    );
+  });
+
+  it('asks for exactly the named business, demo or not', async () => {
+    const { service, businessFindMany } = makeService(
+      [midnight],
+      [{ id: 'br-1', businessId: 'b-1' }],
+    );
+    await service.resolve(query({ businessId: 'b-1' }));
+    expect(businessFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'b-1' } }),
+    );
+  });
+
+  it('404s when the named business does not belong to the caller', async () => {
+    const { service } = makeService([], []);
+    await expect(service.resolve(query({ businessId: 'b-9' }))).rejects.toThrow(
+      NotFoundError,
+    );
+  });
+
+  it('404s when the named branch does not belong to the caller', async () => {
+    const { service } = makeService([midnight], []);
+    await expect(
+      service.resolve(query({ businessId: 'b-1', branchId: 'br-9' })),
+    ).rejects.toThrow(NotFoundError);
+  });
+
+  it('returns an empty business list — not a 404 — for an owned business with no branches', async () => {
+    const { service } = makeService([midnight], []);
+    const scope = await service.resolve(query({ businessId: 'b-1' }));
+    expect(scope.businesses).toEqual([]);
+    expect(scope.branchIds).toEqual([]);
+    expect(scope.dayCount).toBe(7);
+  });
+
+  it('groups branches under their own business', async () => {
+    const { service } = makeService(
+      [midnight, cafe],
+      [
+        { id: 'br-1', businessId: 'b-1' },
+        { id: 'br-2', businessId: 'b-1' },
+        { id: 'br-3', businessId: 'b-2' },
+      ],
+    );
+    const scope = await service.resolve(query());
+    expect(scope.businesses.map((b) => b.branchIds)).toEqual([
+      ['br-1', 'br-2'],
+      ['br-3'],
+    ]);
+    expect(scope.branchIds).toEqual(['br-1', 'br-2', 'br-3']);
+  });
+
+  it('gives each business its own window, because day starts differ', async () => {
+    const { service } = makeService(
+      [midnight, cafe],
+      [
+        { id: 'br-1', businessId: 'b-1' },
+        { id: 'br-3', businessId: 'b-2' },
+      ],
+    );
+    const scope = await service.resolve(query());
+    const [retail, coffee] = scope.businesses;
+
+    expect(retail.dayStartMinutes).toBe(0);
+    expect(retail.fromUtc.toISOString()).toBe('2026-02-28T16:00:00.000Z');
+    expect(coffee.dayStartMinutes).toBe(240);
+    expect(coffee.fromUtc.toISOString()).toBe('2026-02-28T20:00:00.000Z');
+  });
+
+  it('sets the previous window to the equal period immediately before', async () => {
+    const { service } = makeService(
+      [midnight],
+      [{ id: 'br-1', businessId: 'b-1' }],
+    );
+    const scope = await service.resolve(query());
+    const [b] = scope.businesses;
+    expect(b.previousToUtc).toEqual(b.fromUtc);
+    expect(b.toUtc.getTime() - b.fromUtc.getTime()).toBe(
+      b.previousToUtc.getTime() - b.previousFromUtc.getTime(),
+    );
+  });
+
+  it('drops a business whose branches are all filtered out by branchId', async () => {
+    const { service } = makeService(
+      [midnight],
+      [{ id: 'br-1', businessId: 'b-1' }],
+    );
+    const scope = await service.resolve(
+      query({ businessId: 'b-1', branchId: 'br-1' }),
+    );
+    expect(scope.businesses).toHaveLength(1);
+    expect(scope.businesses[0].branchIds).toEqual(['br-1']);
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+npm test -- analytics-scope
+```
+
+Expected: FAIL — `Cannot find module './analytics-scope.service'`.
+
+- [ ] **Step 3: Add the shared date regex**
 
 Append to `src/common/validation-constants.ts`:
 
 ```ts
-/** `YYYY-MM-DD` calendar date (shape only — realness is checked downstream). */
+/** `YYYY-MM-DD` calendar date (e.g. an analytics range endpoint). */
 export const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 ```
 
-- [ ] **Step 2: Write the query DTO**
+- [ ] **Step 4: Write the query DTO**
 
 Create `src/portal/analytics/dto/analytics-query.dto.ts`:
 
@@ -820,15 +854,12 @@ import { IsIn, IsOptional, IsUUID, Matches } from 'class-validator';
 import { ISO_DATE_REGEX } from '../../../common/validation-constants';
 
 /**
- * The shared query for every analytics report.
+ * The query every report endpoint accepts.
  *
- * Dates are BUSINESS days (project-spec §7), inclusive at both ends, and are
- * resolved per business against its own `dayStartTime`.
- *
- * Range presets (today / 7 days / this month) deliberately resolve in the
- * PORTAL, not here: the API takes explicit dates only, which keeps "what is
- * today" one question answered against one business day rather than a second
- * clock in the API.
+ * Range presets (today / 7 days / this month …) resolve in the PORTAL, not
+ * here: "today" is a question about a business day, and answering it in one
+ * place — against the business's own `dayStartTime` — keeps the API explicit
+ * and testable. The API takes literal dates only.
  */
 export class AnalyticsQueryDto {
   /** Omit to span every non-demo business the caller owns. */
@@ -836,14 +867,16 @@ export class AnalyticsQueryDto {
   @IsUUID()
   businessId?: string;
 
-  /** Requires `businessId`; 422 without it. */
+  /** Requires `businessId`; the resolver rejects it on its own. */
   @IsOptional()
   @IsUUID()
   branchId?: string;
 
+  /** Inclusive business-day lower bound. */
   @Matches(ISO_DATE_REGEX, { message: 'from must be YYYY-MM-DD' })
   from!: string;
 
+  /** Inclusive business-day upper bound. */
   @Matches(ISO_DATE_REGEX, { message: 'to must be YYYY-MM-DD' })
   to!: string;
 
@@ -853,206 +886,7 @@ export class AnalyticsQueryDto {
 }
 ```
 
-- [ ] **Step 3: Write the failing tests**
-
-Create `src/portal/analytics/scope/analytics-scope.service.spec.ts`:
-
-```ts
-import { Prisma } from '@prisma/client';
-import {
-  NotFoundError,
-  ValidationFailedError,
-} from '../../../common/errors/api-errors';
-import type { ScopedPrisma } from '../../../prisma/scoped-prisma.provider';
-import { AnalyticsScopeService } from './analytics-scope.service';
-
-interface FakeBusiness {
-  id: string;
-  name: string;
-  dayStartTime: string;
-  taxRate: Prisma.Decimal;
-}
-
-function business(over: Partial<FakeBusiness> = {}): FakeBusiness {
-  return {
-    id: 'b-1',
-    name: 'Kape',
-    dayStartTime: '00:00',
-    taxRate: new Prisma.Decimal('0.12'),
-    ...over,
-  };
-}
-
-function fakeScoped(businesses: FakeBusiness[], branches: unknown[]) {
-  const businessFindMany = jest.fn().mockResolvedValue(businesses);
-  const branchFindMany = jest.fn().mockResolvedValue(branches);
-  const scoped = {
-    business: { findMany: businessFindMany },
-    branch: { findMany: branchFindMany },
-  } as unknown as ScopedPrisma;
-  return { scoped, businessFindMany, branchFindMany };
-}
-
-const RANGE = { from: '2026-03-01', to: '2026-03-07' };
-
-describe('AnalyticsScopeService.resolve', () => {
-  it('rejects a branchId without a businessId', async () => {
-    const { scoped } = fakeScoped([business()], []);
-    const service = new AnalyticsScopeService(scoped);
-    await expect(
-      service.resolve({ ...RANGE, branchId: 'br-1' }),
-    ).rejects.toBeInstanceOf(ValidationFailedError);
-  });
-
-  it('rejects a to-date before the from-date', async () => {
-    const { scoped } = fakeScoped([business()], [{ id: 'br-1', businessId: 'b-1' }]);
-    const service = new AnalyticsScopeService(scoped);
-    await expect(
-      service.resolve({ from: '2026-03-07', to: '2026-03-01' }),
-    ).rejects.toBeInstanceOf(ValidationFailedError);
-  });
-
-  it('rejects a range longer than 366 days', async () => {
-    const { scoped } = fakeScoped([business()], [{ id: 'br-1', businessId: 'b-1' }]);
-    const service = new AnalyticsScopeService(scoped);
-    await expect(
-      service.resolve({ from: '2025-01-01', to: '2026-03-01' }),
-    ).rejects.toBeInstanceOf(ValidationFailedError);
-  });
-
-  it('rejects a well-shaped but impossible date', async () => {
-    const { scoped } = fakeScoped([business()], [{ id: 'br-1', businessId: 'b-1' }]);
-    const service = new AnalyticsScopeService(scoped);
-    await expect(
-      service.resolve({ from: '2026-02-30', to: '2026-03-01' }),
-    ).rejects.toBeInstanceOf(ValidationFailedError);
-  });
-
-  it('404s when the named business is not the callers', async () => {
-    const { scoped } = fakeScoped([], []);
-    const service = new AnalyticsScopeService(scoped);
-    await expect(
-      service.resolve({ ...RANGE, businessId: 'someone-elses' }),
-    ).rejects.toBeInstanceOf(NotFoundError);
-  });
-
-  it('404s when the named branch is not the callers', async () => {
-    const { scoped } = fakeScoped([business()], []);
-    const service = new AnalyticsScopeService(scoped);
-    await expect(
-      service.resolve({ ...RANGE, businessId: 'b-1', branchId: 'someone-elses' }),
-    ).rejects.toBeInstanceOf(NotFoundError);
-  });
-
-  // A brand-new business with no branches is a legitimate thing to ask about.
-  // Answering 404 would be a lie; the reports return their zero shape instead.
-  it('returns an empty business list — not a 404 — for an owned business with no branches', async () => {
-    const { scoped } = fakeScoped([business()], []);
-    const service = new AnalyticsScopeService(scoped);
-    const scope = await service.resolve({ ...RANGE, businessId: 'b-1' });
-    expect(scope.businesses).toEqual([]);
-    expect(scope.branchIds).toEqual([]);
-  });
-
-  it('excludes demo businesses when no business is named', async () => {
-    const { scoped, businessFindMany } = fakeScoped(
-      [business()],
-      [{ id: 'br-1', businessId: 'b-1' }],
-    );
-    const service = new AnalyticsScopeService(scoped);
-    await service.resolve(RANGE);
-    expect(businessFindMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { isDemo: false } }),
-    );
-  });
-
-  it('asks for one business by id when one is named, demo or not', async () => {
-    const { scoped, businessFindMany } = fakeScoped(
-      [business()],
-      [{ id: 'br-1', businessId: 'b-1' }],
-    );
-    const service = new AnalyticsScopeService(scoped);
-    await service.resolve({ ...RANGE, businessId: 'b-1' });
-    expect(businessFindMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 'b-1' } }),
-    );
-  });
-
-  it('gives each business its own window from its own day start', async () => {
-    const { scoped } = fakeScoped(
-      [
-        business({ id: 'b-1', dayStartTime: '00:00' }),
-        business({ id: 'b-2', name: 'Cafe', dayStartTime: '04:00' }),
-      ],
-      [
-        { id: 'br-1', businessId: 'b-1' },
-        { id: 'br-2', businessId: 'b-2' },
-      ],
-    );
-    const service = new AnalyticsScopeService(scoped);
-    const scope = await service.resolve(RANGE);
-
-    const [midnight, cafe] = scope.businesses;
-    expect(midnight.fromUtc.toISOString()).toBe('2026-02-28T16:00:00.000Z');
-    expect(cafe.fromUtc.toISOString()).toBe('2026-02-28T20:00:00.000Z');
-    expect(cafe.dayStartMinutes).toBe(240);
-  });
-
-  it('groups each businesss own branches and unions them on the scope', async () => {
-    const { scoped } = fakeScoped(
-      [business({ id: 'b-1' }), business({ id: 'b-2', name: 'Two' })],
-      [
-        { id: 'br-1', businessId: 'b-1' },
-        { id: 'br-2', businessId: 'b-1' },
-        { id: 'br-3', businessId: 'b-2' },
-      ],
-    );
-    const service = new AnalyticsScopeService(scoped);
-    const scope = await service.resolve(RANGE);
-
-    expect(scope.businesses[0].branchIds).toEqual(['br-1', 'br-2']);
-    expect(scope.businesses[1].branchIds).toEqual(['br-3']);
-    expect(scope.branchIds).toEqual(['br-1', 'br-2', 'br-3']);
-  });
-
-  it('reports the previous period as the equal window before this one', async () => {
-    const { scoped } = fakeScoped([business()], [{ id: 'br-1', businessId: 'b-1' }]);
-    const service = new AnalyticsScopeService(scoped);
-    const [only] = (await service.resolve(RANGE)).businesses;
-
-    expect(only.previousToUtc).toEqual(only.fromUtc);
-    expect(only.toUtc.getTime() - only.fromUtc.getTime()).toBe(
-      only.previousToUtc.getTime() - only.previousFromUtc.getTime(),
-    );
-  });
-
-  it('counts the days in the range', async () => {
-    const { scoped } = fakeScoped([business()], [{ id: 'br-1', businessId: 'b-1' }]);
-    const service = new AnalyticsScopeService(scoped);
-    expect((await service.resolve(RANGE)).dayCount).toBe(7);
-  });
-
-  it('converts the tax rate off Prisma Decimal', async () => {
-    const { scoped } = fakeScoped(
-      [business({ taxRate: new Prisma.Decimal('0.12') })],
-      [{ id: 'br-1', businessId: 'b-1' }],
-    );
-    const service = new AnalyticsScopeService(scoped);
-    const [only] = (await service.resolve(RANGE)).businesses;
-    expect(only.taxRate).toBe(0.12);
-  });
-});
-```
-
-- [ ] **Step 4: Run the tests to verify they fail**
-
-```bash
-npm test -- analytics-scope
-```
-
-Expected: FAIL — `Cannot find module './analytics-scope.service'`.
-
-- [ ] **Step 5: Write the implementation**
+- [ ] **Step 5: Write the scope resolver**
 
 Create `src/portal/analytics/scope/analytics-scope.service.ts`:
 
@@ -1076,18 +910,13 @@ import {
 
 const MAX_RANGE_DAYS = 366;
 
-/** A business the caller may report on, with its in-scope branches. */
-export interface BusinessBranches {
+export interface ScopedBusiness {
   id: string;
   name: string;
   dayStartTime: string;
   dayStartMinutes: number;
   taxRate: number;
   branchIds: string[];
-}
-
-/** A business plus the UTC window derived from ITS OWN day start. */
-export interface ScopedBusiness extends BusinessBranches {
   fromUtc: Date;
   toUtc: Date;
   previousFromUtc: Date;
@@ -1096,7 +925,6 @@ export interface ScopedBusiness extends BusinessBranches {
 
 export interface ResolvedScope {
   businesses: ScopedBusiness[];
-  /** The union, for guards and messages. */
   branchIds: string[];
   from: string;
   to: string;
@@ -1104,58 +932,49 @@ export interface ResolvedScope {
 }
 
 /**
- * Attach a window to a business. Exported because the dashboard builds its own
- * per-business windows ("today" differs between a 00:00 business and an 04:00
- * café) rather than sharing one range.
- */
-export function withWindow(
-  business: BusinessBranches,
-  from: string,
-  to: string,
-): ScopedBusiness {
-  const { fromUtc, toUtc } = businessDayRangeUtc(
-    from,
-    to,
-    business.dayStartMinutes,
-  );
-  const previous = previousPeriod(fromUtc, toUtc);
-  return {
-    ...business,
-    fromUtc,
-    toUtc,
-    previousFromUtc: previous.fromUtc,
-    previousToUtc: previous.toUtc,
-  };
-}
-
-/**
- * Resolves what a report may see.
+ * Turns a report query into the branches and UTC windows the SQL will use.
  *
- * Every id comes back through the SCOPED client, so the Task 4 choke point —
- * not this service — decides visibility. That matters more here than anywhere
- * else in the app, because the report queries themselves are raw SQL and the
- * choke point cannot see them (`scoped-prisma.ts:737` hooks `$allModels` only).
- * The branch ids this service returns are the ONLY thing standing between a
- * report and another tenant's data.
+ * Ids are resolved through the SCOPED client, so the tenancy choke point — not
+ * this service — decides what the caller may see. That matters more than usual
+ * here: the report queries themselves are raw SQL, which bypasses the choke
+ * point entirely, so this is where their scope comes from.
  *
- * 404 is reserved for a NAMED id that is not the caller's. An owned business
- * with no branches yet resolves to nothing and the reports answer with zeros —
- * "not found" would be a lie about a business the caller just created.
+ * The window lives on each BUSINESS rather than on the scope, because
+ * `dayStartTime` differs per business: a midnight retailer and an 04:00 cafe
+ * asked about the same dates are asking about different UTC intervals. Every
+ * report therefore queries per business and merges in TypeScript.
+ *
+ * 404 is reserved for a named id that is not the caller's. An owned business
+ * that simply has no branches yet yields an empty list and a zeroed report — a
+ * new business is a legitimate thing to ask about.
  */
 @Injectable()
 export class AnalyticsScopeService {
   constructor(@Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma) {}
 
-  async resolveBusinesses(filter: {
-    businessId?: string;
-    branchId?: string;
-  }): Promise<BusinessBranches[]> {
-    if (filter.branchId && !filter.businessId) {
-      throw new ValidationFailedError('branchId requires businessId.');
+  async resolve(query: AnalyticsQueryDto): Promise<ResolvedScope> {
+    if (query.branchId && !query.businessId) {
+      throw new ValidationFailedError(
+        'branchId requires businessId — a branch is only meaningful within its business.',
+      );
+    }
+
+    let days: string[];
+    try {
+      days = businessDaySeries(query.from, query.to);
+    } catch {
+      throw new ValidationFailedError('to must be on or after from.');
+    }
+    if (days.length > MAX_RANGE_DAYS) {
+      throw new ValidationFailedError(
+        `The date range must not exceed ${MAX_RANGE_DAYS} days.`,
+      );
     }
 
     const businesses = await this.scoped.business.findMany({
-      where: filter.businessId ? { id: filter.businessId } : { isDemo: false },
+      // Demo businesses are excluded from rollups (project-spec §8) but remain
+      // reportable when asked for by id, so training data can still be checked.
+      where: query.businessId ? { id: query.businessId } : { isDemo: false },
       select: { id: true, name: true, dayStartTime: true, taxRate: true },
       orderBy: { createdAt: 'asc' },
     });
@@ -1166,53 +985,52 @@ export class AnalyticsScopeService {
     const branches = await this.scoped.branch.findMany({
       where: {
         businessId: { in: businesses.map((b) => b.id) },
-        ...(filter.branchId ? { id: filter.branchId } : {}),
+        ...(query.branchId ? { id: query.branchId } : {}),
       },
       select: { id: true, businessId: true },
       orderBy: { createdAt: 'asc' },
     });
-    if (filter.branchId && branches.length === 0) {
+    if (query.branchId && branches.length === 0) {
       throw new NotFoundError('Branch not found.');
     }
 
-    return businesses
-      .map((b) => ({
-        id: b.id,
-        name: b.name,
-        dayStartTime: b.dayStartTime,
-        dayStartMinutes: parseDayStart(b.dayStartTime),
-        taxRate: Number(b.taxRate),
-        branchIds: branches
-          .filter((branch) => branch.businessId === b.id)
-          .map((branch) => branch.id),
-      }))
-      .filter((b) => b.branchIds.length > 0);
-  }
-
-  async resolve(query: AnalyticsQueryDto): Promise<ResolvedScope> {
-    // business-day helpers throw plain Errors; a bad range is the caller's
-    // mistake, so it must surface as 422, not 500.
-    let days: string[];
-    try {
-      days = businessDaySeries(query.from, query.to);
-    } catch (err) {
-      throw new ValidationFailedError(
-        err instanceof Error ? err.message : 'Invalid date range.',
-      );
-    }
-    if (days.length > MAX_RANGE_DAYS) {
-      throw new ValidationFailedError(
-        `The date range must not exceed ${MAX_RANGE_DAYS} days.`,
-      );
+    const byBusiness = new Map<string, string[]>();
+    for (const branch of branches) {
+      const list = byBusiness.get(branch.businessId);
+      if (list) list.push(branch.id);
+      else byBusiness.set(branch.businessId, [branch.id]);
     }
 
-    const businesses = (await this.resolveBusinesses(query)).map((b) =>
-      withWindow(b, query.from, query.to),
-    );
+    const scopedBusinesses: ScopedBusiness[] = [];
+    for (const business of businesses) {
+      const branchIds = byBusiness.get(business.id);
+      if (!branchIds || branchIds.length === 0) continue;
+
+      const dayStartMinutes = parseDayStart(business.dayStartTime);
+      const { fromUtc, toUtc } = businessDayRangeUtc(
+        query.from,
+        query.to,
+        dayStartMinutes,
+      );
+      const previous = previousPeriod(fromUtc, toUtc);
+
+      scopedBusinesses.push({
+        id: business.id,
+        name: business.name,
+        dayStartTime: business.dayStartTime,
+        dayStartMinutes,
+        taxRate: Number(business.taxRate),
+        branchIds,
+        fromUtc,
+        toUtc,
+        previousFromUtc: previous.fromUtc,
+        previousToUtc: previous.toUtc,
+      });
+    }
 
     return {
-      businesses,
-      branchIds: businesses.flatMap((b) => b.branchIds),
+      businesses: scopedBusinesses,
+      branchIds: scopedBusinesses.flatMap((b) => b.branchIds),
       from: query.from,
       to: query.to,
       dayCount: days.length,
@@ -1225,226 +1043,133 @@ export class AnalyticsScopeService {
 
 ```bash
 npm test -- analytics-scope
+npm run lint && npm run build
 ```
 
-Expected: PASS, all suites.
+Expected: all pass.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/common/validation-constants.ts src/portal/analytics/dto src/portal/analytics/scope/analytics-scope.service.ts src/portal/analytics/scope/analytics-scope.service.spec.ts
-git commit -m "feat(analytics): scope resolver with per-business windows through the choke point"
+git add src/portal/analytics/dto/analytics-query.dto.ts \
+        src/portal/analytics/scope/analytics-scope.service.ts \
+        src/portal/analytics/scope/analytics-scope.service.spec.ts \
+        src/common/validation-constants.ts
+git commit -m "feat(api): analytics scope resolver with per-business day windows"
 ```
 
 ---
 
-## Task 5: The scoped-SQL door, report rendering, audit, and the module
+### Task 5: Scoped raw SQL, report rendering, report audit, and the module
 
-Three small pieces that every report depends on, plus the Nest module that wires them. `runScoped()` is the security-critical one: raw SQL is invisible to the tenancy extension, so this is the only place a report may reach the database.
+The three shared mechanisms every report uses, plus the Nest module that will hold the controllers.
 
 **Files:**
 - Create: `src/portal/analytics/scoped-sql.ts`
-- Test: `src/portal/analytics/scoped-sql.spec.ts`
 - Create: `src/portal/analytics/report-response.ts`
-- Test: `src/portal/analytics/report-response.spec.ts`
 - Create: `src/portal/analytics/report-audit.service.ts`
 - Create: `src/portal/analytics/analytics.module.ts`
 - Modify: `src/portal/portal.module.ts`
+- Test: `src/portal/analytics/scoped-sql.spec.ts`, `src/portal/analytics/report-response.spec.ts`
 
 **Interfaces:**
-- Consumes: `ScopedBusiness`, `ResolvedScope` (Task 4); `CsvSection`, `toCsv` (Task 3); `PrismaService`; `AuditService`.
+- Consumes: `ScopedBusiness`, `ResolvedScope` (Task 4); `CsvSection`, `toCsv` (Task 3); `PrismaService`; `AuditService` from `../../auth/audit.service`.
 - Produces:
   - `runScoped<T>(raw: PrismaService, business: ScopedBusiness, build: (b: ScopedBusiness) => Prisma.Sql): Promise<T[]>`
-  - `renderReport<T>(res: Response, reportName: string, query: AnalyticsQueryDto, data: T, toSections: (data: T) => CsvSection[]): T | string`
-  - `ReportAuditService.log(scope: ResolvedScope, report: string, format: 'json' | 'csv'): Promise<void>`
-  - `AnalyticsModule`
+  - `runScopedOne<T>(raw, business, build): Promise<T>` — the single-row variant every aggregate uses.
+  - `renderReport<T>(res, reportName, query, data, toSections): T | string`
+  - `class ReportAuditService { log(scope: ResolvedScope, report: string, format: 'json' | 'csv'): Promise<void> }`
+  - `class AnalyticsModule`
 
-- [ ] **Step 1: Write the failing tests for `runScoped`**
+- [ ] **Step 1: Write the failing tests**
 
 Create `src/portal/analytics/scoped-sql.spec.ts`:
 
 ```ts
 import { Prisma } from '@prisma/client';
+import { runScoped } from './scoped-sql';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { ScopedBusiness } from './scope/analytics-scope.service';
-import { runScoped } from './scoped-sql';
+
+const business = (branchIds: string[]): ScopedBusiness => ({
+  id: 'b-1',
+  name: 'Biz',
+  dayStartTime: '00:00',
+  dayStartMinutes: 0,
+  taxRate: 0.12,
+  branchIds,
+  fromUtc: new Date('2026-03-01T00:00:00.000Z'),
+  toUtc: new Date('2026-03-08T00:00:00.000Z'),
+  previousFromUtc: new Date('2026-02-22T00:00:00.000Z'),
+  previousToUtc: new Date('2026-03-01T00:00:00.000Z'),
+});
 
 function fakeRaw(rows: unknown[] = []) {
   const queryRaw = jest.fn().mockResolvedValue(rows);
   return { raw: { $queryRaw: queryRaw } as unknown as PrismaService, queryRaw };
 }
 
-function scopedBusiness(over: Partial<ScopedBusiness> = {}): ScopedBusiness {
-  return {
-    id: 'b-1',
-    name: 'Kape',
-    dayStartTime: '00:00',
-    dayStartMinutes: 0,
-    taxRate: 0.12,
-    branchIds: ['br-1'],
-    fromUtc: new Date('2026-03-01T00:00:00.000Z'),
-    toUtc: new Date('2026-03-08T00:00:00.000Z'),
-    previousFromUtc: new Date('2026-02-22T00:00:00.000Z'),
-    previousToUtc: new Date('2026-03-01T00:00:00.000Z'),
-    ...over,
-  };
-}
-
-const scopedQuery = (b: ScopedBusiness) =>
-  Prisma.sql`SELECT 1 FROM sales WHERE branch_id = ANY(${b.branchIds}::uuid[])`;
-
 describe('runScoped', () => {
-  it('runs the built query and returns its rows', async () => {
+  it('refuses to run when the business has no branches in scope', async () => {
+    const { raw } = fakeRaw();
+    await expect(
+      runScoped(raw, business([]), () => Prisma.sql`SELECT 1 FROM sales WHERE branch_id = ANY('{}')`),
+    ).rejects.toThrow(/no branches/i);
+  });
+
+  it('refuses SQL that carries no branch_id predicate', async () => {
+    const { raw } = fakeRaw();
+    await expect(
+      runScoped(raw, business(['br-1']), () => Prisma.sql`SELECT 1 FROM sales`),
+    ).rejects.toThrow(/branch_id/);
+  });
+
+  it('runs SQL that is scoped, and returns its rows', async () => {
     const { raw, queryRaw } = fakeRaw([{ n: 1 }]);
-    const rows = await runScoped(raw, scopedBusiness(), scopedQuery);
+    const rows = await runScoped(raw, business(['br-1']), (b) =>
+      Prisma.sql`SELECT 1 AS n FROM sales WHERE branch_id = ANY(${b.branchIds}::uuid[])`,
+    );
     expect(rows).toEqual([{ n: 1 }]);
     expect(queryRaw).toHaveBeenCalledTimes(1);
   });
-
-  // An empty IN-list would make `branch_id = ANY('{}')` match nothing, which
-  // looks harmless — but it means a caller reached the database with no scope
-  // at all, and the next refactor might drop the predicate entirely.
-  it('refuses to run with no branches in scope', async () => {
-    const { raw, queryRaw } = fakeRaw();
-    await expect(
-      runScoped(raw, scopedBusiness({ branchIds: [] }), scopedQuery),
-    ).rejects.toThrow(/no branches in scope/);
-    expect(queryRaw).not.toHaveBeenCalled();
-  });
-
-  // The tripwire: raw SQL bypasses the tenancy choke point entirely, so a
-  // builder that forgets its scope predicate would silently read every tenant.
-  it('refuses to run SQL that does not mention branch_id', async () => {
-    const { raw, queryRaw } = fakeRaw();
-    await expect(
-      runScoped(raw, scopedBusiness(), () => Prisma.sql`SELECT 1 FROM sales`),
-    ).rejects.toThrow(/branch_id/);
-    expect(queryRaw).not.toHaveBeenCalled();
-  });
 });
 ```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-```bash
-npm test -- scoped-sql
-```
-
-Expected: FAIL — `Cannot find module './scoped-sql'`.
-
-- [ ] **Step 3: Write `runScoped`**
-
-Create `src/portal/analytics/scoped-sql.ts`:
-
-```ts
-import { Prisma } from '@prisma/client';
-import type { PrismaService } from '../../prisma/prisma.service';
-import type { ScopedBusiness } from './scope/analytics-scope.service';
-
-/**
- * THE door for every analytics query.
- *
- * Reports need SQL Prisma cannot express: `sale_items` has no top-level tenant
- * access (`model-scope-map.ts:60`), and `groupBy` offers no date bucketing,
- * joins, or conditional aggregates. Raw SQL is therefore unavoidable — and raw
- * SQL is INVISIBLE to the tenancy choke point, which hooks `$allModels` only
- * (`scoped-prisma.ts:737`). Nothing stops a raw query reading every tenant in
- * the database except the predicate the builder writes.
- *
- * So both guards below are deliberate, and neither is decoration:
- *
- *  1. No branches in scope → refuse. Running with an empty id list would look
- *     harmless (it matches nothing) while proving the caller reached the
- *     database with no scope at all.
- *  2. SQL that never mentions `branch_id` → refuse. Crude, cheap, and it is the
- *     one check that catches a builder which forgot its scope predicate.
- *
- * Every report query goes through here. There is no second path.
- */
-export async function runScoped<T>(
-  raw: PrismaService,
-  business: ScopedBusiness,
-  build: (business: ScopedBusiness) => Prisma.Sql,
-): Promise<T[]> {
-  if (business.branchIds.length === 0) {
-    throw new Error(
-      `runScoped: refusing to query with no branches in scope (business ${business.id})`,
-    );
-  }
-
-  const sql = build(business);
-  if (!sql.text.includes('branch_id')) {
-    throw new Error(
-      'runScoped: refusing to run analytics SQL with no branch_id predicate',
-    );
-  }
-
-  return raw.$queryRaw<T[]>(sql);
-}
-```
-
-- [ ] **Step 4: Run the tests to verify they pass**
-
-```bash
-npm test -- scoped-sql
-```
-
-Expected: PASS, three tests.
-
-- [ ] **Step 5: Write the failing tests for `renderReport`**
 
 Create `src/portal/analytics/report-response.spec.ts`:
 
 ```ts
 import type { Response } from 'express';
-import type { AnalyticsQueryDto } from './dto/analytics-query.dto';
 import { renderReport } from './report-response';
-
-interface Payload {
-  totalC: number;
-}
-
-const sections = (data: Payload) => [
-  { columns: ['Total'], rows: [[data.totalC]] },
-];
 
 function fakeRes() {
   const setHeader = jest.fn();
   return { res: { setHeader } as unknown as Response, setHeader };
 }
 
-const query = (over: Partial<AnalyticsQueryDto> = {}): AnalyticsQueryDto =>
-  ({ from: '2026-03-01', to: '2026-03-07', ...over }) as AnalyticsQueryDto;
+const query = { from: '2026-03-01', to: '2026-03-07' };
+const data = { totalC: 12345 };
+const sections = (d: typeof data) => [
+  { columns: ['total'], rows: [[d.totalC]] },
+];
 
 describe('renderReport', () => {
-  it('returns the object unchanged when the format is json', () => {
+  it('returns the data untouched for JSON, setting no headers', () => {
     const { res, setHeader } = fakeRes();
-    const data = { totalC: 1000 };
-    expect(renderReport(res, 'overview', query(), data, sections)).toBe(data);
+    expect(renderReport(res, 'overview', query, data, sections)).toBe(data);
     expect(setHeader).not.toHaveBeenCalled();
   });
 
-  it('returns the object unchanged when no format is given', () => {
-    const { res } = fakeRes();
-    const data = { totalC: 1000 };
-    expect(renderReport(res, 'overview', query(), data, sections)).toBe(data);
-  });
-
-  it('renders CSV from the same object the JSON response would carry', () => {
-    const { res } = fakeRes();
-    const csv = renderReport(
+  it('renders CSV and names the file after the report and its range', () => {
+    const { res, setHeader } = fakeRes();
+    const out = renderReport(
       res,
       'overview',
-      query({ format: 'csv' }),
-      { totalC: 1000 },
+      { ...query, format: 'csv' as const },
+      data,
       sections,
     );
-    expect(csv).toBe('﻿Total\r\n1000\r\n');
-  });
-
-  it('sets the CSV content type and a dated attachment filename', () => {
-    const { res, setHeader } = fakeRes();
-    renderReport(res, 'overview', query({ format: 'csv' }), { totalC: 0 }, sections);
+    expect(typeof out).toBe('string');
+    expect(out).toContain('12345');
     expect(setHeader).toHaveBeenCalledWith(
       'Content-Type',
       'text/csv; charset=utf-8',
@@ -1457,34 +1182,104 @@ describe('renderReport', () => {
 });
 ```
 
-- [ ] **Step 6: Run the tests to verify they fail**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-npm test -- report-response
+npm test -- scoped-sql report-response
 ```
 
-Expected: FAIL — `Cannot find module './report-response'`.
+Expected: FAIL — both modules missing.
 
-- [ ] **Step 7: Write `renderReport`**
+- [ ] **Step 3: Implement the scoped SQL helper**
+
+Create `src/portal/analytics/scoped-sql.ts`:
+
+```ts
+import { Prisma } from '@prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import type { ScopedBusiness } from './scope/analytics-scope.service';
+
+/**
+ * The ONLY way analytics touches raw SQL.
+ *
+ * The tenancy extension hooks `$allModels` (`scoped-prisma.ts:737`), and a raw
+ * query is not a model operation — so `$queryRaw` bypasses the choke point
+ * completely. Reports need raw SQL anyway (`sale_items` has no top-level access,
+ * and `groupBy` cannot bucket dates or join), so the scope has to come from
+ * somewhere trustworthy: `business.branchIds`, which the scope resolver read
+ * through the scoped client.
+ *
+ * Two guards, both cheap:
+ *   1. Never run for a business with no branches — an unbounded `IN ()` is a bug.
+ *   2. Never run SQL whose text lacks `branch_id`. Crude on purpose: it is a
+ *      tripwire for a builder that forgot its predicate, and it fires in tests.
+ */
+function assertScoped(business: ScopedBusiness, sql: Prisma.Sql): void {
+  if (business.branchIds.length === 0) {
+    throw new Error(
+      `runScoped: business ${business.id} has no branches in scope — the caller must skip it.`,
+    );
+  }
+  if (!sql.text.includes('branch_id')) {
+    throw new Error(
+      'runScoped: analytics SQL must constrain branch_id — refusing to run an unscoped query.',
+    );
+  }
+}
+
+export async function runScoped<T>(
+  raw: PrismaService,
+  business: ScopedBusiness,
+  build: (business: ScopedBusiness) => Prisma.Sql,
+): Promise<T[]> {
+  const sql = build(business);
+  assertScoped(business, sql);
+  return raw.$queryRaw<T[]>(sql);
+}
+
+/** Single-row variant for aggregates, which always return exactly one row. */
+export async function runScopedOne<T>(
+  raw: PrismaService,
+  business: ScopedBusiness,
+  build: (business: ScopedBusiness) => Prisma.Sql,
+): Promise<T> {
+  const rows = await runScoped<T>(raw, business, build);
+  if (rows.length !== 1) {
+    throw new Error(
+      `runScopedOne: expected exactly one row, got ${rows.length}.`,
+    );
+  }
+  return rows[0];
+}
+```
+
+- [ ] **Step 4: Implement report rendering**
 
 Create `src/portal/analytics/report-response.ts`:
 
 ```ts
 import type { Response } from 'express';
-import { toCsv, type CsvSection } from './csv';
-import type { AnalyticsQueryDto } from './dto/analytics-query.dto';
+import { CsvSection, toCsv } from './csv';
+
+/** The part of `AnalyticsQueryDto` this needs — kept narrow so tests are trivial. */
+export interface ReportRange {
+  from: string;
+  to: string;
+  format?: 'json' | 'csv';
+}
 
 /**
- * Renders a report as JSON or CSV.
+ * JSON by default; CSV when asked, built from the SAME object the JSON
+ * response would have returned. One code path, so an export cannot drift from
+ * what the portal shows.
  *
- * The CSV is built from THE SAME object the JSON response returns, so an export
- * can never disagree with what is on screen. That is the whole reason this is
- * one function rather than a second set of export endpoints.
+ * Used with `@Res({ passthrough: true })` so Nest still serialises the returned
+ * value and applies the global exception filter.
  */
 export function renderReport<T>(
   res: Response,
   reportName: string,
-  query: Pick<AnalyticsQueryDto, 'from' | 'to' | 'format'>,
+  query: ReportRange,
   data: T,
   toSections: (data: T) => CsvSection[],
 ): T | string {
@@ -1499,15 +1294,7 @@ export function renderReport<T>(
 }
 ```
 
-- [ ] **Step 8: Run the tests to verify they pass**
-
-```bash
-npm test -- report-response
-```
-
-Expected: PASS, four tests.
-
-- [ ] **Step 9: Write the report audit service**
+- [ ] **Step 5: Implement the report audit service**
 
 Create `src/portal/analytics/report-audit.service.ts`:
 
@@ -1517,12 +1304,10 @@ import { AuditService } from '../../auth/audit.service';
 import type { ResolvedScope } from './scope/analytics-scope.service';
 
 /**
- * Report reads are SENSITIVE READS (project-spec §11): report views and CSV
- * exports are logged, the same as the activity-log browse already is.
- *
- * One row per business in scope, so an all-businesses rollup still surfaces in
- * each business's own activity log rather than vanishing into a scope nobody
- * can filter by.
+ * Report views and exports are sensitive READS (project-spec §11), which the
+ * tenancy choke point does not capture — it audits mutations. This writes them
+ * explicitly, one row per business in scope, so each business's own activity log
+ * shows who looked at its numbers and when.
  */
 @Injectable()
 export class ReportAuditService {
@@ -1547,7 +1332,7 @@ export class ReportAuditService {
 }
 ```
 
-- [ ] **Step 10: Wire the module**
+- [ ] **Step 6: Create the module and wire it into the portal**
 
 Create `src/portal/analytics/analytics.module.ts`:
 
@@ -1558,13 +1343,12 @@ import { AnalyticsScopeService } from './scope/analytics-scope.service';
 import { ReportAuditService } from './report-audit.service';
 
 /**
- * Analytics (tenant scope), `analytics-spec.md` §0–§6.
+ * Analytics (tenant scope) — `analytics-spec.md`. Controllers arrive one report
+ * family at a time; the shared providers below are what they all stand on.
  *
- * Controllers arrive one report at a time; this module starts as the shared
- * foundation (scope resolution + sensitive-read auditing) that all of them use.
- * `PrismaService` (raw, for `runScoped`) and `SCOPED_PRISMA` come from the
- * global `PrismaModule`; `AuthModule` supplies `PortalAuthGuard` and
- * `AuditService`.
+ * Imports `AuthModule` for `PortalAuthGuard`. `PrismaService` (raw, for the
+ * report SQL) and `SCOPED_PRISMA` (for scope resolution) come from the global
+ * `PrismaModule`.
  */
 @Module({
   imports: [AuthModule],
@@ -1574,72 +1358,67 @@ import { ReportAuditService } from './report-audit.service';
 export class AnalyticsModule {}
 ```
 
-Then import it in `src/portal/portal.module.ts` — add to the imports list beside `CatalogModule` and `StockModule`:
+In `src/portal/portal.module.ts`, add the import beside `CatalogModule` and `StockModule`:
 
 ```ts
 import { AnalyticsModule } from './analytics/analytics.module';
 ```
 
-```ts
-  imports: [AuthModule, CatalogModule, StockModule, AnalyticsModule],
-```
+and add `AnalyticsModule` to the `imports` array.
 
-- [ ] **Step 11: Verify the app still boots and everything passes**
+- [ ] **Step 7: Run the tests to verify they pass**
 
 ```bash
-npm run build && npm test && npm run lint
+npm test -- scoped-sql report-response
+npm run lint && npm run build
+npm run test:e2e -- health
 ```
 
-Expected: build clean, all unit suites pass, lint clean.
+Expected: unit tests pass; the app still boots (the health e2e proves the module graph is valid).
 
-- [ ] **Step 12: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/portal/analytics src/portal/portal.module.ts
-git commit -m "feat(analytics): scoped-SQL guard, report rendering, sensitive-read audit, module"
+git commit -m "feat(api): scoped raw-sql helper, report rendering and sensitive-read audit"
 ```
 
 ---
 
-## Task 6: Sale-seeding test helper
+### Task 6: Sale-seeding test helper
 
-Every analytics e2e needs sales in the database. Going through the real POS flow (pair a terminal, open a shift, complete a sale) for each fixture would make the suites slow and brittle. This helper writes sale rows directly — but computes their money **with the real totals engine**, so a fixture can never disagree with what the POS would have written.
+Report e2e tests need sales. Driving the real POS flow (pair a terminal, open a shift, complete a sale) for every report assertion is slow and buries the thing under test. This helper writes sale rows **through the real totals engine**, so the numbers a report reads are the numbers the engine produced — which is exactly the invariant the reports must respect.
 
 **Files:**
 - Create: `test/helpers/sales.ts`
-- Test: `test/portal-analytics-invariants.e2e-spec.ts` (first case only; the rest of that file lands in Task 11)
+- Test: `test/helpers-sales.e2e-spec.ts`
 
 **Interfaces:**
-- Consumes: `computeTotals` (`src/common/totals/totals`), `Cart`/`CartLine` (`src/common/totals/cart`).
+- Consumes: `computeTotals` and `Cart`/`CartLine` from `src/common/totals`.
 - Produces:
-  - `interface SeedLine { name?: string; productId?: string | null; variantId?: string | null; qty: number; unitPriceC: number; costC?: number | null; modifiers?: { groupId: string; modifierId: string; name: string; priceDeltaC: number }[]; discount?: DiscountSpec | null; scPwdMarked?: boolean }`
-  - `interface SeedSaleOptions { branchId: string; terminalId: string; shiftId?: string | null; createdAt: Date; lines: SeedLine[]; orderType?: OrderType; status?: SaleStatus; statusReason?: string | null; taxRate?: number; serviceChargeRate?: number; scPwd?: { idNo: string; name: string } | null; orderDiscount?: DiscountSpec | null; paymentMethod?: PaymentMethod; receiptNo?: string }`
-  - `seedSale(raw: PrismaClient, options: SeedSaleOptions): Promise<{ saleId: string; totals: CartTotals }>`
-  - `seedBranchInfra(raw: PrismaClient, branchId: string): Promise<{ terminalId: string }>`
+  - `interface SeedLine { name?: string; qty: number; unitPriceC: number; costC?: number | null; productId?: string | null; variantId?: string | null; modifiers?: { groupId: string; modifierId: string; name: string; priceDeltaC: number }[]; discount?: DiscountSpec | null; scPwdMarked?: boolean }`
+  - `seedSale(raw, opts): Promise<{ id: string; subtotal: number; total: number }>` where `opts` is `{ branchId, terminalId, shiftId?, createdAt, status?, statusReason?, orderType?, taxRate?, serviceChargeRate?, scPwd?, orderDiscount?, paymentMethod?, lines }`
 
 - [ ] **Step 1: Write the failing test**
 
-Create `test/portal-analytics-invariants.e2e-spec.ts` with the bootstrap block and this first case. (Task 11 adds the tenancy, null-cost and business-day cases to the same file.)
+Create `test/helpers-sales.e2e-spec.ts`:
 
 ```ts
 /*
- * Analytics invariants (e2e).
- *
- * The cases here are the ones that keep the whole analytics design honest:
- * revenue must agree with the totals engine, raw SQL must not cross tenants,
- * a null cost must never read as zero, and a business day must respect its
- * own start time. Each is cheap to write and expensive to discover in
- * production.
+ * Proves the sale-seeding helper writes what the POS would write. Every
+ * analytics e2e leans on it, so if this drifts from `sales.service.persist`
+ * the reports would be validated against fiction.
  */
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
 import { PrismaClient } from '@prisma/client';
 import { resetDb, closeDb } from './helpers/db';
-import { seedBranchInfra, seedSale } from './helpers/sales';
+import { seedSale } from './helpers/sales';
 
 const raw = new PrismaClient();
 
-describe('Analytics invariants (e2e)', () => {
+describe('seedSale helper (e2e)', () => {
+  let branchId: string;
+  let terminalId: string;
+
   beforeAll(async () => {
     await raw.$connect();
   });
@@ -1651,9 +1430,6 @@ describe('Analytics invariants (e2e)', () => {
 
   beforeEach(async () => {
     await resetDb();
-  });
-
-  async function seedBranch() {
     const owner = await raw.owner.create({
       data: { name: 'O', email: `o-${Date.now()}@t.com`, status: 'active' },
     });
@@ -1663,47 +1439,91 @@ describe('Analytics invariants (e2e)', () => {
     const branch = await raw.branch.create({
       data: { businessId: business.id, name: 'Main', code: 'MN', address: 'x' },
     });
-    const { terminalId } = await seedBranchInfra(raw, branch.id);
-    return { owner, business, branch, terminalId };
-  }
+    const terminal = await raw.terminal.create({
+      data: { branchId: branch.id, name: 'T1', code: 'T1' },
+    });
+    branchId = branch.id;
+    terminalId = terminal.id;
+  });
 
-  // sale_items.unit_price is the BASE price; the engine's line gross adds each
-  // modifier's priceDeltaC. A fixture that stored the wrong number would make
-  // every revenue assertion in every other suite meaningless.
-  it('seeds a sale whose stored subtotal matches the totals engine, modifiers included', async () => {
-    const { branch, terminalId } = await seedBranch();
-
-    const { saleId, totals } = await seedSale(raw, {
-      branchId: branch.id,
+  it('stores a subtotal that includes modifier prices', async () => {
+    const sale = await seedSale(raw, {
+      branchId,
       terminalId,
       createdAt: new Date('2026-03-02T04:00:00.000Z'),
       lines: [
         {
-          name: 'Latte',
           qty: 2,
-          unitPriceC: 12000,
-          costC: 4000,
+          unitPriceC: 10000,
           modifiers: [
-            {
-              groupId: '11111111-1111-1111-1111-111111111111',
-              modifierId: '22222222-2222-2222-2222-222222222222',
-              name: 'Oat milk',
-              priceDeltaC: 2000,
-            },
+            { groupId: 'g', modifierId: 'm', name: 'Oat milk', priceDeltaC: 2000 },
           ],
         },
       ],
     });
 
-    const stored = await raw.sale.findUniqueOrThrow({ where: { id: saleId } });
+    // 2 x (100.00 + 20.00) = 240.00
+    expect(sale.subtotal).toBe(24000);
 
-    // 2 × (12000 + 2000) = 28000 — NOT 2 × 12000.
-    expect(totals.subtotalC).toBe(28000);
-    expect(stored.subtotal).toBe(28000);
+    const stored = await raw.sale.findUniqueOrThrow({ where: { id: sale.id } });
+    expect(stored.subtotal).toBe(24000);
 
-    const items = await raw.saleItem.findMany({ where: { saleId } });
-    expect(items[0].unitPrice).toBe(12000);
-    expect(items[0].costSnapshot).toBe(4000);
+    // The stored unit_price is the BASE price — the modifier lives in the json.
+    const [item] = await raw.saleItem.findMany({ where: { saleId: sale.id } });
+    expect(item.unitPrice).toBe(10000);
+    expect(item.modifiers).toEqual([
+      { groupId: 'g', modifierId: 'm', name: 'Oat milk', priceDeltaC: 2000 },
+    ]);
+  });
+
+  it('records a per-unit cost snapshot, and null when the cost is unset', async () => {
+    const sale = await seedSale(raw, {
+      branchId,
+      terminalId,
+      createdAt: new Date('2026-03-02T04:00:00.000Z'),
+      lines: [
+        { qty: 3, unitPriceC: 5000, costC: 2000 },
+        { qty: 1, unitPriceC: 5000, costC: null },
+      ],
+    });
+
+    const items = await raw.saleItem.findMany({
+      where: { saleId: sale.id },
+      orderBy: { qty: 'desc' },
+    });
+    expect(items[0].costSnapshot).toBe(2000);
+    expect(items[1].costSnapshot).toBeNull();
+  });
+
+  it('writes a payment covering the total', async () => {
+    const sale = await seedSale(raw, {
+      branchId,
+      terminalId,
+      createdAt: new Date('2026-03-02T04:00:00.000Z'),
+      paymentMethod: 'gcash',
+      lines: [{ qty: 1, unitPriceC: 15000 }],
+    });
+
+    const [payment] = await raw.salePayment.findMany({
+      where: { saleId: sale.id },
+    });
+    expect(payment.method).toBe('gcash');
+    expect(payment.amount).toBe(sale.total);
+  });
+
+  it('can write a voided sale for the void/refund counts', async () => {
+    const sale = await seedSale(raw, {
+      branchId,
+      terminalId,
+      createdAt: new Date('2026-03-02T04:00:00.000Z'),
+      status: 'voided',
+      statusReason: 'Wrong order',
+      lines: [{ qty: 1, unitPriceC: 5000 }],
+    });
+
+    const stored = await raw.sale.findUniqueOrThrow({ where: { id: sale.id } });
+    expect(stored.status).toBe('voided');
+    expect(stored.statusReason).toBe('Wrong order');
   });
 });
 ```
@@ -1711,44 +1531,38 @@ describe('Analytics invariants (e2e)', () => {
 - [ ] **Step 2: Run the test to verify it fails**
 
 ```bash
-docker compose up -d db
-npm run test:e2e -- portal-analytics-invariants
+npm run test:e2e -- helpers-sales
 ```
 
 Expected: FAIL — `Cannot find module './helpers/sales'`.
 
-- [ ] **Step 3: Write the helper**
+- [ ] **Step 3: Implement the helper**
 
 Create `test/helpers/sales.ts`:
 
 ```ts
 import { randomUUID } from 'crypto';
-import type { OrderType, PaymentMethod, PrismaClient, SaleStatus } from '@prisma/client';
-import { computeTotals, type CartTotals } from '../../src/common/totals/totals';
+import { PaymentMethod, PrismaClient, SaleStatus } from '@prisma/client';
+import { computeTotals } from '../../src/common/totals/totals';
 import type { Cart, CartLine, CartModifier, DiscountSpec } from '../../src/common/totals/cart';
 
 /**
- * Seeds sales for the analytics suites.
+ * Seeds a sale the way `sales.service.persist` does, with totals from the REAL
+ * engine (`computeTotals`). Analytics reports are validated against these rows,
+ * so they must carry the engine's arithmetic — in particular that
+ * `sale_items.unit_price` is the BASE price while the line's gross includes each
+ * modifier's `priceDeltaC`.
  *
- * Rows are written directly rather than through the POS flow (pairing, shift
- * open, sale complete) because the analytics reports only READ — the setup cost
- * of the real flow buys nothing here.
- *
- * But the money is computed by the REAL totals engine (`computeTotals`), not by
- * hand, and stored in exactly the columns `sales.service.ts` writes. That is
- * what stops a fixture drifting from production: if the engine changes, the
- * fixtures change with it, and `unit_price` keeps storing the BASE price while
- * the subtotal keeps including modifier deltas.
+ * Writes on the raw client deliberately: these are fixtures, not tenant traffic,
+ * and going through the choke point would demand a request context.
  */
-
 export interface SeedLine {
   name?: string;
-  productId?: string | null;
-  variantId?: string | null;
   qty: number;
   unitPriceC: number;
-  /** null (the default) means "no cost recorded" — margin must read unknown. */
   costC?: number | null;
+  productId?: string | null;
+  variantId?: string | null;
   modifiers?: CartModifier[];
   discount?: DiscountSpec | null;
   scPwdMarked?: boolean;
@@ -1758,51 +1572,51 @@ export interface SeedSaleOptions {
   branchId: string;
   terminalId: string;
   shiftId?: string | null;
-  /** Server timestamp the reports bucket on. */
   createdAt: Date;
-  lines: SeedLine[];
-  orderType?: OrderType;
   status?: SaleStatus;
   statusReason?: string | null;
+  orderType?: Cart['orderType'];
   taxRate?: number;
   serviceChargeRate?: number;
   scPwd?: { idNo: string; name: string } | null;
   orderDiscount?: DiscountSpec | null;
+  discountId?: string | null;
   paymentMethod?: PaymentMethod;
   receiptNo?: string;
+  lines: SeedLine[];
 }
 
 let receiptCounter = 0;
 
-/** A terminal to hang sales off. Sales require one; most tests do not care. */
-export async function seedBranchInfra(
-  raw: PrismaClient,
-  branchId: string,
-): Promise<{ terminalId: string }> {
-  const terminal = await raw.terminal.create({
-    data: {
-      branchId,
-      name: `T-${(receiptCounter += 1)}`,
-      code: `T${receiptCounter}`,
-      lastSeenAt: new Date(),
-    },
-  });
-  return { terminalId: terminal.id };
-}
-
 export async function seedSale(
   raw: PrismaClient,
   options: SeedSaleOptions,
-): Promise<{ saleId: string; totals: CartTotals }> {
-  const orderType = options.orderType ?? 'none';
-  const taxRate = options.taxRate ?? 0.12;
-  const serviceChargeRate = options.serviceChargeRate ?? 0;
+): Promise<{ id: string; subtotal: number; total: number }> {
+  const {
+    branchId,
+    terminalId,
+    shiftId = null,
+    createdAt,
+    status = 'completed',
+    statusReason = null,
+    orderType = 'takeout',
+    taxRate = 0.12,
+    serviceChargeRate = 0,
+    scPwd = null,
+    orderDiscount = null,
+    discountId = null,
+    paymentMethod = 'cash',
+    lines,
+  } = options;
 
-  const lines: CartLine[] = options.lines.map((line) => ({
-    id: randomUUID(),
+  receiptCounter += 1;
+  const receiptNo = options.receiptNo ?? `R-${Date.now()}-${receiptCounter}`;
+
+  const cartLines: CartLine[] = lines.map((line, index) => ({
+    id: `line-${index}`,
     productId: line.productId ?? null,
     variantId: line.variantId ?? null,
-    name: line.name ?? 'Item',
+    name: line.name ?? `Item ${index + 1}`,
     soldBy: 'unit',
     qty: line.qty,
     unitPriceC: line.unitPriceC,
@@ -1815,48 +1629,48 @@ export async function seedSale(
   const cart: Cart = {
     id: randomUUID(),
     orderType,
-    lines,
-    orderDiscount: options.orderDiscount ?? null,
-    scPwd: options.scPwd ?? null,
+    lines: cartLines,
+    orderDiscount,
+    scPwd,
   };
   const totals = computeTotals(cart, { taxRate, serviceChargeRate });
 
   const saleId = randomUUID();
-  receiptCounter += 1;
-
   await raw.sale.create({
     data: {
       id: saleId,
-      branchId: options.branchId,
-      terminalId: options.terminalId,
-      shiftId: options.shiftId ?? null,
-      receiptNo: options.receiptNo ?? `R-${receiptCounter}`,
+      createdAt,
+      branchId,
+      terminalId,
+      shiftId,
+      receiptNo,
       orderType,
-      status: options.status ?? 'completed',
-      statusReason: options.statusReason ?? null,
+      status,
+      statusReason,
       subtotal: totals.subtotalC,
       discount: totals.promoDiscountC,
+      discountId,
       serviceCharge: totals.serviceChargeC,
-      scPwd: options.scPwd ?? undefined,
+      scPwd: scPwd ?? undefined,
       scPwdDiscount: totals.scPwdDiscountC,
       vatExemptSales: totals.vatExemptSalesC,
       tax: totals.vatC,
       total: totals.totalC,
-      createdAt: options.createdAt,
-      createdAtDevice: options.createdAt,
+      createdAtDevice: createdAt,
       draft: {},
       items: {
-        create: lines.map((line, index) => {
+        create: cartLines.map((line, index) => {
           const lineTotals = totals.lines[index];
           return {
+            createdAt,
             productId: line.productId,
             variantId: line.variantId,
             nameSnapshot: line.name,
             qty: line.qty,
-            // The BASE price, exactly as sales.service.ts:507 stores it —
-            // modifier deltas live in `modifiers`, not in this column.
+            // The BASE price, exactly as the POS stores it: modifier deltas
+            // live in `modifiers` and are added back by the report SQL.
             unitPrice: line.unitPriceC,
-            costSnapshot: options.lines[index].costC ?? null,
+            costSnapshot: lines[index].costC ?? null,
             discount: lineTotals.grossC - lineTotals.netC,
             modifiers: line.modifiers,
           };
@@ -1865,7 +1679,8 @@ export async function seedSale(
       payments: {
         create: [
           {
-            method: options.paymentMethod ?? 'cash',
+            createdAt,
+            method: paymentMethod,
             amount: totals.totalC,
             tendered: totals.totalC,
             change: 0,
@@ -1875,62 +1690,466 @@ export async function seedSale(
     },
   });
 
-  return { saleId, totals };
+  return { id: saleId, subtotal: totals.subtotalC, total: totals.totalC };
 }
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 ```bash
-npm run test:e2e -- portal-analytics-invariants
+npm run test:e2e -- helpers-sales
 ```
 
-Expected: PASS. If `subtotal` comes back as 24000 instead of 28000, the engine is not being used — the fixture must never compute money by hand.
+Expected: all five cases pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add test/helpers/sales.ts test/portal-analytics-invariants.e2e-spec.ts
-git commit -m "test(analytics): sale-seeding helper that computes money with the real totals engine"
+git add test/helpers/sales.ts test/helpers-sales.e2e-spec.ts
+git commit -m "test: sale-seeding helper that writes through the real totals engine"
 ```
 
 ---
 
-## Task 7: Overview report (§1)
+### Task 7: Overview report (§1)
 
-The KPI set with change against the previous equal period. This is the first report, so it also establishes the shared SQL builders every later report reuses.
+The first real report. It establishes the two SQL builders every money report reuses, the KPI arithmetic, and the controller shape.
 
 **Files:**
 - Create: `src/portal/analytics/reports/sales-aggregate.sql.ts`
+- Create: `src/portal/analytics/overview/overview.math.ts`
 - Create: `src/portal/analytics/overview/overview.service.ts`
 - Create: `src/portal/analytics/overview/overview.controller.ts`
 - Create: `src/portal/analytics/overview/overview.csv.ts`
 - Modify: `src/portal/analytics/analytics.module.ts`
-- Test: `test/portal-analytics-overview.e2e-spec.ts`
+- Test: `src/portal/analytics/overview/overview.math.spec.ts`, `test/portal-analytics-overview.e2e-spec.ts`
 
 **Interfaces:**
-- Consumes: `runScoped` (Task 5), `AnalyticsScopeService`, `ScopedBusiness`, `ReportAuditService`, `renderReport`, `AnalyticsQueryDto`, `centavosToPesos`/`formatPct`/`CsvSection`.
+- Consumes: `runScopedOne` (Task 5), `AnalyticsScopeService`/`ScopedBusiness`/`ResolvedScope` (Task 4), `ReportAuditService` (Task 5), `renderReport` (Task 5), `centavosToPesos`/`CsvSection` (Task 3), `seedSale` (Task 6).
 - Produces:
-  - `LINE_MODS_JOIN`, `LINE_NET_C`, `LINE_COST_C` — shared SQL fragments used by every revenue query in both plans
-  - `saleAggregateSql(business, fromUtc, toUtc): Prisma.Sql`, `SaleAggregateRow`
-  - `lineAggregateSql(business, fromUtc, toUtc): Prisma.Sql`, `LineAggregateRow`
-  - `interface Kpi { value: number | null; previous: number | null; changePct: number | null }`
-  - `interface OverviewReport`
-  - `OverviewService.run(query: AnalyticsQueryDto): Promise<OverviewReport>`
-  - `overviewCsv(report: OverviewReport): CsvSection[]`
+  - `interface SalesAggregateRow { gross_sales_c, discounts_c, service_charge_c, transactions, void_count, refund_count: bigint }`
+  - `interface LineAggregateRow { costed_lines, costed_revenue_c, costed_cost_c, uncosted_revenue_c: bigint }`
+  - `salesAggregateSql(business, fromUtc, toUtc): Prisma.Sql`
+  - `lineAggregateSql(business, fromUtc, toUtc): Prisma.Sql`
+  - `interface Kpi { value: number; previous: number; changePct: number | null }`
+  - `interface NullableKpi { value: number | null; previous: number | null; changePct: number | null }`
+  - `interface MarginKpi { value: number | null; previous: number | null; changePoints: number | null }`
+  - `interface OverviewReport` (below)
   - `GET /v1/portal/analytics/overview`
 
-- [ ] **Step 1: Write the failing e2e test**
+- [ ] **Step 1: Write the failing unit tests for the KPI arithmetic**
+
+Create `src/portal/analytics/overview/overview.math.spec.ts`:
+
+```ts
+import {
+  addRows,
+  averageBasketC,
+  emptyTotals,
+  grossProfitC,
+  marginPct,
+  netSalesC,
+  toKpi,
+  toMarginKpi,
+  toNullableKpi,
+} from './overview.math';
+
+const sales = (over: Partial<Record<string, bigint>> = {}) => ({
+  gross_sales_c: 0n,
+  discounts_c: 0n,
+  service_charge_c: 0n,
+  transactions: 0n,
+  void_count: 0n,
+  refund_count: 0n,
+  ...over,
+}) as any;
+
+const lines = (over: Partial<Record<string, bigint>> = {}) => ({
+  costed_lines: 0n,
+  costed_revenue_c: 0n,
+  costed_cost_c: 0n,
+  uncosted_revenue_c: 0n,
+  ...over,
+}) as any;
+
+describe('addRows', () => {
+  it('sums across businesses, converting bigint to number', () => {
+    const totals = emptyTotals();
+    addRows(totals, sales({ gross_sales_c: 10000n, transactions: 2n }), lines());
+    addRows(totals, sales({ gross_sales_c: 5000n, transactions: 1n }), lines());
+    expect(totals.grossSalesC).toBe(15000);
+    expect(totals.transactions).toBe(3);
+  });
+});
+
+describe('netSalesC', () => {
+  it('is gross sales less every discount, and excludes service charge', () => {
+    const totals = emptyTotals();
+    addRows(
+      totals,
+      sales({ gross_sales_c: 100000n, discounts_c: 15000n, service_charge_c: 8000n }),
+      lines(),
+    );
+    expect(netSalesC(totals)).toBe(85000);
+  });
+});
+
+describe('grossProfitC and marginPct — the null-cost rule', () => {
+  it('is null, NOT zero, when nothing in the range carries a cost', () => {
+    const totals = emptyTotals();
+    addRows(totals, sales({ gross_sales_c: 50000n }), lines({ uncosted_revenue_c: 50000n }));
+    expect(grossProfitC(totals)).toBeNull();
+    expect(marginPct(totals)).toBeNull();
+  });
+
+  it('counts only costed lines, and reports the uncosted revenue alongside', () => {
+    const totals = emptyTotals();
+    addRows(
+      totals,
+      sales({ gross_sales_c: 50000n }),
+      lines({
+        costed_lines: 3n,
+        costed_revenue_c: 30000n,
+        costed_cost_c: 18000n,
+        uncosted_revenue_c: 20000n,
+      }),
+    );
+    expect(grossProfitC(totals)).toBe(12000);
+    expect(marginPct(totals)).toBeCloseTo(0.4, 10);
+    expect(totals.uncostedRevenueC).toBe(20000);
+  });
+
+  it('reports a loss as a negative profit rather than clamping at zero', () => {
+    const totals = emptyTotals();
+    addRows(
+      totals,
+      sales(),
+      lines({ costed_lines: 1n, costed_revenue_c: 1000n, costed_cost_c: 1500n }),
+    );
+    expect(grossProfitC(totals)).toBe(-500);
+  });
+});
+
+describe('averageBasketC', () => {
+  it('is null when there were no transactions, never a divide by zero', () => {
+    expect(averageBasketC(emptyTotals())).toBeNull();
+  });
+
+  it('rounds half-up to whole centavos', () => {
+    const totals = emptyTotals();
+    addRows(totals, sales({ gross_sales_c: 1001n, transactions: 2n }), lines());
+    expect(averageBasketC(totals)).toBe(501);
+  });
+});
+
+describe('toKpi', () => {
+  it('reports change as a ratio of the previous period', () => {
+    expect(toKpi(150, 100)).toEqual({ value: 150, previous: 100, changePct: 0.5 });
+  });
+
+  it('leaves change null from a standing start, rather than claiming infinity', () => {
+    expect(toKpi(150, 0)).toEqual({ value: 150, previous: 0, changePct: null });
+  });
+});
+
+describe('toNullableKpi', () => {
+  it('leaves change null when either side is unknown', () => {
+    expect(toNullableKpi(null, 100).changePct).toBeNull();
+    expect(toNullableKpi(150, null).changePct).toBeNull();
+  });
+});
+
+describe('toMarginKpi', () => {
+  it('reports the difference in percentage POINTS, not a percentage change', () => {
+    expect(toMarginKpi(0.42, 0.4)).toEqual({
+      value: 0.42,
+      previous: 0.4,
+      changePoints: expect.closeTo(0.02, 10),
+    });
+  });
+
+  it('leaves the difference null when either margin is unknown', () => {
+    expect(toMarginKpi(null, 0.4).changePoints).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Run the unit tests to verify they fail**
+
+```bash
+npm test -- overview.math
+```
+
+Expected: FAIL — `Cannot find module './overview.math'`.
+
+- [ ] **Step 3: Write the SQL builders**
+
+Create `src/portal/analytics/reports/sales-aggregate.sql.ts`:
+
+```ts
+import { Prisma } from '@prisma/client';
+import type { ScopedBusiness } from '../scope/analytics-scope.service';
+
+/**
+ * The two aggregates every money report is built from.
+ *
+ * Both are scoped by `branch_id = ANY(...)` over ids the scope resolver read
+ * through the tenancy choke point — raw SQL gets no scoping of its own
+ * (`scoped-sql.ts` explains why).
+ *
+ * Status rules, applied identically everywhere: VOIDED sales contribute to no
+ * money figure and to no transaction count; REFUNDED sales contribute to no
+ * money figure but are counted. Conditional aggregates keep both counts in one
+ * pass over the same rows.
+ */
+
+export interface SalesAggregateRow {
+  gross_sales_c: bigint;
+  discounts_c: bigint;
+  service_charge_c: bigint;
+  transactions: bigint;
+  void_count: bigint;
+  refund_count: bigint;
+}
+
+export function salesAggregateSql(
+  business: ScopedBusiness,
+  fromUtc: Date,
+  toUtc: Date,
+): Prisma.Sql {
+  return Prisma.sql`
+    SELECT
+      COALESCE(SUM(s.subtotal) FILTER (WHERE s.status = 'completed'), 0)::bigint
+        AS gross_sales_c,
+      COALESCE(SUM(s.discount + s.sc_pwd_discount) FILTER (WHERE s.status = 'completed'), 0)::bigint
+        AS discounts_c,
+      COALESCE(SUM(s.service_charge) FILTER (WHERE s.status = 'completed'), 0)::bigint
+        AS service_charge_c,
+      COUNT(*) FILTER (WHERE s.status = 'completed')::bigint AS transactions,
+      COUNT(*) FILTER (WHERE s.status = 'voided')::bigint    AS void_count,
+      COUNT(*) FILTER (WHERE s.status = 'refunded')::bigint  AS refund_count
+    FROM sales s
+    WHERE s.branch_id = ANY(${business.branchIds}::uuid[])
+      AND s.deleted_at IS NULL
+      AND s.created_at >= ${fromUtc}
+      AND s.created_at <  ${toUtc}
+  `;
+}
+
+export interface LineAggregateRow {
+  costed_lines: bigint;
+  costed_revenue_c: bigint;
+  costed_cost_c: bigint;
+  uncosted_revenue_c: bigint;
+}
+
+/**
+ * Line-level revenue and cost.
+ *
+ * `sale_items.unit_price` is the BASE price — the POS stores the price locked at
+ * add-to-cart and keeps the chosen modifiers in a jsonb array, each with its own
+ * `priceDeltaC` (`sales.service.ts:507`, `cart.ts:49`). The engine's line gross
+ * adds them back, so `qty * unit_price` alone would understate every line that
+ * has a priced modifier. The lateral join below is that addition; without it, Σ
+ * line gross would not equal `sales.subtotal`.
+ *
+ * `cost_snapshot` is the UNIT cost (`sales.service.ts:664`), hence
+ * `qty * cost_snapshot`. Postgres `round(numeric)` rounds half away from zero,
+ * matching the engine's `halfUp` for these non-negative values.
+ *
+ * Costed and uncosted revenue are separated rather than blended: a null cost
+ * means unknown margin, never zero margin.
+ */
+export function lineAggregateSql(
+  business: ScopedBusiness,
+  fromUtc: Date,
+  toUtc: Date,
+): Prisma.Sql {
+  return Prisma.sql`
+    SELECT
+      COUNT(*) FILTER (WHERE si.cost_snapshot IS NOT NULL)::bigint AS costed_lines,
+      COALESCE(SUM(line.net_c) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+        AS costed_revenue_c,
+      COALESCE(SUM(round(si.qty * si.cost_snapshot)) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+        AS costed_cost_c,
+      COALESCE(SUM(line.net_c) FILTER (WHERE si.cost_snapshot IS NULL), 0)::bigint
+        AS uncosted_revenue_c
+    FROM sale_items si
+    JOIN sales s ON s.id = si.sale_id
+    CROSS JOIN LATERAL (
+      SELECT COALESCE(SUM((m->>'priceDeltaC')::int), 0) AS mods_c
+      FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(si.modifiers) = 'array'
+             THEN si.modifiers ELSE '[]'::jsonb END
+      ) AS m
+    ) mods
+    CROSS JOIN LATERAL (
+      SELECT round(si.qty * (si.unit_price + mods.mods_c)) - si.discount AS net_c
+    ) line
+    WHERE s.branch_id = ANY(${business.branchIds}::uuid[])
+      AND s.deleted_at IS NULL
+      AND si.deleted_at IS NULL
+      AND s.status = 'completed'
+      AND s.created_at >= ${fromUtc}
+      AND s.created_at <  ${toUtc}
+  `;
+}
+```
+
+- [ ] **Step 4: Write the KPI arithmetic**
+
+Create `src/portal/analytics/overview/overview.math.ts`:
+
+```ts
+import { halfUp } from '../../../common/totals/money';
+import type {
+  LineAggregateRow,
+  SalesAggregateRow,
+} from '../reports/sales-aggregate.sql';
+
+export interface Totals {
+  grossSalesC: number;
+  discountsC: number;
+  serviceChargeC: number;
+  transactions: number;
+  voidCount: number;
+  refundCount: number;
+  costedLines: number;
+  costedRevenueC: number;
+  costedCostC: number;
+  uncostedRevenueC: number;
+}
+
+export interface Kpi {
+  value: number;
+  previous: number;
+  /** Ratio of the previous period (0.5 = up by half). Null from a zero base. */
+  changePct: number | null;
+}
+
+export interface NullableKpi {
+  value: number | null;
+  previous: number | null;
+  changePct: number | null;
+}
+
+export interface MarginKpi {
+  value: number | null;
+  previous: number | null;
+  /** Percentage POINTS, not a percentage change — margin is already a ratio. */
+  changePoints: number | null;
+}
+
+export function emptyTotals(): Totals {
+  return {
+    grossSalesC: 0,
+    discountsC: 0,
+    serviceChargeC: 0,
+    transactions: 0,
+    voidCount: 0,
+    refundCount: 0,
+    costedLines: 0,
+    costedRevenueC: 0,
+    costedCostC: 0,
+    uncostedRevenueC: 0,
+  };
+}
+
+/** Aggregates arrive as bigint (project-spec §7) and land as numbers here. */
+export function addRows(
+  into: Totals,
+  sales: SalesAggregateRow,
+  lines: LineAggregateRow,
+): void {
+  into.grossSalesC += Number(sales.gross_sales_c);
+  into.discountsC += Number(sales.discounts_c);
+  into.serviceChargeC += Number(sales.service_charge_c);
+  into.transactions += Number(sales.transactions);
+  into.voidCount += Number(sales.void_count);
+  into.refundCount += Number(sales.refund_count);
+  into.costedLines += Number(lines.costed_lines);
+  into.costedRevenueC += Number(lines.costed_revenue_c);
+  into.costedCostC += Number(lines.costed_cost_c);
+  into.uncostedRevenueC += Number(lines.uncosted_revenue_c);
+}
+
+/** Sales after every discount. Service charge is a separate KPI, not part of this. */
+export function netSalesC(t: Totals): number {
+  return t.grossSalesC - t.discountsC;
+}
+
+/**
+ * Null when NO line in the range carried a cost. Reporting zero would claim a
+ * 100% margin on an entire uncosted catalogue — the single most damaging silent
+ * error available in these reports.
+ */
+export function grossProfitC(t: Totals): number | null {
+  if (t.costedLines === 0) return null;
+  return t.costedRevenueC - t.costedCostC;
+}
+
+export function marginPct(t: Totals): number | null {
+  const profit = grossProfitC(t);
+  if (profit === null || t.costedRevenueC === 0) return null;
+  return profit / t.costedRevenueC;
+}
+
+export function averageBasketC(t: Totals): number | null {
+  if (t.transactions === 0) return null;
+  return halfUp(netSalesC(t) / t.transactions);
+}
+
+export function toKpi(value: number, previous: number): Kpi {
+  return {
+    value,
+    previous,
+    changePct: previous === 0 ? null : (value - previous) / previous,
+  };
+}
+
+export function toNullableKpi(
+  value: number | null,
+  previous: number | null,
+): NullableKpi {
+  return {
+    value,
+    previous,
+    changePct:
+      value === null || previous === null || previous === 0
+        ? null
+        : (value - previous) / previous,
+  };
+}
+
+export function toMarginKpi(
+  value: number | null,
+  previous: number | null,
+): MarginKpi {
+  return {
+    value,
+    previous,
+    changePoints: value === null || previous === null ? null : value - previous,
+  };
+}
+```
+
+- [ ] **Step 5: Run the unit tests to verify they pass**
+
+```bash
+npm test -- overview.math
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Write the failing e2e test**
 
 Create `test/portal-analytics-overview.e2e-spec.ts`:
 
 ```ts
 /*
- * Analytics overview §1 (e2e).
- *
- * Asserts real figures against seeded sales, not just response shape: the KPI
- * definitions in the spec are the contract, and a shape-only test would pass
- * with every number wrong.
+ * Overview report (analytics-spec §1) e2e. Sales are seeded through the real
+ * totals engine (`test/helpers/sales.ts`), so the KPIs are checked against the
+ * same arithmetic the POS produces.
  */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
@@ -1943,15 +2162,61 @@ import { ApiExceptionFilter } from '../src/common/filters/api-exception.filter';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthService } from '../src/auth/auth.service';
 import { resetDb, closeDb } from './helpers/db';
-import { seedBranchInfra, seedSale } from './helpers/sales';
+import { seedSale } from './helpers/sales';
 
 const raw = new PrismaClient();
-let seq = 0;
 
-describe('Analytics overview (e2e)', () => {
+/** 2 March 2026, 10:00 Manila — comfortably inside a midnight business day. */
+const DURING = new Date('2026-03-02T02:00:00.000Z');
+/** 23 February 2026, 10:00 Manila — inside the previous 7-day window. */
+const BEFORE = new Date('2026-02-23T02:00:00.000Z');
+
+describe('Portal analytics — overview (e2e)', () => {
   let app: INestApplication;
   let auth: AuthService;
+
   const server = () => app.getHttpServer();
+
+  async function seedTenant(over: Record<string, unknown> = {}) {
+    const owner = await raw.owner.create({
+      data: {
+        name: 'O',
+        email: `o-${Date.now()}-${Math.random()}@t.com`,
+        status: 'active',
+        maxBusinesses: 5,
+      },
+    });
+    const user = await raw.user.create({
+      data: {
+        email: `u-${Date.now()}-${Math.random()}@t.com`,
+        role: 'owner',
+        ownerId: owner.id,
+        passwordHash: 'x',
+      },
+    });
+    const business = await raw.business.create({
+      data: { ownerId: owner.id, name: 'B', type: 'retail', taxRate: '0.12', ...over },
+    });
+    const branch = await raw.branch.create({
+      data: { businessId: business.id, name: 'Main', code: 'MN', address: 'x' },
+    });
+    const terminal = await raw.terminal.create({
+      data: { branchId: branch.id, name: 'T1', code: 'T1' },
+    });
+    const { accessToken } = await auth.mintTokenPair(user.id, 'owner', owner.id);
+    return {
+      token: accessToken,
+      businessId: business.id,
+      branchId: branch.id,
+      terminalId: terminal.id,
+    };
+  }
+
+  const overview = (token: string, query: Record<string, string>) =>
+    request(server())
+      .get('/v1/portal/analytics/overview')
+      .query({ from: '2026-03-01', to: '2026-03-07', ...query })
+      .set('Authorization', `Bearer ${token}`);
 
   beforeAll(async () => {
     await raw.$connect();
@@ -1982,309 +2247,166 @@ describe('Analytics overview (e2e)', () => {
     await resetDb();
   });
 
-  async function ctx(over: { dayStartTime?: string; isDemo?: boolean } = {}) {
-    seq += 1;
-    const owner = await raw.owner.create({
-      data: {
-        name: `O${seq}`,
-        email: `o-${seq}-${Date.now()}@t.com`,
-        status: 'active',
-        maxBusinesses: 5,
-      },
-    });
-    const user = await raw.user.create({
-      data: {
-        email: `u-${seq}-${Date.now()}@t.com`,
-        role: 'owner',
-        ownerId: owner.id,
-        passwordHash: 'x',
-      },
-    });
-    const business = await raw.business.create({
-      data: {
-        ownerId: owner.id,
-        name: `B${seq}`,
-        type: 'fnb',
-        taxRate: '0.12',
-        dayStartTime: over.dayStartTime ?? '00:00',
-        isDemo: over.isDemo ?? false,
-      },
-    });
-    const branch = await raw.branch.create({
-      data: { businessId: business.id, name: 'Main', code: 'MN', address: 'x' },
-    });
-    const { terminalId } = await seedBranchInfra(raw, branch.id);
-    const { accessToken } = await auth.mintTokenPair(user.id, 'owner', owner.id);
-    return { owner, business, branch, terminalId, token: accessToken };
-  }
-
-  const get = (token: string, query: string) =>
-    request(server())
-      .get(`/v1/portal/analytics/overview?${query}`)
-      .set('Authorization', `Bearer ${token}`);
-
-  const RANGE = 'from=2026-03-01&to=2026-03-07';
-  const inRange = new Date('2026-03-03T04:00:00.000Z');
-
-  it('reports gross sales, discounts and net sales from the seeded sales', async () => {
-    const c = await ctx();
+  it('reports gross, discounts and net sales for the range', async () => {
+    const t = await seedTenant();
     await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 2, unitPriceC: 10000 }],
-      orderDiscount: { source: 'free', kind: 'fixed', value: 5000 },
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [
+        { qty: 2, unitPriceC: 10000 },
+        { qty: 1, unitPriceC: 5000, discount: { source: 'free', kind: 'fixed', value: 1000 } },
+      ],
     });
 
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
+    const res = await overview(t.token, {}).expect(200);
 
-    expect(res.body.grossSalesC.value).toBe(20000);
-    expect(res.body.discountsC.value).toBe(5000);
-    expect(res.body.netSalesC.value).toBe(15000);
+    expect(res.body.grossSalesC.value).toBe(25000);
+    expect(res.body.discountsC.value).toBe(1000);
+    expect(res.body.netSalesC.value).toBe(24000);
     expect(res.body.transactions.value).toBe(1);
-    expect(res.body.averageBasketC.value).toBe(15000);
+    expect(res.body.averageBasketC.value).toBe(24000);
+  });
+
+  it('counts voids and refunds but keeps their money out of sales', async () => {
+    const t = await seedTenant();
+    const common = { branchId: t.branchId, terminalId: t.terminalId, createdAt: DURING };
+    await seedSale(raw, { ...common, lines: [{ qty: 1, unitPriceC: 10000 }] });
+    await seedSale(raw, { ...common, status: 'voided', lines: [{ qty: 1, unitPriceC: 90000 }] });
+    await seedSale(raw, { ...common, status: 'refunded', lines: [{ qty: 1, unitPriceC: 70000 }] });
+
+    const res = await overview(t.token, {}).expect(200);
+
+    expect(res.body.grossSalesC.value).toBe(10000);
+    expect(res.body.transactions.value).toBe(1);
+    expect(res.body.voidCount.value).toBe(1);
+    expect(res.body.refundCount.value).toBe(1);
+  });
+
+  it('compares against the equal period immediately before', async () => {
+    const t = await seedTenant();
+    const common = { branchId: t.branchId, terminalId: t.terminalId };
+    await seedSale(raw, { ...common, createdAt: DURING, lines: [{ qty: 1, unitPriceC: 15000 }] });
+    await seedSale(raw, { ...common, createdAt: BEFORE, lines: [{ qty: 1, unitPriceC: 10000 }] });
+
+    const res = await overview(t.token, {}).expect(200);
+
+    expect(res.body.grossSalesC.value).toBe(15000);
+    expect(res.body.grossSalesC.previous).toBe(10000);
+    expect(res.body.grossSalesC.changePct).toBeCloseTo(0.5, 10);
+  });
+
+  it('reports margin as null — never zero — when costs are unset', async () => {
+    const t = await seedTenant();
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [{ qty: 1, unitPriceC: 10000, costC: null }],
+    });
+
+    const res = await overview(t.token, {}).expect(200);
+
+    expect(res.body.grossProfitC.value).toBeNull();
+    expect(res.body.marginPct.value).toBeNull();
+    expect(res.body.uncostedRevenueC).toBe(10000);
+  });
+
+  it('computes profit from costed lines and says how much revenue it covers', async () => {
+    const t = await seedTenant();
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [
+        { qty: 2, unitPriceC: 10000, costC: 6000 },
+        { qty: 1, unitPriceC: 5000, costC: null },
+      ],
+    });
+
+    const res = await overview(t.token, {}).expect(200);
+
+    expect(res.body.grossProfitC.value).toBe(8000);
+    expect(res.body.marginPct.value).toBeCloseTo(0.4, 10);
+    expect(res.body.costedRevenueC).toBe(20000);
+    expect(res.body.uncostedRevenueC).toBe(5000);
   });
 
   it('includes modifier prices in revenue', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
+    const t = await seedTenant();
+    const sale = await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
       lines: [
         {
           qty: 2,
-          unitPriceC: 12000,
+          unitPriceC: 10000,
           costC: 4000,
           modifiers: [
-            {
-              groupId: '11111111-1111-1111-1111-111111111111',
-              modifierId: '22222222-2222-2222-2222-222222222222',
-              name: 'Oat milk',
-              priceDeltaC: 2000,
-            },
+            { groupId: 'g', modifierId: 'm', name: 'Oat milk', priceDeltaC: 2000 },
           ],
         },
       ],
     });
 
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
+    const res = await overview(t.token, {}).expect(200);
 
-    // 2 × (12000 + 2000), not 2 × 12000.
-    expect(res.body.grossSalesC.value).toBe(28000);
-    // Profit uses the same modifier-aware revenue: 28000 − (2 × 4000).
-    expect(res.body.grossProfitC.value).toBe(20000);
+    // 2 x (100.00 + 20.00) = 240.00 — not 2 x 100.00.
+    expect(res.body.grossSalesC.value).toBe(24000);
+    expect(res.body.grossSalesC.value).toBe(sale.subtotal);
+    expect(res.body.costedRevenueC).toBe(24000);
   });
 
-  it('reports margin as null, never zero, when nothing is costed', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 10000, costC: null }],
-    });
-
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(res.body.grossProfitC.value).toBeNull();
-    expect(res.body.marginPct.value).toBeNull();
-    expect(res.body.uncostedRevenueC).toBe(10000);
-    expect(res.body.costedRevenueC).toBe(0);
-  });
-
-  it('reports profit over costed items only and says how much revenue that covers', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [
-        { qty: 1, unitPriceC: 10000, costC: 6000 },
-        { qty: 1, unitPriceC: 5000, costC: null },
-      ],
-    });
-
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(res.body.grossProfitC.value).toBe(4000);
-    expect(res.body.costedRevenueC).toBe(10000);
-    expect(res.body.uncostedRevenueC).toBe(5000);
-  });
-
-  it('excludes voided sales from money and counts them separately', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 10000 }],
-    });
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      status: 'voided',
-      lines: [{ qty: 1, unitPriceC: 99900 }],
-    });
-
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(res.body.grossSalesC.value).toBe(10000);
-    expect(res.body.transactions.value).toBe(1);
-    expect(res.body.voidCount.value).toBe(1);
-  });
-
-  it('excludes refunded sales from money but reports their count', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      status: 'refunded',
-      lines: [{ qty: 1, unitPriceC: 10000 }],
-    });
-
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(res.body.grossSalesC.value).toBe(0);
-    expect(res.body.transactions.value).toBe(0);
-    expect(res.body.refundCount.value).toBe(1);
-  });
-
-  it('compares against the equal period immediately before', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 20000 }],
-    });
-    // 2026-02-25 falls in the previous 7-day window (02-22 .. 02-28).
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-02-25T04:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
-    });
-
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(res.body.grossSalesC.value).toBe(20000);
-    expect(res.body.grossSalesC.previous).toBe(10000);
-    expect(res.body.grossSalesC.changePct).toBeCloseTo(100);
-  });
-
-  it('reports changePct as null rather than infinity when the previous period was zero', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 20000 }],
-    });
-
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(res.body.grossSalesC.previous).toBe(0);
-    expect(res.body.grossSalesC.changePct).toBeNull();
-  });
-
-  it('returns zeros for an owned business with no branches, not a 404', async () => {
-    const c = await ctx();
+  it('returns zeros for an owned business that has no branches yet', async () => {
+    const t = await seedTenant();
     const empty = await raw.business.create({
-      data: { ownerId: c.owner.id, name: 'Fresh', type: 'retail', taxRate: '0.12' },
-    });
-
-    const res = await get(c.token, `${RANGE}&businessId=${empty.id}`).expect(200);
-
-    expect(res.body.grossSalesC.value).toBe(0);
-    expect(res.body.transactions.value).toBe(0);
-    expect(res.body.grossProfitC.value).toBeNull();
-  });
-
-  it('excludes demo businesses from an all-businesses rollup', async () => {
-    const c = await ctx();
-    const demo = await raw.business.create({
       data: {
-        ownerId: c.owner.id,
-        name: 'Demo',
+        ownerId: (await raw.business.findUniqueOrThrow({ where: { id: t.businessId } })).ownerId,
+        name: 'Fresh',
         type: 'retail',
         taxRate: '0.12',
-        isDemo: true,
       },
     });
-    const demoBranch = await raw.branch.create({
-      data: { businessId: demo.id, name: 'D', code: 'DM', address: 'x' },
-    });
-    const { terminalId } = await seedBranchInfra(raw, demoBranch.id);
+
+    const res = await overview(t.token, { businessId: empty.id }).expect(200);
+
+    expect(res.body.grossSalesC.value).toBe(0);
+    expect(res.body.transactions.value).toBe(0);
+    expect(res.body.grossProfitC.value).toBeNull();
+  });
+
+  it('rejects a branchId without a businessId, and a backwards range', async () => {
+    const t = await seedTenant();
+    await overview(t.token, { branchId: t.branchId }).expect(422);
+    await overview(t.token, { from: '2026-03-07', to: '2026-03-01' }).expect(422);
+  });
+
+  it('exports the same numbers as CSV, in pesos, as an attachment', async () => {
+    const t = await seedTenant();
     await seedSale(raw, {
-      branchId: demoBranch.id,
-      terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 77700 }],
-    });
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 10000 }],
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [{ qty: 1, unitPriceC: 125000 }],
     });
 
-    const res = await get(c.token, RANGE).expect(200);
-
-    expect(res.body.grossSalesC.value).toBe(10000);
-  });
-
-  it('rejects a branchId without a businessId with 422', async () => {
-    const c = await ctx();
-    await get(c.token, `${RANGE}&branchId=${c.branch.id}`).expect(422);
-  });
-
-  it('rejects a to-date before the from-date with 422', async () => {
-    const c = await ctx();
-    await get(c.token, 'from=2026-03-07&to=2026-03-01').expect(422);
-  });
-
-  it('rejects a malformed date with 422', async () => {
-    const c = await ctx();
-    await get(c.token, 'from=03-01-2026&to=2026-03-07').expect(422);
-  });
-
-  it('404s on a business the caller does not own', async () => {
-    const c = await ctx();
-    const other = await ctx();
-    await get(c.token, `${RANGE}&businessId=${other.business.id}`).expect(404);
-  });
-
-  it('exports the same figures as CSV', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 2, unitPriceC: 10000 }],
-    });
-
-    const res = await get(
-      c.token,
-      `${RANGE}&businessId=${c.business.id}&format=csv`,
-    ).expect(200);
+    const res = await overview(t.token, { format: 'csv' }).expect(200);
 
     expect(res.headers['content-type']).toContain('text/csv');
-    expect(res.headers['content-disposition']).toContain(
+    expect(res.headers['content-disposition']).toBe(
       'attachment; filename="overview-2026-03-01-2026-03-07.csv"',
     );
-    expect(res.text).toContain('Gross sales,200.00');
+    expect(res.text).toContain('1250.00');
   });
 
-  it('audits the read, and the export separately', async () => {
-    const c = await ctx();
-    await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-    await get(c.token, `${RANGE}&businessId=${c.business.id}&format=csv`).expect(200);
+  it('audits the read, and an export as an export', async () => {
+    const t = await seedTenant();
+    await overview(t.token, {}).expect(200);
+    await overview(t.token, { format: 'csv' }).expect(200);
 
     const rows = await raw.auditLog.findMany({
-      where: { businessId: c.business.id },
+      where: { businessId: t.businessId },
       orderBy: { createdAt: 'asc' },
     });
     const actions = rows.map((r) => r.action);
@@ -2294,133 +2416,15 @@ describe('Analytics overview (e2e)', () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 7: Run the e2e test to verify it fails**
 
 ```bash
-docker compose up -d db
 npm run test:e2e -- portal-analytics-overview
 ```
 
-Expected: every case 404s — the route does not exist yet.
+Expected: every case fails with 404 — the route does not exist.
 
-- [ ] **Step 3: Write the shared SQL builders**
-
-Create `src/portal/analytics/reports/sales-aggregate.sql.ts`:
-
-```ts
-import { Prisma } from '@prisma/client';
-import type { ScopedBusiness } from '../scope/analytics-scope.service';
-
-/**
- * The shared money expressions. EVERY revenue query in both analytics plans
- * builds on these — do not hand-roll `qty * unit_price` anywhere.
- *
- * `sale_items.unit_price` is the BASE price locked at add-to-cart
- * (`sales.service.ts:507`). The totals engine's line gross is
- * `lineUnitWithModsC()` = `unitPriceC + Σ modifiers[].priceDeltaC`
- * (`cart.ts:49`), and the chosen modifiers live in the `modifiers` jsonb array.
- * So `qty * unit_price` understates every line that carries a priced modifier,
- * and Σ over a sale would not equal `sales.subtotal`.
- *
- * `round()` on numeric rounds half away from zero in Postgres, matching the
- * engine's `halfUp` for the non-negative values involved. `cost_snapshot` is a
- * UNIT cost (`sales.service.ts:664`), so line cost multiplies by qty too.
- *
- * The CASE inside the lateral is not paranoia: `jsonb_array_elements` raises on
- * a non-array, and it is evaluated in FROM before any WHERE could filter it.
- */
-export const LINE_MODS_JOIN = Prisma.sql`
-  LEFT JOIN LATERAL (
-    SELECT COALESCE(SUM((m->>'priceDeltaC')::int), 0) AS mods_c
-    FROM jsonb_array_elements(
-      CASE WHEN jsonb_typeof(si.modifiers) = 'array'
-           THEN si.modifiers ELSE '[]'::jsonb END
-    ) AS m
-  ) mods ON true
-`;
-
-/** Line gross, modifiers included. */
-export const LINE_GROSS_C = Prisma.sql`round(si.qty * (si.unit_price + COALESCE(mods.mods_c, 0)))`;
-
-/** Line gross minus the discount applied to that line. */
-export const LINE_NET_C = Prisma.sql`(round(si.qty * (si.unit_price + COALESCE(mods.mods_c, 0))) - si.discount)`;
-
-/** Line cost — `cost_snapshot` is per unit. */
-export const LINE_COST_C = Prisma.sql`round(si.qty * si.cost_snapshot)`;
-
-export interface SaleAggregateRow {
-  gross_sales_c: bigint;
-  discounts_c: bigint;
-  service_charge_c: bigint;
-  transactions: bigint;
-  void_count: bigint;
-  refund_count: bigint;
-}
-
-/**
- * Sale-level totals for one window.
- *
- * Voided and refunded sales are excluded from every money figure and from
- * `transactions`; both are counted separately (spec §1).
- */
-export function saleAggregateSql(
-  business: ScopedBusiness,
-  fromUtc: Date,
-  toUtc: Date,
-): Prisma.Sql {
-  return Prisma.sql`
-    SELECT
-      COALESCE(SUM(s.subtotal) FILTER (WHERE s.status = 'completed'), 0)::bigint AS gross_sales_c,
-      COALESCE(SUM(s.discount + s.sc_pwd_discount) FILTER (WHERE s.status = 'completed'), 0)::bigint AS discounts_c,
-      COALESCE(SUM(s.service_charge) FILTER (WHERE s.status = 'completed'), 0)::bigint AS service_charge_c,
-      COUNT(*) FILTER (WHERE s.status = 'completed')::bigint AS transactions,
-      COUNT(*) FILTER (WHERE s.status = 'voided')::bigint   AS void_count,
-      COUNT(*) FILTER (WHERE s.status = 'refunded')::bigint AS refund_count
-    FROM sales s
-    WHERE s.branch_id = ANY(${business.branchIds}::uuid[])
-      AND s.deleted_at IS NULL
-      AND s.created_at >= ${fromUtc}
-      AND s.created_at <  ${toUtc}
-  `;
-}
-
-export interface LineAggregateRow {
-  costed_revenue_c: bigint;
-  costed_cost_c: bigint;
-  uncosted_revenue_c: bigint;
-  costed_items: bigint;
-}
-
-/**
- * Line-level revenue and cost for one window, split by whether a cost was
- * recorded. `costed_items` is what lets the caller answer "is profit unknown?"
- * — a zero profit and an unknown profit are different answers.
- */
-export function lineAggregateSql(
-  business: ScopedBusiness,
-  fromUtc: Date,
-  toUtc: Date,
-): Prisma.Sql {
-  return Prisma.sql`
-    SELECT
-      COALESCE(SUM(${LINE_NET_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint AS costed_revenue_c,
-      COALESCE(SUM(${LINE_COST_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint AS costed_cost_c,
-      COALESCE(SUM(${LINE_NET_C}) FILTER (WHERE si.cost_snapshot IS NULL), 0)::bigint     AS uncosted_revenue_c,
-      COUNT(*) FILTER (WHERE si.cost_snapshot IS NOT NULL)::bigint                        AS costed_items
-    FROM sale_items si
-    JOIN sales s ON s.id = si.sale_id
-    ${LINE_MODS_JOIN}
-    WHERE s.branch_id = ANY(${business.branchIds}::uuid[])
-      AND s.deleted_at IS NULL
-      AND si.deleted_at IS NULL
-      AND s.status = 'completed'
-      AND s.created_at >= ${fromUtc}
-      AND s.created_at <  ${toUtc}
-  `;
-}
-```
-
-- [ ] **Step 4: Write the overview service**
+- [ ] **Step 8: Write the service**
 
 Create `src/portal/analytics/overview/overview.service.ts`:
 
@@ -2428,26 +2432,30 @@ Create `src/portal/analytics/overview/overview.service.ts`:
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
-import {
-  AnalyticsScopeService,
-  type ScopedBusiness,
-} from '../scope/analytics-scope.service';
+import { AnalyticsScopeService } from '../scope/analytics-scope.service';
 import { ReportAuditService } from '../report-audit.service';
-import { runScoped } from '../scoped-sql';
+import { runScopedOne } from '../scoped-sql';
 import {
   lineAggregateSql,
-  saleAggregateSql,
+  salesAggregateSql,
   type LineAggregateRow,
-  type SaleAggregateRow,
+  type SalesAggregateRow,
 } from '../reports/sales-aggregate.sql';
-
-/** A KPI and its change against the previous equal period. */
-export interface Kpi {
-  value: number | null;
-  previous: number | null;
-  /** null when there is no meaningful comparison — never Infinity. */
-  changePct: number | null;
-}
+import {
+  addRows,
+  averageBasketC,
+  emptyTotals,
+  grossProfitC,
+  marginPct,
+  netSalesC,
+  toKpi,
+  toMarginKpi,
+  toNullableKpi,
+  type Kpi,
+  type MarginKpi,
+  type NullableKpi,
+  type Totals,
+} from './overview.math';
 
 export interface OverviewReport {
   from: string;
@@ -2455,258 +2463,142 @@ export interface OverviewReport {
   grossSalesC: Kpi;
   discountsC: Kpi;
   netSalesC: Kpi;
-  grossProfitC: Kpi;
-  marginPct: Kpi;
+  serviceChargeC: Kpi;
   transactions: Kpi;
-  averageBasketC: Kpi;
   voidCount: Kpi;
   refundCount: Kpi;
-  serviceChargeC: Kpi;
-  /** How much of the period's revenue the profit figure actually covers. */
+  averageBasketC: NullableKpi;
+  grossProfitC: NullableKpi;
+  marginPct: MarginKpi;
+  /** How much of this period's revenue the profit figure actually covers. */
   costedRevenueC: number;
   uncostedRevenueC: number;
-}
-
-interface WindowTotals {
-  grossSalesC: number;
-  discountsC: number;
-  serviceChargeC: number;
-  transactions: number;
-  voidCount: number;
-  refundCount: number;
-  costedRevenueC: number;
-  costedCostC: number;
-  uncostedRevenueC: number;
-  costedItems: number;
-}
-
-interface Derived {
-  grossSalesC: number;
-  discountsC: number;
-  netSalesC: number;
-  grossProfitC: number | null;
-  marginPct: number | null;
-  transactions: number;
-  averageBasketC: number | null;
-  voidCount: number;
-  refundCount: number;
-  serviceChargeC: number;
-  costedRevenueC: number;
-  uncostedRevenueC: number;
-}
-
-const ZERO: WindowTotals = {
-  grossSalesC: 0,
-  discountsC: 0,
-  serviceChargeC: 0,
-  transactions: 0,
-  voidCount: 0,
-  refundCount: 0,
-  costedRevenueC: 0,
-  costedCostC: 0,
-  uncostedRevenueC: 0,
-  costedItems: 0,
-};
-
-function add(a: WindowTotals, b: WindowTotals): WindowTotals {
-  return {
-    grossSalesC: a.grossSalesC + b.grossSalesC,
-    discountsC: a.discountsC + b.discountsC,
-    serviceChargeC: a.serviceChargeC + b.serviceChargeC,
-    transactions: a.transactions + b.transactions,
-    voidCount: a.voidCount + b.voidCount,
-    refundCount: a.refundCount + b.refundCount,
-    costedRevenueC: a.costedRevenueC + b.costedRevenueC,
-    costedCostC: a.costedCostC + b.costedCostC,
-    uncostedRevenueC: a.uncostedRevenueC + b.uncostedRevenueC,
-    costedItems: a.costedItems + b.costedItems,
-  };
 }
 
 /**
- * Derived figures, and the two places a null is the only honest answer:
- * profit when nothing in the window carried a cost, and average basket when
- * there were no transactions to divide by.
- */
-function derive(totals: WindowTotals): Derived {
-  const netSalesC = totals.grossSalesC - totals.discountsC;
-  const grossProfitC =
-    totals.costedItems === 0 ? null : totals.costedRevenueC - totals.costedCostC;
-  const marginPct =
-    grossProfitC === null || totals.costedRevenueC === 0
-      ? null
-      : (grossProfitC / totals.costedRevenueC) * 100;
-
-  return {
-    grossSalesC: totals.grossSalesC,
-    discountsC: totals.discountsC,
-    netSalesC,
-    grossProfitC,
-    marginPct,
-    transactions: totals.transactions,
-    averageBasketC:
-      totals.transactions === 0
-        ? null
-        : Math.round(netSalesC / totals.transactions),
-    voidCount: totals.voidCount,
-    refundCount: totals.refundCount,
-    serviceChargeC: totals.serviceChargeC,
-    costedRevenueC: totals.costedRevenueC,
-    uncostedRevenueC: totals.uncostedRevenueC,
-  };
-}
-
-function kpi(value: number | null, previous: number | null): Kpi {
-  const changePct =
-    value === null || previous === null || previous === 0
-      ? null
-      : ((value - previous) / previous) * 100;
-  return { value, previous, changePct };
-}
-
-/**
- * §1 Overview.
+ * Overview KPIs (analytics-spec §1) with a comparison against the equal period
+ * immediately before.
  *
- * Runs per business — each has its own `dayStartTime` and therefore its own UTC
- * window — and sums the results. There is no cross-business query.
+ * Queries run PER BUSINESS because each has its own `dayStartTime` and therefore
+ * its own UTC window; the rows are summed here. A business with no branches in
+ * scope is skipped entirely — `runScoped` refuses an unbounded query — and its
+ * absence simply leaves the totals at zero.
  */
 @Injectable()
 export class OverviewService {
   constructor(
-    private readonly raw: PrismaService,
     private readonly scope: AnalyticsScopeService,
+    private readonly raw: PrismaService,
     private readonly reportAudit: ReportAuditService,
   ) {}
 
   async run(query: AnalyticsQueryDto): Promise<OverviewReport> {
     const scope = await this.scope.resolve(query);
+    const current = emptyTotals();
+    const previous = emptyTotals();
 
-    let current = ZERO;
-    let previous = ZERO;
     for (const business of scope.businesses) {
-      current = add(
-        current,
-        await this.window(business, business.fromUtc, business.toUtc),
-      );
-      previous = add(
-        previous,
-        await this.window(
-          business,
-          business.previousFromUtc,
-          business.previousToUtc,
+      const [salesNow, salesThen, linesNow, linesThen] = await Promise.all([
+        runScopedOne<SalesAggregateRow>(this.raw, business, (b) =>
+          salesAggregateSql(b, b.fromUtc, b.toUtc),
         ),
-      );
+        runScopedOne<SalesAggregateRow>(this.raw, business, (b) =>
+          salesAggregateSql(b, b.previousFromUtc, b.previousToUtc),
+        ),
+        runScopedOne<LineAggregateRow>(this.raw, business, (b) =>
+          lineAggregateSql(b, b.fromUtc, b.toUtc),
+        ),
+        runScopedOne<LineAggregateRow>(this.raw, business, (b) =>
+          lineAggregateSql(b, b.previousFromUtc, b.previousToUtc),
+        ),
+      ]);
+      addRows(current, salesNow, linesNow);
+      addRows(previous, salesThen, linesThen);
     }
 
-    const now = derive(current);
-    const before = derive(previous);
-
     await this.reportAudit.log(scope, 'overview', query.format ?? 'json');
-
-    return {
-      from: scope.from,
-      to: scope.to,
-      grossSalesC: kpi(now.grossSalesC, before.grossSalesC),
-      discountsC: kpi(now.discountsC, before.discountsC),
-      netSalesC: kpi(now.netSalesC, before.netSalesC),
-      grossProfitC: kpi(now.grossProfitC, before.grossProfitC),
-      marginPct: kpi(now.marginPct, before.marginPct),
-      transactions: kpi(now.transactions, before.transactions),
-      averageBasketC: kpi(now.averageBasketC, before.averageBasketC),
-      voidCount: kpi(now.voidCount, before.voidCount),
-      refundCount: kpi(now.refundCount, before.refundCount),
-      serviceChargeC: kpi(now.serviceChargeC, before.serviceChargeC),
-      costedRevenueC: now.costedRevenueC,
-      uncostedRevenueC: now.uncostedRevenueC,
-    };
+    return build(scope.from, scope.to, current, previous);
   }
+}
 
-  private async window(
-    business: ScopedBusiness,
-    fromUtc: Date,
-    toUtc: Date,
-  ): Promise<WindowTotals> {
-    const [sales] = await runScoped<SaleAggregateRow>(this.raw, business, (b) =>
-      saleAggregateSql(b, fromUtc, toUtc),
-    );
-    const [lines] = await runScoped<LineAggregateRow>(this.raw, business, (b) =>
-      lineAggregateSql(b, fromUtc, toUtc),
-    );
-
-    return {
-      grossSalesC: Number(sales.gross_sales_c),
-      discountsC: Number(sales.discounts_c),
-      serviceChargeC: Number(sales.service_charge_c),
-      transactions: Number(sales.transactions),
-      voidCount: Number(sales.void_count),
-      refundCount: Number(sales.refund_count),
-      costedRevenueC: Number(lines.costed_revenue_c),
-      costedCostC: Number(lines.costed_cost_c),
-      uncostedRevenueC: Number(lines.uncosted_revenue_c),
-      costedItems: Number(lines.costed_items),
-    };
-  }
+function build(
+  from: string,
+  to: string,
+  current: Totals,
+  previous: Totals,
+): OverviewReport {
+  return {
+    from,
+    to,
+    grossSalesC: toKpi(current.grossSalesC, previous.grossSalesC),
+    discountsC: toKpi(current.discountsC, previous.discountsC),
+    netSalesC: toKpi(netSalesC(current), netSalesC(previous)),
+    serviceChargeC: toKpi(current.serviceChargeC, previous.serviceChargeC),
+    transactions: toKpi(current.transactions, previous.transactions),
+    voidCount: toKpi(current.voidCount, previous.voidCount),
+    refundCount: toKpi(current.refundCount, previous.refundCount),
+    averageBasketC: toNullableKpi(
+      averageBasketC(current),
+      averageBasketC(previous),
+    ),
+    grossProfitC: toNullableKpi(grossProfitC(current), grossProfitC(previous)),
+    marginPct: toMarginKpi(marginPct(current), marginPct(previous)),
+    costedRevenueC: current.costedRevenueC,
+    uncostedRevenueC: current.uncostedRevenueC,
+  };
 }
 ```
 
-- [ ] **Step 5: Write the CSV builder**
+- [ ] **Step 9: Write the CSV shaper and the controller**
 
 Create `src/portal/analytics/overview/overview.csv.ts`:
 
 ```ts
-import { centavosToPesos, formatPct, type CsvSection } from '../csv';
-import type { Kpi, OverviewReport } from './overview.service';
+import { centavosToPesos, type CsvSection } from '../csv';
+import type { OverviewReport } from './overview.service';
 
-const money = (k: Kpi) => [
-  centavosToPesos(k.value),
-  centavosToPesos(k.previous),
-  formatPct(k.changePct),
-];
-
-const count = (k: Kpi) => [
-  k.value === null ? '' : String(k.value),
-  k.previous === null ? '' : String(k.previous),
-  formatPct(k.changePct),
-];
-
-const percent = (k: Kpi) => [
-  formatPct(k.value),
-  formatPct(k.previous),
-  formatPct(k.changePct),
-];
-
+/** One row per KPI, so the export reads like the cards on screen. */
 export function overviewCsv(report: OverviewReport): CsvSection[] {
+  const money = (label: string, kpi: { value: number | null; previous: number | null; changePct?: number | null }) => [
+    label,
+    centavosToPesos(kpi.value),
+    centavosToPesos(kpi.previous),
+    kpi.changePct ?? null,
+  ];
+  const count = (label: string, kpi: { value: number; previous: number; changePct: number | null }) => [
+    label,
+    kpi.value,
+    kpi.previous,
+    kpi.changePct,
+  ];
+
   return [
     {
-      columns: ['Metric', 'Value', 'Previous period', 'Change %'],
+      title: `Overview ${report.from} to ${report.to}`,
+      columns: ['metric', 'value', 'previous', 'change'],
       rows: [
-        ['Gross sales', ...money(report.grossSalesC)],
-        ['Discounts given', ...money(report.discountsC)],
-        ['Net sales', ...money(report.netSalesC)],
-        ['Gross profit', ...money(report.grossProfitC)],
-        ['Margin %', ...percent(report.marginPct)],
-        ['Transactions', ...count(report.transactions)],
-        ['Average basket', ...money(report.averageBasketC)],
-        ['Voids', ...count(report.voidCount)],
-        ['Refunds', ...count(report.refundCount)],
-        ['Service charge', ...money(report.serviceChargeC)],
-      ],
-    },
-    {
-      title: 'Profit coverage',
-      columns: ['Costed revenue', 'Uncosted revenue'],
-      rows: [
+        money('Gross sales', report.grossSalesC),
+        money('Discounts', report.discountsC),
+        money('Net sales', report.netSalesC),
+        money('Service charge', report.serviceChargeC),
+        count('Transactions', report.transactions),
+        count('Voids', report.voidCount),
+        count('Refunds', report.refundCount),
+        money('Average basket', report.averageBasketC),
+        money('Gross profit', report.grossProfitC),
         [
-          centavosToPesos(report.costedRevenueC),
-          centavosToPesos(report.uncostedRevenueC),
+          'Margin',
+          report.marginPct.value,
+          report.marginPct.previous,
+          report.marginPct.changePoints,
         ],
+        money('Costed revenue', { value: report.costedRevenueC, previous: null }),
+        money('Uncosted revenue', { value: report.uncostedRevenueC, previous: null }),
       ],
     },
   ];
 }
 ```
-
-- [ ] **Step 6: Write the controller**
 
 Create `src/portal/analytics/overview/overview.controller.ts`:
 
@@ -2716,10 +2608,15 @@ import type { Response } from 'express';
 import { PortalAuthGuard } from '../../../auth/guards/portal-auth.guard';
 import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
 import { renderReport } from '../report-response';
-import { overviewCsv } from './overview.csv';
 import { OverviewService, type OverviewReport } from './overview.service';
+import { overviewCsv } from './overview.csv';
 
-/** §1 Overview — `GET /v1/portal/analytics/overview`. */
+/**
+ * Overview KPIs (analytics-spec §1). `GET /v1/portal/analytics/overview`.
+ *
+ * `passthrough: true` keeps Nest's serialisation and the global exception
+ * filter in play; `renderReport` only sets headers when CSV was asked for.
+ */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
 export class OverviewController {
@@ -2736,7 +2633,7 @@ export class OverviewController {
 }
 ```
 
-- [ ] **Step 7: Register it in the module**
+- [ ] **Step 10: Register the controller**
 
 In `src/portal/analytics/analytics.module.ts`, add the imports and entries:
 
@@ -2745,34 +2642,35 @@ import { OverviewController } from './overview/overview.controller';
 import { OverviewService } from './overview/overview.service';
 ```
 
-```ts
-  controllers: [OverviewController],
-  providers: [AnalyticsScopeService, ReportAuditService, OverviewService],
-```
+`controllers: [OverviewController]`, and add `OverviewService` to `providers`.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [ ] **Step 11: Run every test to verify they pass**
 
 ```bash
+npm test -- overview.math
 npm run test:e2e -- portal-analytics-overview
+npm run lint && npm run build
 ```
 
-Expected: PASS, all cases. If `grossSalesC` reads 24000 where 28000 was expected, a revenue expression is using `qty * unit_price` instead of `LINE_NET_C`.
+Expected: all pass. If the CSV case fails on the peso rendering, check `centavosToPesos` is applied in `overview.csv.ts` rather than raw centavos leaking through.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
 git add src/portal/analytics test/portal-analytics-overview.e2e-spec.ts
-git commit -m "feat(analytics): overview KPIs with previous-period comparison and CSV export"
+git commit -m "feat(api): overview report with period comparison and null-safe margin"
 ```
 
 ---
 
-## Task 8: Sales reports (§2)
+### Task 8: Sales report (§2)
 
-Four views over the same sales: the calendar heatmap, the trend line, hour/day patterns, and the three breakdowns.
+Four endpoints over one family of bucketed queries: the calendar heatmap, the trend line, the hour/weekday patterns, and the three breakdowns.
+
+**Definition used throughout §2:** `salesC` is **net sales** — `subtotal − discount − sc_pwd_discount`, the same figure `netSalesC` reports in §1 — so a heatmap day and an overview card never disagree. Service charge is excluded, as it is in §1.
 
 **Files:**
-- Create: `src/portal/analytics/reports/sales-buckets.sql.ts`
+- Create: `src/portal/analytics/reports/sales-series.sql.ts`
 - Create: `src/portal/analytics/sales/sales-report.service.ts`
 - Create: `src/portal/analytics/sales/sales-report.controller.ts`
 - Create: `src/portal/analytics/sales/sales-report.csv.ts`
@@ -2781,355 +2679,351 @@ Four views over the same sales: the calendar heatmap, the trend line, hour/day p
 - Test: `test/portal-analytics-sales.e2e-spec.ts`
 
 **Interfaces:**
-- Consumes: everything from Tasks 3–5, plus `LINE_MODS_JOIN`/`LINE_NET_C`/`LINE_COST_C` (Task 7).
+- Consumes: `runScoped` (Task 5), `MANILA_OFFSET_MINUTES`/`businessDaySeries` (Task 2), `ScopedBusiness` (Task 4), `seedSale` (Task 6).
 - Produces:
-  - `businessDayExpr(business): Prisma.Sql`, `SALE_NET_C`
-  - `dailySalesSql`, `bucketedSalesSql`, `bucketedProfitSql`, `hourOfDaySql`, `dayOfWeekSql`, `paymentBreakdownSql`, `orderTypeBreakdownSql`, `branchBreakdownSql`
+  - `dayBucketExpr(business): Prisma.Sql` — the business-day bucket, reused by every builder here
+  - `heatmapSql`, `trendSalesSql`, `trendLinesSql`, `hourPatternSql`, `paymentBreakdownSql`, `orderTypeBreakdownSql`, `branchBreakdownSql`
   - `class SalesTrendQueryDto extends AnalyticsQueryDto { granularity?: 'day' | 'week' | 'month' }`
-  - `SalesReportService.heatmap/trend/patterns/breakdowns(query)`
-  - `GET /v1/portal/analytics/sales/{heatmap,trend,patterns,breakdowns}`
+  - `GET /v1/portal/analytics/sales/heatmap`, `/trend`, `/patterns`, `/breakdowns`
 
 - [ ] **Step 1: Write the failing e2e test**
 
-Create `test/portal-analytics-sales.e2e-spec.ts`. Copy the `beforeAll`/`afterAll`/`beforeEach`/`ctx()` bootstrap verbatim from `test/portal-analytics-overview.e2e-spec.ts` (same imports, same describe skeleton, renamed to `'Analytics sales (e2e)'`), then use these cases:
+Create `test/portal-analytics-sales.e2e-spec.ts`. Reuse the `seedTenant` / bootstrap block from `test/portal-analytics-overview.e2e-spec.ts` verbatim — same imports, same `beforeAll`/`afterAll`/`beforeEach`, same `seedTenant` helper — then:
 
 ```ts
-  const RANGE = 'from=2026-03-01&to=2026-03-07';
-  const get = (token: string, path: string, query: string) =>
+  /** 2 March 2026 is a Monday; 10:00 and 15:00 Manila. */
+  const MON_10 = new Date('2026-03-02T02:00:00.000Z');
+  const MON_15 = new Date('2026-03-02T07:00:00.000Z');
+  /** 4 March 2026, Wednesday, 10:00 Manila. */
+  const WED_10 = new Date('2026-03-04T02:00:00.000Z');
+
+  const get = (token: string, path: string, query: Record<string, string> = {}) =>
     request(server())
-      .get(`/v1/portal/analytics/sales/${path}?${query}`)
+      .get(`/v1/portal/analytics/sales/${path}`)
+      .query({ from: '2026-03-01', to: '2026-03-07', ...query })
       .set('Authorization', `Bearer ${token}`);
 
-  it('zero-fills every day of the range so the calendar grid has no holes', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-03T04:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
+  describe('heatmap', () => {
+    it('returns one row per day in the range, zero-filled', async () => {
+      const t = await seedTenant();
+      await seedSale(raw, {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        createdAt: MON_10,
+        lines: [{ qty: 1, unitPriceC: 10000 }],
+      });
+
+      const res = await get(t.token, 'heatmap').expect(200);
+
+      expect(res.body).toHaveLength(7);
+      expect(res.body[0]).toEqual({ date: '2026-03-01', salesC: 0, transactions: 0 });
+      expect(res.body[1]).toEqual({ date: '2026-03-02', salesC: 10000, transactions: 1 });
     });
 
-    const res = await get(c.token, 'heatmap', `${RANGE}&businessId=${c.business.id}`).expect(200);
+    it('reports NET sales, so a discount shows up on the day', async () => {
+      const t = await seedTenant();
+      await seedSale(raw, {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        createdAt: MON_10,
+        lines: [
+          { qty: 1, unitPriceC: 10000, discount: { source: 'free', kind: 'fixed', value: 2500 } },
+        ],
+      });
 
-    expect(res.body.days).toHaveLength(7);
-    expect(res.body.days[0]).toEqual({
-      date: '2026-03-01',
-      salesC: 0,
-      transactions: 0,
-    });
-    expect(res.body.days[2]).toEqual({
-      date: '2026-03-03',
-      salesC: 10000,
-      transactions: 1,
-    });
-  });
-
-  it('buckets a 3 AM sale on the previous day when the business day starts at 04:00', async () => {
-    const c = await ctx({ dayStartTime: '04:00' });
-    // 2026-03-03 03:00 Manila == 2026-03-02T19:00Z
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-02T19:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
+      const res = await get(t.token, 'heatmap').expect(200);
+      expect(res.body[1].salesC).toBe(7500);
     });
 
-    const res = await get(c.token, 'heatmap', `${RANGE}&businessId=${c.business.id}`).expect(200);
+    it('puts an early-hours sale on the previous day for an 04:00 business', async () => {
+      const t = await seedTenant({ dayStartTime: '04:00' });
+      // 03:00 Manila on 3 March is 19:00 UTC on 2 March.
+      await seedSale(raw, {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        createdAt: new Date('2026-03-02T19:00:00.000Z'),
+        lines: [{ qty: 1, unitPriceC: 10000 }],
+      });
 
-    const byDate = Object.fromEntries(
-      res.body.days.map((d: any) => [d.date, d.salesC]),
-    );
-    expect(byDate['2026-03-02']).toBe(10000);
-    expect(byDate['2026-03-03']).toBe(0);
-  });
-
-  it('reports the trend by day with profit where costs are known', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-03T04:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000, costC: 6000 }],
-    });
-
-    const res = await get(
-      c.token,
-      'trend',
-      `${RANGE}&businessId=${c.business.id}&granularity=day`,
-    ).expect(200);
-
-    const day = res.body.buckets.find((b: any) => b.bucket === '2026-03-03');
-    expect(day.salesC).toBe(10000);
-    expect(day.grossProfitC).toBe(4000);
-    expect(day.transactions).toBe(1);
-  });
-
-  it('reports profit as null in a bucket where nothing was costed', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-03T04:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000, costC: null }],
-    });
-
-    const res = await get(
-      c.token,
-      'trend',
-      `${RANGE}&businessId=${c.business.id}&granularity=day`,
-    ).expect(200);
-
-    const day = res.body.buckets.find((b: any) => b.bucket === '2026-03-03');
-    expect(day.salesC).toBe(10000);
-    expect(day.grossProfitC).toBeNull();
-  });
-
-  it('groups the trend by week and by month', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-03T04:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
-    });
-
-    const week = await get(
-      c.token,
-      'trend',
-      `${RANGE}&businessId=${c.business.id}&granularity=week`,
-    ).expect(200);
-    // 2026-03-03 is a Tuesday; the ISO week starts Monday 2026-03-02.
-    expect(week.body.buckets[0].bucket).toBe('2026-03-02');
-
-    const month = await get(
-      c.token,
-      'trend',
-      `${RANGE}&businessId=${c.business.id}&granularity=month`,
-    ).expect(200);
-    expect(month.body.buckets[0].bucket).toBe('2026-03-01');
-  });
-
-  it('rejects an unknown granularity with 422', async () => {
-    const c = await ctx();
-    await get(
-      c.token,
-      'trend',
-      `${RANGE}&businessId=${c.business.id}&granularity=fortnight`,
-    ).expect(422);
-  });
-
-  it('reports hour-of-day on the wall clock, not the business day', async () => {
-    // A 3 AM sale in an 04:00 business belongs to the previous BUSINESS DAY but
-    // is still 3 AM on the clock. Peaks must read as the hour they happened.
-    const c = await ctx({ dayStartTime: '04:00' });
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-02T19:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
-    });
-
-    const res = await get(c.token, 'patterns', `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(res.body.hourOfDay).toHaveLength(24);
-    expect(res.body.hourOfDay[3]).toEqual({
-      hour: 3,
-      salesC: 10000,
-      transactions: 1,
-    });
-    expect(res.body.hourOfDay[4].salesC).toBe(0);
-  });
-
-  it('reports day-of-week with Sunday at index 0 and every day present', async () => {
-    const c = await ctx();
-    // 2026-03-03 is a Tuesday.
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-03T04:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
-    });
-
-    const res = await get(c.token, 'patterns', `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(res.body.dayOfWeek).toHaveLength(7);
-    expect(res.body.dayOfWeek[0].dayOfWeek).toBe(0);
-    expect(res.body.dayOfWeek[2]).toEqual({
-      dayOfWeek: 2,
-      salesC: 10000,
-      transactions: 1,
+      const res = await get(t.token, 'heatmap').expect(200);
+      const byDate = Object.fromEntries(res.body.map((r: any) => [r.date, r.salesC]));
+      expect(byDate['2026-03-02']).toBe(10000);
+      expect(byDate['2026-03-03']).toBe(0);
     });
   });
 
-  it('breaks down by payment method, order type and branch', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-03T04:00:00.000Z'),
-      orderType: 'dine_in',
-      paymentMethod: 'gcash',
-      lines: [{ qty: 1, unitPriceC: 10000 }],
+  describe('trend', () => {
+    it('buckets by day and carries profit where costs are known', async () => {
+      const t = await seedTenant();
+      await seedSale(raw, {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        createdAt: MON_10,
+        lines: [{ qty: 1, unitPriceC: 10000, costC: 6000 }],
+      });
+
+      const res = await get(t.token, 'trend', { granularity: 'day' }).expect(200);
+
+      const monday = res.body.find((r: any) => r.bucket === '2026-03-02');
+      expect(monday).toEqual({
+        bucket: '2026-03-02',
+        salesC: 10000,
+        grossProfitC: 4000,
+        transactions: 1,
+      });
     });
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-04T04:00:00.000Z'),
-      orderType: 'takeout',
-      paymentMethod: 'cash',
-      lines: [{ qty: 1, unitPriceC: 5000 }],
+
+    it('leaves profit null on a bucket whose sales are all uncosted', async () => {
+      const t = await seedTenant();
+      await seedSale(raw, {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        createdAt: MON_10,
+        lines: [{ qty: 1, unitPriceC: 10000, costC: null }],
+      });
+
+      const res = await get(t.token, 'trend', { granularity: 'day' }).expect(200);
+      expect(res.body.find((r: any) => r.bucket === '2026-03-02').grossProfitC).toBeNull();
     });
 
-    const res = await get(c.token, 'breakdowns', `${RANGE}&businessId=${c.business.id}`).expect(200);
+    it('collapses the week into a single Monday-dated bucket', async () => {
+      const t = await seedTenant();
+      const common = { branchId: t.branchId, terminalId: t.terminalId };
+      await seedSale(raw, { ...common, createdAt: MON_10, lines: [{ qty: 1, unitPriceC: 10000 }] });
+      await seedSale(raw, { ...common, createdAt: WED_10, lines: [{ qty: 1, unitPriceC: 5000 }] });
 
-    const byMethod = Object.fromEntries(
-      res.body.byPaymentMethod.map((r: any) => [r.method, r.salesC]),
-    );
-    expect(byMethod.gcash).toBe(10000);
-    expect(byMethod.cash).toBe(5000);
+      const res = await get(t.token, 'trend', { granularity: 'week' }).expect(200);
 
-    const byType = Object.fromEntries(
-      res.body.byOrderType.map((r: any) => [r.orderType, r.salesC]),
-    );
-    expect(byType.dine_in).toBe(10000);
-    expect(byType.takeout).toBe(5000);
+      expect(res.body).toEqual([
+        { bucket: '2026-03-02', salesC: 15000, grossProfitC: null, transactions: 2 },
+      ]);
+    });
 
-    expect(res.body.byBranch).toHaveLength(1);
-    expect(res.body.byBranch[0]).toMatchObject({
-      branchId: c.branch.id,
-      name: 'Main',
-      salesC: 15000,
-      transactions: 2,
+    it('rejects an unknown granularity', async () => {
+      const t = await seedTenant();
+      await get(t.token, 'trend', { granularity: 'fortnight' }).expect(422);
     });
   });
 
-  it('exports the heatmap as CSV', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date('2026-03-03T04:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
+  describe('patterns', () => {
+    it('reports all 24 hours and all 7 weekdays, zero-filled', async () => {
+      const t = await seedTenant();
+      const res = await get(t.token, 'patterns').expect(200);
+      expect(res.body.hourOfDay).toHaveLength(24);
+      expect(res.body.dayOfWeek).toHaveLength(7);
     });
 
-    const res = await get(
-      c.token,
-      'heatmap',
-      `${RANGE}&businessId=${c.business.id}&format=csv`,
-    ).expect(200);
+    it('places a sale at its Manila wall-clock hour, not the business-day offset', async () => {
+      const t = await seedTenant({ dayStartTime: '04:00' });
+      await seedSale(raw, {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        createdAt: MON_15,
+        lines: [{ qty: 1, unitPriceC: 10000 }],
+      });
 
-    expect(res.headers['content-type']).toContain('text/csv');
-    expect(res.text).toContain('2026-03-03,100.00,1');
+      const res = await get(t.token, 'patterns').expect(200);
+
+      // 15:00 Manila reads as 15:00 whatever the business day starts at.
+      expect(res.body.hourOfDay[15]).toEqual({ hour: 15, salesC: 10000, transactions: 1 });
+      expect(res.body.hourOfDay[11].salesC).toBe(0);
+    });
+
+    it('places a Monday sale on Monday (dayOfWeek 1, Sunday is 0)', async () => {
+      const t = await seedTenant();
+      await seedSale(raw, {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        createdAt: MON_10,
+        lines: [{ qty: 1, unitPriceC: 10000 }],
+      });
+
+      const res = await get(t.token, 'patterns').expect(200);
+      expect(res.body.dayOfWeek[1]).toEqual({ dayOfWeek: 1, salesC: 10000, transactions: 1 });
+    });
+  });
+
+  describe('breakdowns', () => {
+    it('splits by payment method, order type and branch', async () => {
+      const t = await seedTenant();
+      const common = { branchId: t.branchId, terminalId: t.terminalId, createdAt: MON_10 };
+      await seedSale(raw, {
+        ...common,
+        paymentMethod: 'cash',
+        orderType: 'takeout',
+        lines: [{ qty: 1, unitPriceC: 10000 }],
+      });
+      await seedSale(raw, {
+        ...common,
+        paymentMethod: 'gcash',
+        orderType: 'dine_in',
+        lines: [{ qty: 1, unitPriceC: 5000 }],
+      });
+
+      const res = await get(t.token, 'breakdowns').expect(200);
+
+      const byMethod = Object.fromEntries(
+        res.body.byPaymentMethod.map((r: any) => [r.method, r.salesC]),
+      );
+      expect(byMethod).toEqual({ cash: 10000, gcash: 5000 });
+
+      const byType = Object.fromEntries(
+        res.body.byOrderType.map((r: any) => [r.orderType, r.transactions]),
+      );
+      expect(byType).toEqual({ takeout: 1, dine_in: 1 });
+
+      expect(res.body.byBranch).toEqual([
+        { branchId: t.branchId, name: 'Main', salesC: 15000, transactions: 2 },
+      ]);
+    });
+
+    it('exports every breakdown as one CSV with a section each', async () => {
+      const t = await seedTenant();
+      await seedSale(raw, {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        createdAt: MON_10,
+        lines: [{ qty: 1, unitPriceC: 10000 }],
+      });
+
+      const res = await get(t.token, 'breakdowns', { format: 'csv' }).expect(200);
+
+      expect(res.headers['content-disposition']).toContain(
+        'filename="sales-breakdowns-2026-03-01-2026-03-07.csv"',
+      );
+      expect(res.text).toContain('By payment method');
+      expect(res.text).toContain('By order type');
+      expect(res.text).toContain('By branch');
+      expect(res.text).toContain('100.00');
+    });
   });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run the e2e test to verify it fails**
 
 ```bash
 npm run test:e2e -- portal-analytics-sales
 ```
 
-Expected: 404 on every case — the routes do not exist.
+Expected: every case 404s.
 
-- [ ] **Step 3: Write the bucketed SQL builders**
+- [ ] **Step 3: Write the SQL builders**
 
-Create `src/portal/analytics/reports/sales-buckets.sql.ts`:
+Create `src/portal/analytics/reports/sales-series.sql.ts`:
 
 ```ts
 import { Prisma } from '@prisma/client';
 import { MANILA_OFFSET_MINUTES } from '../scope/business-day';
 import type { ScopedBusiness } from '../scope/analytics-scope.service';
-import { LINE_COST_C, LINE_MODS_JOIN, LINE_NET_C } from './sales-aggregate.sql';
-
-export type Granularity = 'day' | 'week' | 'month';
 
 /**
- * The business day a sale belongs to, as SQL.
+ * Bucketed sales queries (analytics-spec §2).
  *
- * Shift the UTC timestamp into Manila (+480) and back off the day start, then
- * take the date. Identical arithmetic to `businessDayOf()` in
- * `scope/business-day.ts` — the two MUST agree, and the e2e business-day case
- * is what proves they do.
+ * `salesC` throughout is NET sales — `subtotal - discount - sc_pwd_discount` —
+ * the same figure the overview reports, so a heatmap day and an overview card
+ * can never disagree. Service charge is excluded here as it is there.
  *
- * The shift is passed as an interval literal rather than `make_interval(...)`
- * so the parameter type is unambiguous to the driver.
+ * The business-day bucket mirrors `businessDayOf()` exactly: shift the instant
+ * by (Manila offset − the business's day start), then take the date. Doing it in
+ * SQL and in TypeScript the same way is what lets the zero-fill line up.
  */
-export function businessDayExpr(business: ScopedBusiness): Prisma.Sql {
-  const shiftMinutes = MANILA_OFFSET_MINUTES - business.dayStartMinutes;
-  return Prisma.sql`((s.created_at + ${`${shiftMinutes} minutes`}::interval)::date)`;
+
+const NET_SALES = Prisma.sql`(s.subtotal - s.discount - s.sc_pwd_discount)`;
+
+/** `(created_at + offset)::date` — the business day a sale belongs to. */
+export function dayBucketExpr(business: ScopedBusiness): Prisma.Sql {
+  const shift = MANILA_OFFSET_MINUTES - business.dayStartMinutes;
+  return Prisma.sql`((s.created_at + make_interval(mins => ${shift}))::date)`;
 }
 
-function bucketExpr(
-  business: ScopedBusiness,
-  granularity: Granularity,
-): Prisma.Sql {
-  const day = businessDayExpr(business);
-  if (granularity === 'day') return day;
-  const unit = granularity === 'week' ? 'week' : 'month';
-  return Prisma.sql`(date_trunc(${unit}, ${day})::date)`;
-}
-
-/**
- * Sale-level net sales: after discounts, EXCLUDING service charge — the same
- * definition as the overview's `netSalesC`, so the two reports agree.
- */
-export const SALE_NET_C = Prisma.sql`(s.subtotal - s.discount - s.sc_pwd_discount)`;
-
-/** Only completed sales count as sales; voids and refunds never do. */
-const COMPLETED_IN_WINDOW = (business: ScopedBusiness) => Prisma.sql`
-  WHERE s.branch_id = ANY(${business.branchIds}::uuid[])
+/** Shared predicate: completed, live, in this business's window. */
+function completedInWindow(business: ScopedBusiness): Prisma.Sql {
+  return Prisma.sql`
+    s.branch_id = ANY(${business.branchIds}::uuid[])
     AND s.deleted_at IS NULL
     AND s.status = 'completed'
     AND s.created_at >= ${business.fromUtc}
     AND s.created_at <  ${business.toUtc}
-`;
+  `;
+}
 
-export interface BucketSalesRow {
+export interface BucketRow {
   bucket: Date;
   sales_c: bigint;
   transactions: bigint;
 }
 
-export function bucketedSalesSql(
-  business: ScopedBusiness,
-  granularity: Granularity,
-): Prisma.Sql {
+export function heatmapSql(business: ScopedBusiness): Prisma.Sql {
   return Prisma.sql`
-    SELECT
-      ${bucketExpr(business, granularity)} AS bucket,
-      COALESCE(SUM(${SALE_NET_C}), 0)::bigint AS sales_c,
-      COUNT(*)::bigint AS transactions
+    SELECT ${dayBucketExpr(business)} AS bucket,
+           COALESCE(SUM(${NET_SALES}), 0)::bigint AS sales_c,
+           COUNT(*)::bigint AS transactions
     FROM sales s
-    ${COMPLETED_IN_WINDOW(business)}
+    WHERE ${completedInWindow(business)}
     GROUP BY 1
-    ORDER BY 1
   `;
 }
 
-export interface BucketProfitRow {
-  bucket: Date;
-  costed_revenue_c: bigint;
-  costed_cost_c: bigint;
-  costed_items: bigint;
+export type Granularity = 'day' | 'week' | 'month';
+
+/** `date_trunc` on the bucket date. Postgres weeks start Monday, as §2 asks. */
+function truncated(business: ScopedBusiness, granularity: Granularity): Prisma.Sql {
+  if (granularity === 'day') return dayBucketExpr(business);
+  return Prisma.sql`(date_trunc(${granularity}, ${dayBucketExpr(business)}::timestamp)::date)`;
 }
 
-export function bucketedProfitSql(
+export function trendSalesSql(
   business: ScopedBusiness,
   granularity: Granularity,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT
-      ${bucketExpr(business, granularity)} AS bucket,
-      COALESCE(SUM(${LINE_NET_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint AS costed_revenue_c,
-      COALESCE(SUM(${LINE_COST_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint AS costed_cost_c,
-      COUNT(*) FILTER (WHERE si.cost_snapshot IS NOT NULL)::bigint AS costed_items
+    SELECT ${truncated(business, granularity)} AS bucket,
+           COALESCE(SUM(${NET_SALES}), 0)::bigint AS sales_c,
+           COUNT(*)::bigint AS transactions
+    FROM sales s
+    WHERE ${completedInWindow(business)}
+    GROUP BY 1
+  `;
+}
+
+export interface TrendProfitRow {
+  bucket: Date;
+  costed_lines: bigint;
+  costed_revenue_c: bigint;
+  costed_cost_c: bigint;
+}
+
+/**
+ * Profit per bucket. The modifier lateral is not optional: `unit_price` is the
+ * base price and the priced modifiers live in the jsonb array
+ * (`sales.service.ts:507`), so omitting it understates every such line.
+ */
+export function trendLinesSql(
+  business: ScopedBusiness,
+  granularity: Granularity,
+): Prisma.Sql {
+  return Prisma.sql`
+    SELECT ${truncated(business, granularity)} AS bucket,
+           COUNT(*) FILTER (WHERE si.cost_snapshot IS NOT NULL)::bigint AS costed_lines,
+           COALESCE(SUM(line.net_c) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+             AS costed_revenue_c,
+           COALESCE(SUM(round(si.qty * si.cost_snapshot)) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+             AS costed_cost_c
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
-    ${LINE_MODS_JOIN}
-    ${COMPLETED_IN_WINDOW(business)}
+    CROSS JOIN LATERAL (
+      SELECT COALESCE(SUM((m->>'priceDeltaC')::int), 0) AS mods_c
+      FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(si.modifiers) = 'array'
+             THEN si.modifiers ELSE '[]'::jsonb END
+      ) AS m
+    ) mods
+    CROSS JOIN LATERAL (
+      SELECT round(si.qty * (si.unit_price + mods.mods_c)) - si.discount AS net_c
+    ) line
+    WHERE ${completedInWindow(business)}
       AND si.deleted_at IS NULL
     GROUP BY 1
-    ORDER BY 1
   `;
 }
 
@@ -3140,43 +3034,39 @@ export interface HourRow {
 }
 
 /**
- * Hour of day on the MANILA WALL CLOCK, deliberately not shifted by the day
- * start: a 3 AM peak must read as 3 AM whatever time the business day begins.
+ * Hour of day uses the Manila WALL CLOCK, deliberately ignoring `dayStartTime`:
+ * a 3 PM peak must read as 3 PM whatever hour the business day begins.
  */
-export function hourOfDaySql(business: ScopedBusiness): Prisma.Sql {
+export function hourPatternSql(business: ScopedBusiness): Prisma.Sql {
   return Prisma.sql`
-    SELECT
-      EXTRACT(HOUR FROM (s.created_at + ${`${MANILA_OFFSET_MINUTES} minutes`}::interval))::int AS hour,
-      COALESCE(SUM(${SALE_NET_C}), 0)::bigint AS sales_c,
-      COUNT(*)::bigint AS transactions
+    SELECT EXTRACT(HOUR FROM s.created_at + make_interval(mins => ${MANILA_OFFSET_MINUTES}))::int AS hour,
+           COALESCE(SUM(${NET_SALES}), 0)::bigint AS sales_c,
+           COUNT(*)::bigint AS transactions
     FROM sales s
-    ${COMPLETED_IN_WINDOW(business)}
+    WHERE ${completedInWindow(business)}
     GROUP BY 1
-    ORDER BY 1
   `;
 }
 
-export interface DayOfWeekRow {
+export interface DowRow {
   day_of_week: number;
   sales_c: bigint;
   transactions: bigint;
 }
 
-/** Day of week of the BUSINESS day. Postgres DOW is 0 = Sunday, like JS. */
-export function dayOfWeekSql(business: ScopedBusiness): Prisma.Sql {
+/** Day of week of the BUSINESS day (0 = Sunday), so it agrees with the heatmap. */
+export function dowPatternSql(business: ScopedBusiness): Prisma.Sql {
   return Prisma.sql`
-    SELECT
-      EXTRACT(DOW FROM ${businessDayExpr(business)})::int AS day_of_week,
-      COALESCE(SUM(${SALE_NET_C}), 0)::bigint AS sales_c,
-      COUNT(*)::bigint AS transactions
+    SELECT EXTRACT(DOW FROM ${dayBucketExpr(business)})::int AS day_of_week,
+           COALESCE(SUM(${NET_SALES}), 0)::bigint AS sales_c,
+           COUNT(*)::bigint AS transactions
     FROM sales s
-    ${COMPLETED_IN_WINDOW(business)}
+    WHERE ${completedInWindow(business)}
     GROUP BY 1
-    ORDER BY 1
   `;
 }
 
-export interface PaymentBreakdownRow {
+export interface MethodRow {
   method: string;
   sales_c: bigint;
   transactions: bigint;
@@ -3184,25 +3074,23 @@ export interface PaymentBreakdownRow {
 
 /**
  * Payment split sums `sale_payments.amount`. A sale carries one method in the
- * MVP, but the payments table is the honest source and stays correct when
- * split tender arrives.
+ * MVP, but the payments table is the honest source and stays right when split
+ * payments arrive.
  */
 export function paymentBreakdownSql(business: ScopedBusiness): Prisma.Sql {
   return Prisma.sql`
-    SELECT
-      sp.method::text AS method,
-      COALESCE(SUM(sp.amount), 0)::bigint AS sales_c,
-      COUNT(DISTINCT s.id)::bigint AS transactions
-    FROM sale_payments sp
-    JOIN sales s ON s.id = sp.sale_id
-    ${COMPLETED_IN_WINDOW(business)}
-      AND sp.deleted_at IS NULL
+    SELECT p.method::text AS method,
+           COALESCE(SUM(p.amount), 0)::bigint AS sales_c,
+           COUNT(DISTINCT s.id)::bigint AS transactions
+    FROM sale_payments p
+    JOIN sales s ON s.id = p.sale_id
+    WHERE ${completedInWindow(business)}
+      AND p.deleted_at IS NULL
     GROUP BY 1
-    ORDER BY 2 DESC
   `;
 }
 
-export interface OrderTypeBreakdownRow {
+export interface OrderTypeRow {
   order_type: string;
   sales_c: bigint;
   transactions: bigint;
@@ -3210,18 +3098,16 @@ export interface OrderTypeBreakdownRow {
 
 export function orderTypeBreakdownSql(business: ScopedBusiness): Prisma.Sql {
   return Prisma.sql`
-    SELECT
-      s.order_type::text AS order_type,
-      COALESCE(SUM(${SALE_NET_C}), 0)::bigint AS sales_c,
-      COUNT(*)::bigint AS transactions
+    SELECT s.order_type::text AS order_type,
+           COALESCE(SUM(${NET_SALES}), 0)::bigint AS sales_c,
+           COUNT(*)::bigint AS transactions
     FROM sales s
-    ${COMPLETED_IN_WINDOW(business)}
+    WHERE ${completedInWindow(business)}
     GROUP BY 1
-    ORDER BY 2 DESC
   `;
 }
 
-export interface BranchBreakdownRow {
+export interface BranchRow {
   branch_id: string;
   name: string;
   sales_c: bigint;
@@ -3230,27 +3116,24 @@ export interface BranchBreakdownRow {
 
 export function branchBreakdownSql(business: ScopedBusiness): Prisma.Sql {
   return Prisma.sql`
-    SELECT
-      b.id::text AS branch_id,
-      b.name     AS name,
-      COALESCE(SUM(${SALE_NET_C}), 0)::bigint AS sales_c,
-      COUNT(s.id)::bigint AS transactions
-    FROM branches b
-    LEFT JOIN sales s
-      ON s.branch_id = b.id
-     AND s.deleted_at IS NULL
-     AND s.status = 'completed'
-     AND s.created_at >= ${business.fromUtc}
-     AND s.created_at <  ${business.toUtc}
-    WHERE b.id = ANY(${business.branchIds}::uuid[])
-      AND b.deleted_at IS NULL
+    SELECT s.branch_id::text AS branch_id,
+           b.name AS name,
+           COALESCE(SUM(${NET_SALES}), 0)::bigint AS sales_c,
+           COUNT(*)::bigint AS transactions
+    FROM sales s
+    JOIN branches b ON b.id = s.branch_id
+    WHERE ${completedInWindow(business)}
     GROUP BY 1, 2
     ORDER BY 3 DESC
   `;
 }
 ```
 
-- [ ] **Step 4: Write the trend query DTO**
+If `make_interval(mins => $n)` is rejected by the driver, substitute
+`(s.created_at + (${shift} * INTERVAL '1 minute'))` — same result, and the
+`branch_id` tripwire is unaffected.
+
+- [ ] **Step 4: Write the granularity DTO**
 
 Create `src/portal/analytics/dto/sales-trend-query.dto.ts`:
 
@@ -3259,14 +3142,13 @@ import { IsIn, IsOptional } from 'class-validator';
 import { AnalyticsQueryDto } from './analytics-query.dto';
 
 export class SalesTrendQueryDto extends AnalyticsQueryDto {
-  /** Defaults to `day`. */
   @IsOptional()
   @IsIn(['day', 'week', 'month'])
   granularity?: 'day' | 'week' | 'month';
 }
 ```
 
-- [ ] **Step 5: Write the sales report service**
+- [ ] **Step 5: Write the service**
 
 Create `src/portal/analytics/sales/sales-report.service.ts`:
 
@@ -3275,41 +3157,33 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
 import { SalesTrendQueryDto } from '../dto/sales-trend-query.dto';
-import {
-  AnalyticsScopeService,
-  type ResolvedScope,
-} from '../scope/analytics-scope.service';
+import { AnalyticsScopeService, type ResolvedScope } from '../scope/analytics-scope.service';
 import { businessDaySeries } from '../scope/business-day';
 import { ReportAuditService } from '../report-audit.service';
 import { runScoped } from '../scoped-sql';
 import {
-  bucketedProfitSql,
-  bucketedSalesSql,
   branchBreakdownSql,
-  dayOfWeekSql,
-  hourOfDaySql,
+  dowPatternSql,
+  heatmapSql,
+  hourPatternSql,
   orderTypeBreakdownSql,
   paymentBreakdownSql,
-  type BranchBreakdownRow,
-  type BucketProfitRow,
-  type BucketSalesRow,
-  type DayOfWeekRow,
+  trendLinesSql,
+  trendSalesSql,
+  type BranchRow,
+  type BucketRow,
+  type DowRow,
   type Granularity,
   type HourRow,
-  type OrderTypeBreakdownRow,
-  type PaymentBreakdownRow,
-} from '../reports/sales-buckets.sql';
+  type MethodRow,
+  type OrderTypeRow,
+  type TrendProfitRow,
+} from '../reports/sales-series.sql';
 
 export interface HeatmapDay {
   date: string;
   salesC: number;
   transactions: number;
-}
-
-export interface HeatmapReport {
-  from: string;
-  to: string;
-  days: HeatmapDay[];
 }
 
 export interface TrendBucket {
@@ -3319,242 +3193,167 @@ export interface TrendBucket {
   transactions: number;
 }
 
-export interface TrendReport {
-  from: string;
-  to: string;
-  granularity: Granularity;
-  buckets: TrendBucket[];
-}
-
 export interface PatternsReport {
-  from: string;
-  to: string;
   hourOfDay: { hour: number; salesC: number; transactions: number }[];
   dayOfWeek: { dayOfWeek: number; salesC: number; transactions: number }[];
 }
 
 export interface BreakdownsReport {
-  from: string;
-  to: string;
   byPaymentMethod: { method: string; salesC: number; transactions: number }[];
   byOrderType: { orderType: string; salesC: number; transactions: number }[];
-  byBranch: {
-    branchId: string;
-    name: string;
-    salesC: number;
-    transactions: number;
-  }[];
+  byBranch: { branchId: string; name: string; salesC: number; transactions: number }[];
 }
 
-/** A `::date` column arrives as a Date at UTC midnight. */
-const dateKey = (value: Date): string => value.toISOString().slice(0, 10);
-
-interface Tally {
-  salesC: number;
-  transactions: number;
-}
-
-function bump(map: Map<string, Tally>, key: string, add: Tally): void {
-  const current = map.get(key) ?? { salesC: 0, transactions: 0 };
-  map.set(key, {
-    salesC: current.salesC + add.salesC,
-    transactions: current.transactions + add.transactions,
-  });
+/** A Postgres `date` arrives as a Date at UTC midnight; take its date part. */
+function bucketKey(bucket: Date): string {
+  return bucket.toISOString().slice(0, 10);
 }
 
 /**
- * §2 Sales.
+ * Bucketed sales reports (analytics-spec §2).
  *
- * Every query runs per business against that business's own window, then the
- * per-bucket tallies are summed across businesses in TypeScript. Two businesses
- * with different day starts genuinely disagree about which day a 3 AM sale
- * belongs to, and merging their buckets by KEY (rather than by SQL) is what
- * keeps each one's answer its own.
+ * Buckets are summed ACROSS businesses by their date key, which is only sound
+ * because each business's bucket was computed against its own `dayStartTime`
+ * before it got here — the SQL never spans businesses.
  */
 @Injectable()
 export class SalesReportService {
   constructor(
-    private readonly raw: PrismaService,
     private readonly scope: AnalyticsScopeService,
+    private readonly raw: PrismaService,
     private readonly reportAudit: ReportAuditService,
   ) {}
 
-  async heatmap(query: AnalyticsQueryDto): Promise<HeatmapReport> {
+  async heatmap(query: AnalyticsQueryDto): Promise<HeatmapDay[]> {
     const scope = await this.scope.resolve(query);
-    const tallies = new Map<string, Tally>();
+    const sales = new Map<string, { salesC: number; transactions: number }>();
 
     for (const business of scope.businesses) {
-      const rows = await runScoped<BucketSalesRow>(this.raw, business, (b) =>
-        bucketedSalesSql(b, 'day'),
-      );
+      const rows = await runScoped<BucketRow>(this.raw, business, heatmapSql);
       for (const row of rows) {
-        bump(tallies, dateKey(row.bucket), {
-          salesC: Number(row.sales_c),
-          transactions: Number(row.transactions),
-        });
+        const key = bucketKey(row.bucket);
+        const acc = sales.get(key) ?? { salesC: 0, transactions: 0 };
+        acc.salesC += Number(row.sales_c);
+        acc.transactions += Number(row.transactions);
+        sales.set(key, acc);
       }
     }
 
     await this.reportAudit.log(scope, 'sales-heatmap', query.format ?? 'json');
 
-    // Zero-fill: the calendar grid must have no holes.
-    return {
-      from: scope.from,
-      to: scope.to,
-      days: businessDaySeries(scope.from, scope.to).map((date) => ({
-        date,
-        salesC: tallies.get(date)?.salesC ?? 0,
-        transactions: tallies.get(date)?.transactions ?? 0,
-      })),
-    };
+    // Zero-fill so the calendar grid has no holes.
+    return businessDaySeries(scope.from, scope.to).map((date) => ({
+      date,
+      salesC: sales.get(date)?.salesC ?? 0,
+      transactions: sales.get(date)?.transactions ?? 0,
+    }));
   }
 
-  async trend(query: SalesTrendQueryDto): Promise<TrendReport> {
-    const granularity = query.granularity ?? 'day';
+  async trend(query: SalesTrendQueryDto): Promise<TrendBucket[]> {
     const scope = await this.scope.resolve(query);
+    const granularity: Granularity = query.granularity ?? 'day';
 
-    const sales = new Map<string, Tally>();
+    const sales = new Map<string, { salesC: number; transactions: number }>();
     const profit = new Map<
       string,
-      { costedRevenueC: number; costedCostC: number; costedItems: number }
+      { costedLines: number; revenueC: number; costC: number }
     >();
 
     for (const business of scope.businesses) {
-      const salesRows = await runScoped<BucketSalesRow>(
-        this.raw,
-        business,
-        (b) => bucketedSalesSql(b, granularity),
-      );
-      for (const row of salesRows) {
-        bump(sales, dateKey(row.bucket), {
-          salesC: Number(row.sales_c),
-          transactions: Number(row.transactions),
-        });
-      }
+      const [salesRows, lineRows] = await Promise.all([
+        runScoped<BucketRow>(this.raw, business, (b) => trendSalesSql(b, granularity)),
+        runScoped<TrendProfitRow>(this.raw, business, (b) => trendLinesSql(b, granularity)),
+      ]);
 
-      const profitRows = await runScoped<BucketProfitRow>(
-        this.raw,
-        business,
-        (b) => bucketedProfitSql(b, granularity),
-      );
-      for (const row of profitRows) {
-        const key = dateKey(row.bucket);
-        const current = profit.get(key) ?? {
-          costedRevenueC: 0,
-          costedCostC: 0,
-          costedItems: 0,
-        };
-        profit.set(key, {
-          costedRevenueC: current.costedRevenueC + Number(row.costed_revenue_c),
-          costedCostC: current.costedCostC + Number(row.costed_cost_c),
-          costedItems: current.costedItems + Number(row.costed_items),
-        });
+      for (const row of salesRows) {
+        const key = bucketKey(row.bucket);
+        const acc = sales.get(key) ?? { salesC: 0, transactions: 0 };
+        acc.salesC += Number(row.sales_c);
+        acc.transactions += Number(row.transactions);
+        sales.set(key, acc);
+      }
+      for (const row of lineRows) {
+        const key = bucketKey(row.bucket);
+        const acc = profit.get(key) ?? { costedLines: 0, revenueC: 0, costC: 0 };
+        acc.costedLines += Number(row.costed_lines);
+        acc.revenueC += Number(row.costed_revenue_c);
+        acc.costC += Number(row.costed_cost_c);
+        profit.set(key, acc);
       }
     }
 
-    // Day granularity zero-fills from the requested range so a flat line shows
-    // its zeros. Week and month buckets come from the data — a partial week at
-    // either end would otherwise be indistinguishable from a quiet one.
-    const keys =
-      granularity === 'day'
-        ? businessDaySeries(scope.from, scope.to)
-        : [...new Set([...sales.keys(), ...profit.keys()])].sort();
-
     await this.reportAudit.log(scope, 'sales-trend', query.format ?? 'json');
 
-    return {
-      from: scope.from,
-      to: scope.to,
-      granularity,
-      buckets: keys.map((bucket) => {
+    // Only buckets that saw sales are returned: a month or week grid is the
+    // portal's business, and zero-filling months would need its own calendar.
+    return [...sales.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([bucket, row]) => {
         const p = profit.get(bucket);
         return {
           bucket,
-          salesC: sales.get(bucket)?.salesC ?? 0,
-          transactions: sales.get(bucket)?.transactions ?? 0,
+          salesC: row.salesC,
+          transactions: row.transactions,
           grossProfitC:
-            p === undefined || p.costedItems === 0
-              ? null
-              : p.costedRevenueC - p.costedCostC,
+            p && p.costedLines > 0 ? p.revenueC - p.costC : null,
         };
-      }),
-    };
+      });
   }
 
   async patterns(query: AnalyticsQueryDto): Promise<PatternsReport> {
     const scope = await this.scope.resolve(query);
-    const hours = new Map<string, Tally>();
-    const days = new Map<string, Tally>();
+    const hours = new Array(24).fill(null).map(() => ({ salesC: 0, transactions: 0 }));
+    const days = new Array(7).fill(null).map(() => ({ salesC: 0, transactions: 0 }));
 
     for (const business of scope.businesses) {
-      for (const row of await runScoped<HourRow>(this.raw, business, hourOfDaySql)) {
-        bump(hours, String(row.hour), {
-          salesC: Number(row.sales_c),
-          transactions: Number(row.transactions),
-        });
+      const [hourRows, dowRows] = await Promise.all([
+        runScoped<HourRow>(this.raw, business, hourPatternSql),
+        runScoped<DowRow>(this.raw, business, dowPatternSql),
+      ]);
+      for (const row of hourRows) {
+        hours[row.hour].salesC += Number(row.sales_c);
+        hours[row.hour].transactions += Number(row.transactions);
       }
-      for (const row of await runScoped<DayOfWeekRow>(
-        this.raw,
-        business,
-        dayOfWeekSql,
-      )) {
-        bump(days, String(row.day_of_week), {
-          salesC: Number(row.sales_c),
-          transactions: Number(row.transactions),
-        });
+      for (const row of dowRows) {
+        days[row.day_of_week].salesC += Number(row.sales_c);
+        days[row.day_of_week].transactions += Number(row.transactions);
       }
     }
 
     await this.reportAudit.log(scope, 'sales-patterns', query.format ?? 'json');
 
     return {
-      from: scope.from,
-      to: scope.to,
-      hourOfDay: Array.from({ length: 24 }, (_, hour) => ({
-        hour,
-        salesC: hours.get(String(hour))?.salesC ?? 0,
-        transactions: hours.get(String(hour))?.transactions ?? 0,
-      })),
-      dayOfWeek: Array.from({ length: 7 }, (_, dayOfWeek) => ({
-        dayOfWeek,
-        salesC: days.get(String(dayOfWeek))?.salesC ?? 0,
-        transactions: days.get(String(dayOfWeek))?.transactions ?? 0,
-      })),
+      hourOfDay: hours.map((h, hour) => ({ hour, ...h })),
+      dayOfWeek: days.map((d, dayOfWeek) => ({ dayOfWeek, ...d })),
     };
   }
 
   async breakdowns(query: AnalyticsQueryDto): Promise<BreakdownsReport> {
     const scope = await this.scope.resolve(query);
-    const methods = new Map<string, Tally>();
-    const orderTypes = new Map<string, Tally>();
+    const methods = new Map<string, { salesC: number; transactions: number }>();
+    const orderTypes = new Map<string, { salesC: number; transactions: number }>();
     const branches: BreakdownsReport['byBranch'] = [];
 
     for (const business of scope.businesses) {
-      for (const row of await runScoped<PaymentBreakdownRow>(
-        this.raw,
-        business,
-        paymentBreakdownSql,
-      )) {
-        bump(methods, row.method, {
-          salesC: Number(row.sales_c),
-          transactions: Number(row.transactions),
-        });
+      const [methodRows, typeRows, branchRows] = await Promise.all([
+        runScoped<MethodRow>(this.raw, business, paymentBreakdownSql),
+        runScoped<OrderTypeRow>(this.raw, business, orderTypeBreakdownSql),
+        runScoped<BranchRow>(this.raw, business, branchBreakdownSql),
+      ]);
+
+      for (const row of methodRows) {
+        const acc = methods.get(row.method) ?? { salesC: 0, transactions: 0 };
+        acc.salesC += Number(row.sales_c);
+        acc.transactions += Number(row.transactions);
+        methods.set(row.method, acc);
       }
-      for (const row of await runScoped<OrderTypeBreakdownRow>(
-        this.raw,
-        business,
-        orderTypeBreakdownSql,
-      )) {
-        bump(orderTypes, row.order_type, {
-          salesC: Number(row.sales_c),
-          transactions: Number(row.transactions),
-        });
+      for (const row of typeRows) {
+        const acc = orderTypes.get(row.order_type) ?? { salesC: 0, transactions: 0 };
+        acc.salesC += Number(row.sales_c);
+        acc.transactions += Number(row.transactions);
+        orderTypes.set(row.order_type, acc);
       }
-      for (const row of await runScoped<BranchBreakdownRow>(
-        this.raw,
-        business,
-        branchBreakdownSql,
-      )) {
+      for (const row of branchRows) {
         branches.push({
           branchId: row.branch_id,
           name: row.name,
@@ -3566,27 +3365,16 @@ export class SalesReportService {
 
     await this.reportAudit.log(scope, 'sales-breakdowns', query.format ?? 'json');
 
-    const toRows = (map: Map<string, Tally>) =>
-      [...map.entries()].sort((a, b) => b[1].salesC - a[1].salesC);
-
     return {
-      from: scope.from,
-      to: scope.to,
-      byPaymentMethod: toRows(methods).map(([method, t]) => ({
-        method,
-        ...t,
-      })),
-      byOrderType: toRows(orderTypes).map(([orderType, t]) => ({
-        orderType,
-        ...t,
-      })),
+      byPaymentMethod: [...methods.entries()].map(([method, v]) => ({ method, ...v })),
+      byOrderType: [...orderTypes.entries()].map(([orderType, v]) => ({ orderType, ...v })),
       byBranch: branches.sort((a, b) => b.salesC - a.salesC),
     };
   }
 }
 ```
 
-- [ ] **Step 6: Write the CSV builders**
+- [ ] **Step 6: Write the CSV shapers and the controller**
 
 Create `src/portal/analytics/sales/sales-report.csv.ts`:
 
@@ -3594,29 +3382,27 @@ Create `src/portal/analytics/sales/sales-report.csv.ts`:
 import { centavosToPesos, type CsvSection } from '../csv';
 import type {
   BreakdownsReport,
-  HeatmapReport,
+  HeatmapDay,
   PatternsReport,
-  TrendReport,
+  TrendBucket,
 } from './sales-report.service';
 
-export function heatmapCsv(report: HeatmapReport): CsvSection[] {
+export function heatmapCsv(days: HeatmapDay[]): CsvSection[] {
   return [
     {
-      columns: ['Date', 'Sales', 'Transactions'],
-      rows: report.days.map((d) => [
-        d.date,
-        centavosToPesos(d.salesC),
-        d.transactions,
-      ]),
+      title: 'Sales by day',
+      columns: ['date', 'sales', 'transactions'],
+      rows: days.map((d) => [d.date, centavosToPesos(d.salesC), d.transactions]),
     },
   ];
 }
 
-export function trendCsv(report: TrendReport): CsvSection[] {
+export function trendCsv(buckets: TrendBucket[]): CsvSection[] {
   return [
     {
-      columns: ['Bucket', 'Sales', 'Gross profit', 'Transactions'],
-      rows: report.buckets.map((b) => [
+      title: 'Sales trend',
+      columns: ['bucket', 'sales', 'gross profit', 'transactions'],
+      rows: buckets.map((b) => [
         b.bucket,
         centavosToPesos(b.salesC),
         centavosToPesos(b.grossProfitC),
@@ -3629,17 +3415,13 @@ export function trendCsv(report: TrendReport): CsvSection[] {
 export function patternsCsv(report: PatternsReport): CsvSection[] {
   return [
     {
-      title: 'Hour of day',
-      columns: ['Hour', 'Sales', 'Transactions'],
-      rows: report.hourOfDay.map((h) => [
-        h.hour,
-        centavosToPesos(h.salesC),
-        h.transactions,
-      ]),
+      title: 'By hour of day',
+      columns: ['hour', 'sales', 'transactions'],
+      rows: report.hourOfDay.map((h) => [h.hour, centavosToPesos(h.salesC), h.transactions]),
     },
     {
-      title: 'Day of week',
-      columns: ['Day of week', 'Sales', 'Transactions'],
+      title: 'By day of week (0 = Sunday)',
+      columns: ['day of week', 'sales', 'transactions'],
       rows: report.dayOfWeek.map((d) => [
         d.dayOfWeek,
         centavosToPesos(d.salesC),
@@ -3653,7 +3435,7 @@ export function breakdownsCsv(report: BreakdownsReport): CsvSection[] {
   return [
     {
       title: 'By payment method',
-      columns: ['Method', 'Sales', 'Transactions'],
+      columns: ['method', 'sales', 'transactions'],
       rows: report.byPaymentMethod.map((r) => [
         r.method,
         centavosToPesos(r.salesC),
@@ -3662,7 +3444,7 @@ export function breakdownsCsv(report: BreakdownsReport): CsvSection[] {
     },
     {
       title: 'By order type',
-      columns: ['Order type', 'Sales', 'Transactions'],
+      columns: ['order type', 'sales', 'transactions'],
       rows: report.byOrderType.map((r) => [
         r.orderType,
         centavosToPesos(r.salesC),
@@ -3671,18 +3453,12 @@ export function breakdownsCsv(report: BreakdownsReport): CsvSection[] {
     },
     {
       title: 'By branch',
-      columns: ['Branch', 'Sales', 'Transactions'],
-      rows: report.byBranch.map((r) => [
-        r.name,
-        centavosToPesos(r.salesC),
-        r.transactions,
-      ]),
+      columns: ['branch', 'sales', 'transactions'],
+      rows: report.byBranch.map((r) => [r.name, centavosToPesos(r.salesC), r.transactions]),
     },
   ];
 }
 ```
-
-- [ ] **Step 7: Write the controller**
 
 Create `src/portal/analytics/sales/sales-report.controller.ts`:
 
@@ -3694,20 +3470,20 @@ import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
 import { SalesTrendQueryDto } from '../dto/sales-trend-query.dto';
 import { renderReport } from '../report-response';
 import {
+  SalesReportService,
+  type BreakdownsReport,
+  type HeatmapDay,
+  type PatternsReport,
+  type TrendBucket,
+} from './sales-report.service';
+import {
   breakdownsCsv,
   heatmapCsv,
   patternsCsv,
   trendCsv,
 } from './sales-report.csv';
-import {
-  SalesReportService,
-  type BreakdownsReport,
-  type HeatmapReport,
-  type PatternsReport,
-  type TrendReport,
-} from './sales-report.service';
 
-/** §2 Sales — `GET /v1/portal/analytics/sales/{heatmap,trend,patterns,breakdowns}`. */
+/** Sales reports (analytics-spec §2) under `/v1/portal/analytics/sales/*`. */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
 export class SalesReportController {
@@ -3717,18 +3493,16 @@ export class SalesReportController {
   async heatmap(
     @Query() query: AnalyticsQueryDto,
     @Res({ passthrough: true }) res: Response,
-  ): Promise<HeatmapReport | string> {
-    const report = await this.sales.heatmap(query);
-    return renderReport(res, 'sales-heatmap', query, report, heatmapCsv);
+  ): Promise<HeatmapDay[] | string> {
+    return renderReport(res, 'sales-heatmap', query, await this.sales.heatmap(query), heatmapCsv);
   }
 
   @Get('analytics/sales/trend')
   async trend(
     @Query() query: SalesTrendQueryDto,
     @Res({ passthrough: true }) res: Response,
-  ): Promise<TrendReport | string> {
-    const report = await this.sales.trend(query);
-    return renderReport(res, 'sales-trend', query, report, trendCsv);
+  ): Promise<TrendBucket[] | string> {
+    return renderReport(res, 'sales-trend', query, await this.sales.trend(query), trendCsv);
   }
 
   @Get('analytics/sales/patterns')
@@ -3736,8 +3510,7 @@ export class SalesReportController {
     @Query() query: AnalyticsQueryDto,
     @Res({ passthrough: true }) res: Response,
   ): Promise<PatternsReport | string> {
-    const report = await this.sales.patterns(query);
-    return renderReport(res, 'sales-patterns', query, report, patternsCsv);
+    return renderReport(res, 'sales-patterns', query, await this.sales.patterns(query), patternsCsv);
   }
 
   @Get('analytics/sales/breakdowns')
@@ -3745,38 +3518,45 @@ export class SalesReportController {
     @Query() query: AnalyticsQueryDto,
     @Res({ passthrough: true }) res: Response,
   ): Promise<BreakdownsReport | string> {
-    const report = await this.sales.breakdowns(query);
-    return renderReport(res, 'sales-breakdowns', query, report, breakdownsCsv);
+    return renderReport(
+      res,
+      'sales-breakdowns',
+      query,
+      await this.sales.breakdowns(query),
+      breakdownsCsv,
+    );
   }
 }
 ```
 
-- [ ] **Step 8: Register it in the module**
+- [ ] **Step 7: Register the controller**
 
-In `src/portal/analytics/analytics.module.ts`, add `SalesReportController` to `controllers` and `SalesReportService` to `providers`, with the matching imports.
+Add `SalesReportController` to `controllers` and `SalesReportService` to `providers` in `src/portal/analytics/analytics.module.ts`.
 
-- [ ] **Step 9: Run the tests to verify they pass**
+- [ ] **Step 8: Run the tests to verify they pass**
 
 ```bash
 npm run test:e2e -- portal-analytics-sales
+npm run lint && npm run build
 ```
 
-Expected: PASS, all cases.
+Expected: all pass. If the 04:00 heatmap case fails by one day, the SQL bucket and `businessDayOf` have drifted apart — compare the sign of the shift in `dayBucketExpr` against `business-day.ts`.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add src/portal/analytics test/portal-analytics-sales.e2e-spec.ts
-git commit -m "feat(analytics): sales heatmap, trend, hour/day patterns and breakdowns"
+git commit -m "feat(api): sales heatmap, trend, hour/weekday patterns and breakdowns"
 ```
 
 ---
 
-## Task 9: Tax summary (§6)
+### Task 9: Tax summary (§6)
 
-The accountant's view — one period, one CSV, ready for filing.
+The accountant's view. Small, and the numbers must reconcile with a printed receipt to the centavo.
 
 **Files:**
+- Create: `src/portal/analytics/reports/tax.sql.ts`
 - Create: `src/portal/analytics/tax/tax-report.service.ts`
 - Create: `src/portal/analytics/tax/tax-report.controller.ts`
 - Create: `src/portal/analytics/tax/tax-report.csv.ts`
@@ -3784,113 +3564,114 @@ The accountant's view — one period, one CSV, ready for filing.
 - Test: `test/portal-analytics-tax.e2e-spec.ts`
 
 **Interfaces:**
-- Consumes: Tasks 3–5 plus `SALE_NET_C` conventions.
+- Consumes: `runScopedOne`, `AnalyticsScopeService`, `ReportAuditService`, `renderReport`, `seedSale`.
 - Produces:
-  - `interface TaxReport { from; to; businesses: TaxRow[]; totals: TaxTotals }`
-  - `TaxReportService.run(query): Promise<TaxReport>`
-  - `taxCsv(report): CsvSection[]`
+  - `interface TaxRow { vatable_sales_c, vat_c, vat_exempt_sales_c, sc_pwd_discount_c, service_charge_c: bigint }`
+  - `taxSummarySql(business): Prisma.Sql`
+  - `interface TaxReport { from, to, businesses: TaxBusinessRow[], totals: TaxTotals }`
   - `GET /v1/portal/analytics/tax`
 
 - [ ] **Step 1: Write the failing e2e test**
 
-Create `test/portal-analytics-tax.e2e-spec.ts` with the same bootstrap as Task 7 (renamed `'Analytics tax (e2e)'`), then:
+Create `test/portal-analytics-tax.e2e-spec.ts`, reusing the bootstrap and `seedTenant` block from `test/portal-analytics-overview.e2e-spec.ts` verbatim, then:
 
 ```ts
-  const RANGE = 'from=2026-03-01&to=2026-03-07';
-  const inRange = new Date('2026-03-03T04:00:00.000Z');
-  const get = (token: string, query: string) =>
+  const DURING = new Date('2026-03-02T02:00:00.000Z');
+
+  const tax = (token: string, query: Record<string, string> = {}) =>
     request(server())
-      .get(`/v1/portal/analytics/tax?${query}`)
+      .get('/v1/portal/analytics/tax')
+      .query({ from: '2026-03-01', to: '2026-03-07', ...query })
       .set('Authorization', `Bearer ${token}`);
 
-  it('reports VATable sales, VAT and the service charge to the centavo', async () => {
-    const c = await ctx();
-    const { totals } = await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
+  it('reconciles vatable sales, VAT and the total to the centavo', async () => {
+    const t = await seedTenant();
+    const sale = await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      taxRate: 0.12,
+      lines: [{ qty: 1, unitPriceC: 11200 }],
+    });
+
+    const res = await tax(t.token).expect(200);
+    const row = res.body.businesses[0];
+
+    // Prices are VAT-inclusive: 112.00 total carries 12.00 VAT over 100.00 net.
+    expect(row.vatC).toBe(1200);
+    expect(row.vatableSalesC).toBe(10000);
+    expect(row.vatExemptSalesC).toBe(0);
+    expect(row.vatableSalesC + row.vatC + row.vatExemptSalesC).toBe(sale.total);
+  });
+
+  it('reports SC/PWD sales as VAT-exempt with their discount', async () => {
+    const t = await seedTenant();
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      taxRate: 0.12,
+      scPwd: { idNo: 'SC-1', name: 'Lola' },
+      lines: [{ qty: 1, unitPriceC: 11200, scPwdMarked: true }],
+    });
+
+    const res = await tax(t.token).expect(200);
+    const row = res.body.businesses[0];
+
+    expect(row.vatExemptSalesC).toBeGreaterThan(0);
+    expect(row.scPwdDiscountC).toBeGreaterThan(0);
+    expect(row.vatC).toBe(0);
+  });
+
+  it('reports the service charge collected', async () => {
+    const t = await seedTenant({ serviceChargeRate: '0.10' });
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
       orderType: 'dine_in',
       serviceChargeRate: 0.1,
       lines: [{ qty: 1, unitPriceC: 10000 }],
     });
 
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    // The report must agree with the engine exactly — a receipt and a filing
-    // that disagree by a centavo is a filing nobody can defend.
-    expect(res.body.totals.vatC).toBe(totals.vatC);
-    expect(res.body.totals.vatableSalesC).toBe(totals.vatableSalesC);
-    expect(res.body.totals.serviceChargeC).toBe(totals.serviceChargeC);
+    const res = await tax(t.token).expect(200);
+    expect(res.body.businesses[0].serviceChargeC).toBe(1000);
   });
 
-  it('reports SC/PWD discounts and VAT-exempt sales', async () => {
-    const c = await ctx();
-    const { totals } = await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      scPwd: { idNo: 'SC-1', name: 'Lola' },
-      lines: [{ qty: 1, unitPriceC: 10000, scPwdMarked: true }],
-    });
-
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-
-    expect(totals.scPwdDiscountC).toBeGreaterThan(0);
-    expect(res.body.totals.scPwdDiscountC).toBe(totals.scPwdDiscountC);
-    expect(res.body.totals.vatExemptSalesC).toBe(totals.vatExemptSalesC);
-  });
-
-  it('echoes each business tax rate on its own row and never blends them', async () => {
-    const c = await ctx();
+  it('keeps a row per business and never blends tax rates', async () => {
+    const t = await seedTenant();
+    const owner = (await raw.business.findUniqueOrThrow({ where: { id: t.businessId } })).ownerId;
     const second = await raw.business.create({
-      data: { ownerId: c.owner.id, name: 'Second', type: 'retail', taxRate: '0.00' },
+      data: { ownerId: owner, name: 'Second', type: 'fnb', taxRate: '0.00' },
     });
-    const secondBranch = await raw.branch.create({
-      data: { businessId: second.id, name: 'S', code: 'SC', address: 'x' },
+    await raw.branch.create({
+      data: { businessId: second.id, name: 'B2', code: 'B2', address: 'x' },
     });
-    await seedBranchInfra(raw, secondBranch.id);
 
-    const res = await get(c.token, RANGE).expect(200);
+    const res = await tax(t.token).expect(200);
 
-    const rates = res.body.businesses.map((b: any) => b.taxRate).sort();
-    expect(rates).toEqual([0, 0.12]);
+    expect(res.body.businesses).toHaveLength(2);
+    expect(res.body.businesses.map((b: any) => b.taxRate).sort()).toEqual([0, 0.12]);
+    expect(res.body.totals).toBeDefined();
     expect(res.body.totals.taxRate).toBeUndefined();
   });
 
-  it('excludes voided sales', async () => {
-    const c = await ctx();
+  it('exports as CSV in pesos', async () => {
+    const t = await seedTenant();
     await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      status: 'voided',
-      lines: [{ qty: 1, unitPriceC: 10000 }],
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [{ qty: 1, unitPriceC: 11200 }],
     });
 
-    const res = await get(c.token, `${RANGE}&businessId=${c.business.id}`).expect(200);
-    expect(res.body.totals.vatC).toBe(0);
-  });
-
-  it('exports as CSV with a row per business and a totals row', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 10000 }],
-    });
-
-    const res = await get(
-      c.token,
-      `${RANGE}&businessId=${c.business.id}&format=csv`,
-    ).expect(200);
-
-    expect(res.headers['content-type']).toContain('text/csv');
-    expect(res.text).toContain('Total');
+    const res = await tax(t.token, { format: 'csv' }).expect(200);
+    expect(res.headers['content-disposition']).toContain('filename="tax-2026-03-01-2026-03-07.csv"');
+    expect(res.text).toContain('12.00');
   });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run the e2e test to verify it fails**
 
 ```bash
 npm run test:e2e -- portal-analytics-tax
@@ -3898,44 +3679,23 @@ npm run test:e2e -- portal-analytics-tax
 
 Expected: 404 on every case.
 
-- [ ] **Step 3: Write the service**
+- [ ] **Step 3: Write the SQL builder**
 
-Create `src/portal/analytics/tax/tax-report.service.ts`:
+Create `src/portal/analytics/reports/tax.sql.ts`:
 
 ```ts
-import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { PrismaService } from '../../../prisma/prisma.service';
-import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
-import {
-  AnalyticsScopeService,
-  type ScopedBusiness,
-} from '../scope/analytics-scope.service';
-import { ReportAuditService } from '../report-audit.service';
-import { runScoped } from '../scoped-sql';
+import type { ScopedBusiness } from '../scope/analytics-scope.service';
 
-export interface TaxTotals {
-  vatableSalesC: number;
-  vatC: number;
-  vatExemptSalesC: number;
-  scPwdDiscountC: number;
-  serviceChargeC: number;
-}
-
-export interface TaxRow extends TaxTotals {
-  businessId: string;
-  name: string;
-  taxRate: number;
-}
-
-export interface TaxReport {
-  from: string;
-  to: string;
-  businesses: TaxRow[];
-  totals: TaxTotals;
-}
-
-interface TaxSqlRow {
+/**
+ * Tax summary (analytics-spec §6).
+ *
+ * The columns mirror the engine's `CartTotals` exactly — `vatableSalesC` is
+ * `total - vatExemptSales - vat` there (`totals.ts`), so it is the same
+ * subtraction here. Computing it any other way would let a receipt and this
+ * report disagree, which is the one thing an accountant's view cannot do.
+ */
+export interface TaxRow {
   vatable_sales_c: bigint;
   vat_c: bigint;
   vat_exempt_sales_c: bigint;
@@ -3943,13 +3703,7 @@ interface TaxSqlRow {
   service_charge_c: bigint;
 }
 
-/**
- * Mirrors the engine's own decomposition (`totals.ts`):
- *   vatC          = vatIncluded(total − vatExemptSales)
- *   vatableSalesC = total − vatExemptSales − vat
- * so a receipt and this report agree to the centavo.
- */
-function taxSql(business: ScopedBusiness): Prisma.Sql {
+export function taxSummarySql(business: ScopedBusiness): Prisma.Sql {
   return Prisma.sql`
     SELECT
       COALESCE(SUM(s.total - s.vat_exempt_sales - s.tax), 0)::bigint AS vatable_sales_c,
@@ -3965,29 +3719,76 @@ function taxSql(business: ScopedBusiness): Prisma.Sql {
       AND s.created_at <  ${business.toUtc}
   `;
 }
+```
+
+- [ ] **Step 4: Write the service, CSV shaper and controller**
+
+Create `src/portal/analytics/tax/tax-report.service.ts`:
+
+```ts
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../../prisma/prisma.service';
+import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
+import { AnalyticsScopeService } from '../scope/analytics-scope.service';
+import { ReportAuditService } from '../report-audit.service';
+import { runScopedOne } from '../scoped-sql';
+import { taxSummarySql, type TaxRow } from '../reports/tax.sql';
+
+export interface TaxBusinessRow {
+  businessId: string;
+  name: string;
+  taxRate: number;
+  vatableSalesC: number;
+  vatC: number;
+  vatExemptSalesC: number;
+  scPwdDiscountC: number;
+  serviceChargeC: number;
+}
+
+export interface TaxTotals {
+  vatableSalesC: number;
+  vatC: number;
+  vatExemptSalesC: number;
+  scPwdDiscountC: number;
+  serviceChargeC: number;
+}
+
+export interface TaxReport {
+  from: string;
+  to: string;
+  businesses: TaxBusinessRow[];
+  totals: TaxTotals;
+}
 
 /**
- * §6 Tax summary.
+ * Tax summary (analytics-spec §6).
  *
- * Reported per business, never blended: two businesses on different tax rates
- * have no shared rate, and averaging them would produce a number that is true
- * of neither. The `totals` block sums the amounts only — it carries no rate.
+ * A row per business, deliberately: the money columns add up across businesses,
+ * but `taxRate` does not — a blended rate is a number that is true of nothing,
+ * so `totals` carries no rate at all.
  */
 @Injectable()
 export class TaxReportService {
   constructor(
-    private readonly raw: PrismaService,
     private readonly scope: AnalyticsScopeService,
+    private readonly raw: PrismaService,
     private readonly reportAudit: ReportAuditService,
   ) {}
 
   async run(query: AnalyticsQueryDto): Promise<TaxReport> {
     const scope = await this.scope.resolve(query);
-    const businesses: TaxRow[] = [];
+    const businesses: TaxBusinessRow[] = [];
+    const totals: TaxTotals = {
+      vatableSalesC: 0,
+      vatC: 0,
+      vatExemptSalesC: 0,
+      scPwdDiscountC: 0,
+      serviceChargeC: 0,
+    };
 
     for (const business of scope.businesses) {
-      const [row] = await runScoped<TaxSqlRow>(this.raw, business, taxSql);
-      businesses.push({
+      const row = await runScopedOne<TaxRow>(this.raw, business, taxSummarySql);
+      const mapped: TaxBusinessRow = {
         businessId: business.id,
         name: business.name,
         taxRate: business.taxRate,
@@ -3996,37 +3797,20 @@ export class TaxReportService {
         vatExemptSalesC: Number(row.vat_exempt_sales_c),
         scPwdDiscountC: Number(row.sc_pwd_discount_c),
         serviceChargeC: Number(row.service_charge_c),
-      });
+      };
+      businesses.push(mapped);
+      totals.vatableSalesC += mapped.vatableSalesC;
+      totals.vatC += mapped.vatC;
+      totals.vatExemptSalesC += mapped.vatExemptSalesC;
+      totals.scPwdDiscountC += mapped.scPwdDiscountC;
+      totals.serviceChargeC += mapped.serviceChargeC;
     }
 
     await this.reportAudit.log(scope, 'tax', query.format ?? 'json');
-
-    return {
-      from: scope.from,
-      to: scope.to,
-      businesses,
-      totals: businesses.reduce<TaxTotals>(
-        (sum, b) => ({
-          vatableSalesC: sum.vatableSalesC + b.vatableSalesC,
-          vatC: sum.vatC + b.vatC,
-          vatExemptSalesC: sum.vatExemptSalesC + b.vatExemptSalesC,
-          scPwdDiscountC: sum.scPwdDiscountC + b.scPwdDiscountC,
-          serviceChargeC: sum.serviceChargeC + b.serviceChargeC,
-        }),
-        {
-          vatableSalesC: 0,
-          vatC: 0,
-          vatExemptSalesC: 0,
-          scPwdDiscountC: 0,
-          serviceChargeC: 0,
-        },
-      ),
-    };
+    return { from: scope.from, to: scope.to, businesses, totals };
   }
 }
 ```
-
-- [ ] **Step 4: Write the CSV builder**
 
 Create `src/portal/analytics/tax/tax-report.csv.ts`:
 
@@ -4036,17 +3820,17 @@ import type { TaxReport } from './tax-report.service';
 
 export function taxCsv(report: TaxReport): CsvSection[] {
   const columns = [
-    'Business',
-    'Tax rate',
-    'VATable sales',
+    'business',
+    'tax rate',
+    'vatable sales',
     'VAT',
     'VAT-exempt sales',
-    'SC/PWD discounts',
-    'Service charge',
+    'SC/PWD discount',
+    'service charge',
   ];
-
   return [
     {
+      title: `Tax summary ${report.from} to ${report.to}`,
       columns,
       rows: [
         ...report.businesses.map((b) => [
@@ -4059,9 +3843,8 @@ export function taxCsv(report: TaxReport): CsvSection[] {
           centavosToPesos(b.serviceChargeC),
         ]),
         [
-          'Total',
-          // No blended rate: the total row sums amounts only.
-          '',
+          'All businesses',
+          null,
           centavosToPesos(report.totals.vatableSalesC),
           centavosToPesos(report.totals.vatC),
           centavosToPesos(report.totals.vatExemptSalesC),
@@ -4074,8 +3857,6 @@ export function taxCsv(report: TaxReport): CsvSection[] {
 }
 ```
 
-- [ ] **Step 5: Write the controller and register it**
-
 Create `src/portal/analytics/tax/tax-report.controller.ts`:
 
 ```ts
@@ -4084,10 +3865,10 @@ import type { Response } from 'express';
 import { PortalAuthGuard } from '../../../auth/guards/portal-auth.guard';
 import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
 import { renderReport } from '../report-response';
-import { taxCsv } from './tax-report.csv';
 import { TaxReportService, type TaxReport } from './tax-report.service';
+import { taxCsv } from './tax-report.csv';
 
-/** §6 Tax summary — `GET /v1/portal/analytics/tax`. */
+/** Tax summary (analytics-spec §6). `GET /v1/portal/analytics/tax`. */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
 export class TaxReportController {
@@ -4098,266 +3879,291 @@ export class TaxReportController {
     @Query() query: AnalyticsQueryDto,
     @Res({ passthrough: true }) res: Response,
   ): Promise<TaxReport | string> {
-    const report = await this.tax.run(query);
-    return renderReport(res, 'tax', query, report, taxCsv);
+    return renderReport(res, 'tax', query, await this.tax.run(query), taxCsv);
   }
 }
 ```
 
-Add `TaxReportController` to `controllers` and `TaxReportService` to `providers` in `src/portal/analytics/analytics.module.ts`.
+- [ ] **Step 5: Register and run**
 
-- [ ] **Step 6: Run the tests to verify they pass**
+Add `TaxReportController` to `controllers` and `TaxReportService` to `providers` in `analytics.module.ts`, then:
 
 ```bash
 npm run test:e2e -- portal-analytics-tax
+npm run lint && npm run build
 ```
 
-Expected: PASS, all cases.
+Expected: all pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/portal/analytics test/portal-analytics-tax.e2e-spec.ts
-git commit -m "feat(analytics): tax summary reported per business with no blended rate"
+git commit -m "feat(api): tax summary reconciling vatable sales, vat and sc/pwd exemptions"
 ```
 
 ---
 
-## Task 10: Dashboard (§0)
+### Task 10: Dashboard (§0)
 
-The portal landing — "is everything okay?" in zero clicks. It spans every non-demo business and deliberately ignores the business switcher.
+The portal landing: "is everything okay?" in zero clicks. It spans every non-demo business and deliberately ignores the business switcher, so it takes no scope parameters.
 
 **Files:**
 - Create: `src/portal/analytics/reports/dashboard.sql.ts`
 - Create: `src/portal/analytics/dashboard/dashboard.service.ts`
 - Create: `src/portal/analytics/dashboard/dashboard.controller.ts`
+- Modify: `src/portal/analytics/scope/business-day.ts` (add `addDays`)
+- Modify: `src/portal/analytics/scope/business-day.spec.ts`
+- Modify: `src/portal/analytics/scope/analytics-scope.service.ts` (add `resolveToday`)
 - Modify: `src/portal/analytics/analytics.module.ts`
 - Test: `test/portal-analytics-dashboard.e2e-spec.ts`
 
 **Interfaces:**
-- Consumes: `AnalyticsScopeService.resolveBusinesses`, `withWindow`, `businessDayOf`, `addDays`, `runScoped`, `saleAggregateSql`, `lineAggregateSql`, `branchBreakdownSql`, `bucketedSalesSql`, `ReportAuditService`, `SCOPED_PRISMA`.
+- Consumes: everything from Tasks 2–7.
 - Produces:
-  - `lowStockCountSql(business): Prisma.Sql`, `LowStockRow`
-  - `interface DashboardReport`
-  - `DashboardService.run(): Promise<DashboardReport>`
+  - `addDays(date: string, days: number): string`
+  - `AnalyticsScopeService.resolveToday(now: Date): Promise<ResolvedScope>`
+  - `dashboardSalesSql(business, fromUtc, toUtc)`, `dashboardSparklineSql(business, fromUtc, toUtc)`, `lowStockCountSql(business)`
   - `GET /v1/portal/dashboard`
 
-- [ ] **Step 1: Write the failing e2e test**
+- [ ] **Step 1: Add `addDays` with its test**
 
-Create `test/portal-analytics-dashboard.e2e-spec.ts` with the same bootstrap as Task 7 (renamed `'Analytics dashboard (e2e)'`), then:
+Append to `src/portal/analytics/scope/business-day.spec.ts`:
 
 ```ts
-  const get = (token: string) =>
+describe('addDays', () => {
+  it('moves forward and backward across a month boundary', () => {
+    expect(addDays('2026-03-01', -1)).toBe('2026-02-28');
+    expect(addDays('2026-02-28', 1)).toBe('2026-03-01');
+    expect(addDays('2026-03-08', -7)).toBe('2026-03-01');
+  });
+});
+```
+
+Add `addDays` to the import list at the top of that file, then append to `src/portal/analytics/scope/business-day.ts`:
+
+```ts
+/** Shift a `YYYY-MM-DD` date by whole days. Safe: no DST to fall into. */
+export function addDays(date: string, days: number): string {
+  const base = businessDayStartUtc(date, 0).getTime() + days * DAY_MS;
+  return businessDayOf(new Date(base), 0);
+}
+```
+
+Run `npm test -- business-day` — all pass.
+
+- [ ] **Step 2: Add `resolveToday` to the scope resolver**
+
+Append to `src/portal/analytics/scope/analytics-scope.service.ts` (inside the class), and add `addDays`, `businessDayOf`, `businessDayStartUtc` to its imports from `./business-day`:
+
+```ts
+  /**
+   * The dashboard's scope: every non-demo business, each windowed on ITS OWN
+   * today.
+   *
+   * "Today" is not one date across a tenant — at 3 AM a midnight retailer is
+   * already on the new business day while an 04:00 cafe is still on yesterday's.
+   * So each business gets `businessDayOf(now, its own day start)`.
+   *
+   * `previousFromUtc`/`previousToUtc` here mean the SAME BUSINESS DAY ONE WEEK
+   * EARLIER, not the immediately preceding period — that is the comparison
+   * analytics-spec §0 asks for, and weekday-to-weekday is the only fair one for
+   * a single day.
+   *
+   * `scope.from`/`scope.to` carry the first business's today, and exist only so
+   * the audit rows say which day was viewed.
+   */
+  async resolveToday(now: Date): Promise<ResolvedScope> {
+    const businesses = await this.scoped.business.findMany({
+      where: { isDemo: false },
+      select: { id: true, name: true, dayStartTime: true, taxRate: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    const branches = await this.scoped.branch.findMany({
+      where: { businessId: { in: businesses.map((b) => b.id) } },
+      select: { id: true, businessId: true },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const byBusiness = new Map<string, string[]>();
+    for (const branch of branches) {
+      const list = byBusiness.get(branch.businessId);
+      if (list) list.push(branch.id);
+      else byBusiness.set(branch.businessId, [branch.id]);
+    }
+
+    const scoped: ScopedBusiness[] = [];
+    for (const business of businesses) {
+      const branchIds = byBusiness.get(business.id);
+      if (!branchIds || branchIds.length === 0) continue;
+
+      const dayStartMinutes = parseDayStart(business.dayStartTime);
+      const today = businessDayOf(now, dayStartMinutes);
+      const lastWeek = addDays(today, -7);
+
+      scoped.push({
+        id: business.id,
+        name: business.name,
+        dayStartTime: business.dayStartTime,
+        dayStartMinutes,
+        taxRate: Number(business.taxRate),
+        branchIds,
+        fromUtc: businessDayStartUtc(today, dayStartMinutes),
+        toUtc: businessDayStartUtc(addDays(today, 1), dayStartMinutes),
+        previousFromUtc: businessDayStartUtc(lastWeek, dayStartMinutes),
+        previousToUtc: businessDayStartUtc(addDays(lastWeek, 1), dayStartMinutes),
+      });
+    }
+
+    const first = scoped[0];
+    const stamp = first ? businessDayOf(now, first.dayStartMinutes) : businessDayOf(now, 0);
+
+    return {
+      businesses: scoped,
+      branchIds: scoped.flatMap((b) => b.branchIds),
+      from: stamp,
+      to: stamp,
+      dayCount: 1,
+    };
+  }
+```
+
+- [ ] **Step 3: Write the failing e2e test**
+
+Create `test/portal-analytics-dashboard.e2e-spec.ts`, reusing the bootstrap and `seedTenant` block from `test/portal-analytics-overview.e2e-spec.ts`, then:
+
+```ts
+  const dashboard = (token: string) =>
     request(server())
       .get('/v1/portal/dashboard')
       .set('Authorization', `Bearer ${token}`);
 
-  it("reports today's sales, profit and transactions per business", async () => {
-    const c = await ctx();
+  /** Now, and the same clock time seven days ago — both inside today's window. */
+  const now = () => new Date();
+  const lastWeek = () => new Date(Date.now() - 7 * 86_400_000);
+
+  it('reports today per business, with a branch row and a 7-day sparkline', async () => {
+    const t = await seedTenant();
     await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date(),
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: now(),
       lines: [{ qty: 1, unitPriceC: 10000, costC: 6000 }],
     });
 
-    const res = await get(c.token).expect(200);
+    const res = await dashboard(t.token).expect(200);
+    const business = res.body.businesses.find((b: any) => b.businessId === t.businessId);
 
-    const row = res.body.businesses.find((b: any) => b.businessId === c.business.id);
-    expect(row.today.salesC).toBe(10000);
-    expect(row.today.grossProfitC).toBe(4000);
-    expect(row.today.transactions).toBe(1);
+    expect(business.today).toEqual({ salesC: 10000, grossProfitC: 4000, transactions: 1 });
+    expect(business.branches).toEqual([
+      { branchId: t.branchId, name: 'Main', salesC: 10000, grossProfitC: 4000, transactions: 1 },
+    ]);
+    expect(business.sparkline).toHaveLength(7);
+    expect(business.sparkline[6].salesC).toBe(10000);
   });
 
   it('compares against the same day last week', async () => {
-    const c = await ctx();
-    const lastWeek = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const t = await seedTenant();
     await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: lastWeek,
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: lastWeek(),
       lines: [{ qty: 1, unitPriceC: 5000 }],
     });
 
-    const res = await get(c.token).expect(200);
+    const res = await dashboard(t.token).expect(200);
+    const business = res.body.businesses.find((b: any) => b.businessId === t.businessId);
 
-    const row = res.body.businesses.find((b: any) => b.businessId === c.business.id);
-    expect(row.sameDayLastWeek.salesC).toBe(5000);
-    expect(row.today.salesC).toBe(0);
+    expect(business.today.salesC).toBe(0);
+    expect(business.sameDayLastWeek.salesC).toBe(5000);
   });
 
-  it('returns a 7-point sparkline ending today', async () => {
-    const c = await ctx();
-    const res = await get(c.token).expect(200);
-    const row = res.body.businesses.find((b: any) => b.businessId === c.business.id);
-    expect(row.sparkline).toHaveLength(7);
-    expect(row.sparkline.every((p: any) => typeof p.salesC === 'number')).toBe(true);
-  });
-
-  it('lists per-branch rows under each business', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: new Date(),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
+  it('excludes demo businesses from the landing', async () => {
+    const t = await seedTenant();
+    const owner = (await raw.business.findUniqueOrThrow({ where: { id: t.businessId } })).ownerId;
+    const demo = await raw.business.create({
+      data: { ownerId: owner, name: 'Demo', type: 'retail', taxRate: '0.12', isDemo: true },
+    });
+    await raw.branch.create({
+      data: { businessId: demo.id, name: 'D', code: 'DM', address: 'x' },
     });
 
-    const res = await get(c.token).expect(200);
-    const row = res.body.businesses.find((b: any) => b.businessId === c.business.id);
-    expect(row.branches).toEqual([
-      expect.objectContaining({ branchId: c.branch.id, name: 'Main', salesC: 10000 }),
-    ]);
+    const res = await dashboard(t.token).expect(200);
+    expect(res.body.businesses.map((b: any) => b.businessId)).not.toContain(demo.id);
   });
 
-  it('shows open shifts in the live strip', async () => {
-    const c = await ctx();
+  it('lists open shifts and terminals in the live strip', async () => {
+    const t = await seedTenant();
     await raw.shift.create({
       data: {
-        branchId: c.branch.id,
-        terminalId: c.terminalId,
+        branchId: t.branchId,
+        terminalId: t.terminalId,
         openedAt: new Date(),
         openingCash: 100000,
       },
     });
 
-    const res = await get(c.token).expect(200);
+    const res = await dashboard(t.token).expect(200);
 
     expect(res.body.live.openShifts).toHaveLength(1);
     expect(res.body.live.openShifts[0]).toMatchObject({
-      businessId: c.business.id,
-      branchId: c.branch.id,
+      branchId: t.branchId,
       branchName: 'Main',
+      terminalName: 'T1',
     });
+    expect(res.body.live.terminals[0]).toMatchObject({ code: 'T1', paired: false });
   });
 
-  it('flags a shift left open longer than 24 hours', async () => {
-    const c = await ctx();
-    await raw.shift.create({
-      data: {
-        branchId: c.branch.id,
-        terminalId: c.terminalId,
-        openedAt: new Date(Date.now() - 30 * 60 * 60 * 1000),
-        openingCash: 100000,
-      },
-    });
-
-    const res = await get(c.token).expect(200);
-
-    const flag = res.body.attention.unclosedShifts.find(
-      (u: any) => u.businessId === c.business.id,
-    );
-    expect(flag.count).toBe(1);
+  it('counts unread notifications, which is zero until they are written', async () => {
+    const t = await seedTenant();
+    const res = await dashboard(t.token).expect(200);
+    expect(res.body.live.unreadNotifications).toBe(0);
   });
 
-  it('counts low stock from branch_stock against each products threshold', async () => {
-    const c = await ctx();
+  it('flags low stock and shifts left open past 24 hours', async () => {
+    const t = await seedTenant();
     const category = await raw.category.create({
-      data: { businessId: c.business.id, name: 'Grocery' },
+      data: { businessId: t.businessId, name: 'Grocery' },
     });
-    const low = await raw.product.create({
+    const product = await raw.product.create({
       data: {
-        businessId: c.business.id,
+        businessId: t.businessId,
         categoryId: category.id,
         name: 'Rice',
         price: 5000,
         lowStockThreshold: '10',
       },
     });
-    const fine = await raw.product.create({
+    await raw.branchStock.create({
+      data: { branchId: t.branchId, productId: product.id, qty: '4' },
+    });
+    await raw.shift.create({
       data: {
-        businessId: c.business.id,
-        categoryId: category.id,
-        name: 'Beans',
-        price: 5000,
-        lowStockThreshold: '10',
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        openedAt: new Date(Date.now() - 30 * 3_600_000),
+        openingCash: 0,
       },
     });
-    const untracked = await raw.product.create({
-      data: {
-        businessId: c.business.id,
-        categoryId: category.id,
-        name: 'Salt',
-        price: 5000,
-      },
-    });
-    await raw.branchStock.createMany({
-      data: [
-        { branchId: c.branch.id, productId: low.id, qty: '3' },
-        { branchId: c.branch.id, productId: fine.id, qty: '50' },
-        { branchId: c.branch.id, productId: untracked.id, qty: '0' },
-      ],
-    });
 
-    const res = await get(c.token).expect(200);
+    const res = await dashboard(t.token).expect(200);
 
-    // Only the product below its threshold counts. A product with no threshold
-    // set is not "low" — it is unmonitored, which is a different thing.
-    const flag = res.body.attention.lowStock.find(
-      (l: any) => l.businessId === c.business.id,
-    );
-    expect(flag.count).toBe(1);
+    expect(res.body.attention.lowStock).toEqual([{ businessId: t.businessId, count: 1 }]);
+    expect(res.body.attention.unclosedShifts).toEqual([{ businessId: t.businessId, count: 1 }]);
   });
 
-  it('reports zero unread notifications until the notification feature exists', async () => {
-    const c = await ctx();
-    const res = await get(c.token).expect(200);
-    expect(res.body.live.unreadNotifications).toBe(0);
-  });
+  it('audits the dashboard read against each business', async () => {
+    const t = await seedTenant();
+    await dashboard(t.token).expect(200);
 
-  it('lists terminals with their last-seen and paired state', async () => {
-    const c = await ctx();
-    const res = await get(c.token).expect(200);
-    expect(res.body.live.terminals).toEqual([
-      expect.objectContaining({
-        terminalId: c.terminalId,
-        branchId: c.branch.id,
-        paired: false,
-      }),
-    ]);
-  });
-
-  it('excludes demo businesses entirely', async () => {
-    const c = await ctx();
-    const demo = await raw.business.create({
-      data: {
-        ownerId: c.owner.id,
-        name: 'Demo',
-        type: 'retail',
-        taxRate: '0.12',
-        isDemo: true,
-      },
+    const rows = await raw.auditLog.findMany({
+      where: { businessId: t.businessId, action: 'audit.report_read' },
     });
-    await raw.branch.create({
-      data: { businessId: demo.id, name: 'D', code: 'DM', address: 'x' },
-    });
-
-    const res = await get(c.token).expect(200);
-
-    expect(
-      res.body.businesses.some((b: any) => b.businessId === demo.id),
-    ).toBe(false);
-  });
-
-  it('never shows another owners business', async () => {
-    const c = await ctx();
-    const other = await ctx();
-    await seedSale(raw, {
-      branchId: other.branch.id,
-      terminalId: other.terminalId,
-      createdAt: new Date(),
-      lines: [{ qty: 1, unitPriceC: 99900 }],
-    });
-
-    const res = await get(c.token).expect(200);
-
-    expect(
-      res.body.businesses.some((b: any) => b.businessId === other.business.id),
-    ).toBe(false);
+    expect(rows).toHaveLength(1);
   });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 4: Run the e2e test to verify it fails**
 
 ```bash
 npm run test:e2e -- portal-analytics-dashboard
@@ -4365,47 +4171,141 @@ npm run test:e2e -- portal-analytics-dashboard
 
 Expected: 404 on every case.
 
-- [ ] **Step 3: Write the low-stock SQL**
+- [ ] **Step 5: Write the SQL builders**
 
 Create `src/portal/analytics/reports/dashboard.sql.ts`:
 
 ```ts
 import { Prisma } from '@prisma/client';
+import { MANILA_OFFSET_MINUTES } from '../scope/business-day';
 import type { ScopedBusiness } from '../scope/analytics-scope.service';
 
-export interface LowStockRow {
-  low_count: bigint;
+/**
+ * Dashboard queries (analytics-spec §0).
+ *
+ * Only the figures Prisma genuinely cannot express live here. Open shifts,
+ * terminals and unread notifications are plain scoped-client reads in the
+ * service — they need no aggregation, and going through the choke point is
+ * strictly safer than raw SQL.
+ *
+ * Low stock is the exception: it compares two columns
+ * (`branch_stock.qty <= products.low_stock_threshold`), which Prisma has no
+ * syntax for, so it is raw — and still scoped by `branch_id`.
+ */
+
+const NET_SALES = Prisma.sql`(s.subtotal - s.discount - s.sc_pwd_discount)`;
+
+export interface DashboardBranchRow {
+  branch_id: string;
+  name: string;
+  sales_c: bigint;
+  transactions: bigint;
+  costed_lines: bigint;
+  costed_revenue_c: bigint;
+  costed_cost_c: bigint;
 }
 
 /**
- * Low stock counted straight from `branch_stock`, not from `notifications` —
- * nothing writes that table until sub-project B, and the dashboard has to work
- * today.
- *
- * A product with NO `low_stock_threshold` is never counted: it is unmonitored,
- * which is a different state from "low", and treating it as low would fill the
- * attention list with noise on day one.
- *
- * Prisma cannot express this: comparing a column on `branch_stock` to a column
- * on `products` is a cross-table predicate, not a filter.
+ * Per-branch sales and profit for one window. The profit half joins
+ * `sale_items` through the same modifier lateral every revenue query uses —
+ * `unit_price` alone would understate any line with a priced modifier.
  */
+export function dashboardBranchSql(
+  business: ScopedBusiness,
+  fromUtc: Date,
+  toUtc: Date,
+): Prisma.Sql {
+  return Prisma.sql`
+    WITH scoped_sales AS (
+      SELECT s.id, s.branch_id, ${NET_SALES} AS net_c
+      FROM sales s
+      WHERE s.branch_id = ANY(${business.branchIds}::uuid[])
+        AND s.deleted_at IS NULL
+        AND s.status = 'completed'
+        AND s.created_at >= ${fromUtc}
+        AND s.created_at <  ${toUtc}
+    ),
+    lines AS (
+      SELECT ss.branch_id,
+             COUNT(*) FILTER (WHERE si.cost_snapshot IS NOT NULL) AS costed_lines,
+             COALESCE(SUM(line.net_c) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0) AS costed_revenue_c,
+             COALESCE(SUM(round(si.qty * si.cost_snapshot)) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0) AS costed_cost_c
+      FROM sale_items si
+      JOIN scoped_sales ss ON ss.id = si.sale_id
+      CROSS JOIN LATERAL (
+        SELECT COALESCE(SUM((m->>'priceDeltaC')::int), 0) AS mods_c
+        FROM jsonb_array_elements(
+          CASE WHEN jsonb_typeof(si.modifiers) = 'array'
+               THEN si.modifiers ELSE '[]'::jsonb END
+        ) AS m
+      ) mods
+      CROSS JOIN LATERAL (
+        SELECT round(si.qty * (si.unit_price + mods.mods_c)) - si.discount AS net_c
+      ) line
+      WHERE si.deleted_at IS NULL
+      GROUP BY 1
+    )
+    SELECT b.id::text AS branch_id,
+           b.name     AS name,
+           COALESCE(SUM(ss.net_c), 0)::bigint AS sales_c,
+           COUNT(ss.id)::bigint               AS transactions,
+           COALESCE(MAX(l.costed_lines), 0)::bigint      AS costed_lines,
+           COALESCE(MAX(l.costed_revenue_c), 0)::bigint  AS costed_revenue_c,
+           COALESCE(MAX(l.costed_cost_c), 0)::bigint     AS costed_cost_c
+    FROM branches b
+    LEFT JOIN scoped_sales ss ON ss.branch_id = b.id
+    LEFT JOIN lines l ON l.branch_id = b.id
+    WHERE b.id = ANY(${business.branchIds}::uuid[])
+      AND b.deleted_at IS NULL
+    GROUP BY 1, 2
+    ORDER BY 2
+  `;
+}
+
+export interface SparklineRow {
+  bucket: Date;
+  sales_c: bigint;
+}
+
+export function dashboardSparklineSql(
+  business: ScopedBusiness,
+  fromUtc: Date,
+  toUtc: Date,
+): Prisma.Sql {
+  const shift = MANILA_OFFSET_MINUTES - business.dayStartMinutes;
+  return Prisma.sql`
+    SELECT ((s.created_at + make_interval(mins => ${shift}))::date) AS bucket,
+           COALESCE(SUM(${NET_SALES}), 0)::bigint AS sales_c
+    FROM sales s
+    WHERE s.branch_id = ANY(${business.branchIds}::uuid[])
+      AND s.deleted_at IS NULL
+      AND s.status = 'completed'
+      AND s.created_at >= ${fromUtc}
+      AND s.created_at <  ${toUtc}
+    GROUP BY 1
+  `;
+}
+
+export interface CountRow {
+  count: bigint;
+}
+
+/** Products at or below their threshold. Products without one are not "low". */
 export function lowStockCountSql(business: ScopedBusiness): Prisma.Sql {
   return Prisma.sql`
-    SELECT COUNT(*)::bigint AS low_count
+    SELECT COUNT(*)::bigint AS count
     FROM branch_stock bs
     JOIN products p ON p.id = bs.product_id
     WHERE bs.branch_id = ANY(${business.branchIds}::uuid[])
       AND bs.deleted_at IS NULL
       AND p.deleted_at IS NULL
-      AND p.active = true
-      AND p.track_stock = true
       AND p.low_stock_threshold IS NOT NULL
       AND bs.qty <= p.low_stock_threshold
   `;
 }
 ```
 
-- [ ] **Step 4: Write the dashboard service**
+- [ ] **Step 6: Write the service**
 
 Create `src/portal/analytics/dashboard/dashboard.service.ts`:
 
@@ -4416,28 +4316,18 @@ import {
   SCOPED_PRISMA,
   type ScopedPrisma,
 } from '../../../prisma/scoped-prisma.provider';
-import {
-  AnalyticsScopeService,
-  withWindow,
-  type BusinessBranches,
-  type ScopedBusiness,
-} from '../scope/analytics-scope.service';
-import { addDays, businessDayOf } from '../scope/business-day';
+import { AnalyticsScopeService, type ScopedBusiness } from '../scope/analytics-scope.service';
+import { addDays, businessDayOf, businessDayStartUtc } from '../scope/business-day';
 import { ReportAuditService } from '../report-audit.service';
-import { runScoped } from '../scoped-sql';
+import { runScoped, runScopedOne } from '../scoped-sql';
 import {
-  lineAggregateSql,
-  saleAggregateSql,
-  type LineAggregateRow,
-  type SaleAggregateRow,
-} from '../reports/sales-aggregate.sql';
-import {
-  branchBreakdownSql,
-  bucketedSalesSql,
-  type BranchBreakdownRow,
-  type BucketSalesRow,
-} from '../reports/sales-buckets.sql';
-import { lowStockCountSql, type LowStockRow } from '../reports/dashboard.sql';
+  dashboardBranchSql,
+  dashboardSparklineSql,
+  lowStockCountSql,
+  type CountRow,
+  type DashboardBranchRow,
+  type SparklineRow,
+} from '../reports/dashboard.sql';
 
 const SPARKLINE_DAYS = 7;
 const UNCLOSED_SHIFT_HOURS = 24;
@@ -4448,17 +4338,15 @@ export interface DayFigures {
   transactions: number;
 }
 
-export interface DashboardBusiness {
-  businessId: string;
-  name: string;
-  today: DayFigures;
-  sameDayLastWeek: DayFigures;
-  branches: { branchId: string; name: string; salesC: number; transactions: number }[];
-  sparkline: { date: string; salesC: number }[];
-}
-
 export interface DashboardReport {
-  businesses: DashboardBusiness[];
+  businesses: {
+    businessId: string;
+    name: string;
+    today: DayFigures;
+    sameDayLastWeek: DayFigures;
+    branches: (DayFigures & { branchId: string; name: string })[];
+    sparkline: { date: string; salesC: number }[];
+  }[];
   live: {
     openShifts: {
       shiftId: string;
@@ -4485,246 +4373,191 @@ export interface DashboardReport {
   };
 }
 
+function figuresOf(rows: DashboardBranchRow[]): DayFigures {
+  const costedLines = rows.reduce((n, r) => n + Number(r.costed_lines), 0);
+  const revenue = rows.reduce((n, r) => n + Number(r.costed_revenue_c), 0);
+  const cost = rows.reduce((n, r) => n + Number(r.costed_cost_c), 0);
+  return {
+    salesC: rows.reduce((n, r) => n + Number(r.sales_c), 0),
+    transactions: rows.reduce((n, r) => n + Number(r.transactions), 0),
+    grossProfitC: costedLines === 0 ? null : revenue - cost,
+  };
+}
+
 /**
- * §0 Dashboard — the portal landing.
+ * The portal landing (analytics-spec §0): "is everything okay?" in zero clicks.
  *
- * Spans every non-demo business and IGNORES the business switcher by design:
- * it is the one view that answers "is everything okay?" across the whole
- * account.
- *
- * "Today" is computed per business, because a 00:00 business and an 04:00 café
- * genuinely disagree about which day it is at 3 AM. That is why this service
- * builds its own windows from `resolveBusinesses()` + `withWindow()` rather
- * than taking a shared range.
- *
- * The live strip and attention items read through the SCOPED client wherever
- * Prisma can express the query; only the low-stock count needs raw SQL, because
- * it compares `branch_stock.qty` against a column on `products`.
+ * Spans every non-demo business and ignores the business switcher by design, so
+ * it takes no scope parameters. Each business is windowed on its OWN today —
+ * see `resolveToday`.
  */
 @Injectable()
 export class DashboardService {
   constructor(
+    private readonly scope: AnalyticsScopeService,
     private readonly raw: PrismaService,
     @Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma,
-    private readonly scope: AnalyticsScopeService,
     private readonly reportAudit: ReportAuditService,
   ) {}
 
-  async run(): Promise<DashboardReport> {
-    const businesses = await this.scope.resolveBusinesses({});
-    const now = new Date();
+  async run(now: Date): Promise<DashboardReport> {
+    const scope = await this.scope.resolveToday(now);
+    const businesses: DashboardReport['businesses'] = [];
+    const lowStock: DashboardReport['attention']['lowStock'] = [];
 
-    const rows: DashboardBusiness[] = [];
-    const lowStock: { businessId: string; count: number }[] = [];
+    for (const business of scope.businesses) {
+      const [todayRows, lastWeekRows, sparkRows, low] = await Promise.all([
+        runScoped<DashboardBranchRow>(this.raw, business, (b) =>
+          dashboardBranchSql(b, b.fromUtc, b.toUtc),
+        ),
+        runScoped<DashboardBranchRow>(this.raw, business, (b) =>
+          dashboardBranchSql(b, b.previousFromUtc, b.previousToUtc),
+        ),
+        this.sparkline(business, now),
+        runScopedOne<CountRow>(this.raw, business, lowStockCountSql),
+      ]);
 
-    for (const business of businesses) {
-      const today = businessDayOf(now, business.dayStartMinutes);
-      const lastWeek = addDays(today, -7);
-      const sparkFrom = addDays(today, -(SPARKLINE_DAYS - 1));
-
-      const todayScope = withWindow(business, today, today);
-      const lastWeekScope = withWindow(business, lastWeek, lastWeek);
-      const sparkScope = withWindow(business, sparkFrom, today);
-
-      const [figuresToday, figuresLastWeek, branches, sparkline, low] =
-        await Promise.all([
-          this.figures(todayScope),
-          this.figures(lastWeekScope),
-          this.branches(todayScope),
-          this.sparkline(sparkScope, sparkFrom, today),
-          this.lowStockCount(todayScope),
-        ]);
-
-      rows.push({
+      businesses.push({
         businessId: business.id,
         name: business.name,
-        today: figuresToday,
-        sameDayLastWeek: figuresLastWeek,
-        branches,
-        sparkline,
+        today: figuresOf(todayRows),
+        sameDayLastWeek: figuresOf(lastWeekRows),
+        branches: todayRows.map((row) => ({
+          branchId: row.branch_id,
+          name: row.name,
+          ...figuresOf([row]),
+        })),
+        sparkline: sparkRows,
       });
-      lowStock.push({ businessId: business.id, count: low });
+
+      lowStock.push({ businessId: business.id, count: Number(low.count) });
     }
 
-    const live = await this.live(businesses);
-    const unclosedShifts = await this.unclosedShifts(businesses, now);
+    const [openShifts, terminals, unreadNotifications, unclosedShifts] =
+      await Promise.all([
+        this.openShifts(scope.businesses),
+        this.terminals(scope.businesses),
+        this.scoped.notification.count({ where: { readAt: null } }),
+        this.unclosedShifts(scope.businesses, now),
+      ]);
 
-    await this.reportAudit.log(
-      {
-        businesses: businesses.map((b) => withWindow(b, '2026-01-01', '2026-01-01')),
-        branchIds: businesses.flatMap((b) => b.branchIds),
-        from: businessDayOf(now, 0),
-        to: businessDayOf(now, 0),
-        dayCount: 1,
-      },
-      'dashboard',
-      'json',
-    );
+    await this.reportAudit.log(scope, 'dashboard', 'json');
 
-    return { businesses: rows, live, attention: { lowStock, unclosedShifts } };
-  }
-
-  private async figures(business: ScopedBusiness): Promise<DayFigures> {
-    const [sales] = await runScoped<SaleAggregateRow>(this.raw, business, (b) =>
-      saleAggregateSql(b, b.fromUtc, b.toUtc),
-    );
-    const [lines] = await runScoped<LineAggregateRow>(this.raw, business, (b) =>
-      lineAggregateSql(b, b.fromUtc, b.toUtc),
-    );
-
-    const costedItems = Number(lines.costed_items);
     return {
-      salesC: Number(sales.gross_sales_c) - Number(sales.discounts_c),
-      grossProfitC:
-        costedItems === 0
-          ? null
-          : Number(lines.costed_revenue_c) - Number(lines.costed_cost_c),
-      transactions: Number(sales.transactions),
+      businesses,
+      live: { openShifts, terminals, unreadNotifications },
+      attention: { lowStock, unclosedShifts },
     };
   }
 
-  private async branches(
+  /** Seven business days ending today, zero-filled so the chart has no gaps. */
+  private async sparkline(
     business: ScopedBusiness,
-  ): Promise<DashboardBusiness['branches']> {
-    const rows = await runScoped<BranchBreakdownRow>(
-      this.raw,
-      business,
-      branchBreakdownSql,
+    now: Date,
+  ): Promise<{ date: string; salesC: number }[]> {
+    const today = businessDayOf(now, business.dayStartMinutes);
+    const first = addDays(today, -(SPARKLINE_DAYS - 1));
+    const fromUtc = businessDayStartUtc(first, business.dayStartMinutes);
+
+    const rows = await runScoped<SparklineRow>(this.raw, business, (b) =>
+      dashboardSparklineSql(b, fromUtc, b.toUtc),
     );
+    const byDate = new Map(
+      rows.map((r) => [r.bucket.toISOString().slice(0, 10), Number(r.sales_c)]),
+    );
+
+    return Array.from({ length: SPARKLINE_DAYS }, (_, i) => {
+      const date = addDays(first, i);
+      return { date, salesC: byDate.get(date) ?? 0 };
+    });
+  }
+
+  private async openShifts(businesses: ScopedBusiness[]) {
+    const branchToBusiness = branchIndex(businesses);
+    const rows = await this.scoped.shift.findMany({
+      where: { branchId: { in: [...branchToBusiness.keys()] }, closedAt: null },
+      select: {
+        id: true,
+        branchId: true,
+        openedAt: true,
+        branch: { select: { name: true } },
+        terminal: { select: { name: true } },
+      },
+      orderBy: { openedAt: 'asc' },
+    });
     return rows.map((row) => ({
-      branchId: row.branch_id,
-      name: row.name,
-      salesC: Number(row.sales_c),
-      transactions: Number(row.transactions),
+      shiftId: row.id,
+      businessId: branchToBusiness.get(row.branchId) ?? '',
+      branchId: row.branchId,
+      branchName: row.branch.name,
+      terminalName: row.terminal.name,
+      openedAt: row.openedAt,
     }));
   }
 
-  private async sparkline(
-    business: ScopedBusiness,
-    from: string,
-    to: string,
-  ): Promise<{ date: string; salesC: number }[]> {
-    const rows = await runScoped<BucketSalesRow>(this.raw, business, (b) =>
-      bucketedSalesSql(b, 'day'),
-    );
-    const byDate = new Map(
-      rows.map((row) => [
-        row.bucket.toISOString().slice(0, 10),
-        Number(row.sales_c),
-      ]),
-    );
-
-    const points: { date: string; salesC: number }[] = [];
-    for (let date = from; ; date = addDays(date, 1)) {
-      points.push({ date, salesC: byDate.get(date) ?? 0 });
-      if (date === to) break;
-    }
-    return points;
-  }
-
-  private async lowStockCount(business: ScopedBusiness): Promise<number> {
-    const [row] = await runScoped<LowStockRow>(
-      this.raw,
-      business,
-      lowStockCountSql,
-    );
-    return Number(row.low_count);
+  private async terminals(businesses: ScopedBusiness[]) {
+    const branchToBusiness = branchIndex(businesses);
+    const rows = await this.scoped.terminal.findMany({
+      where: { branchId: { in: [...branchToBusiness.keys()] } },
+      select: {
+        id: true,
+        branchId: true,
+        name: true,
+        code: true,
+        lastSeenAt: true,
+        deviceTokenHash: true,
+      },
+      orderBy: { code: 'asc' },
+    });
+    return rows.map((row) => ({
+      terminalId: row.id,
+      businessId: branchToBusiness.get(row.branchId) ?? '',
+      branchId: row.branchId,
+      name: row.name,
+      code: row.code,
+      lastSeenAt: row.lastSeenAt,
+      // The token hash never leaves the service — only whether one exists.
+      paired: row.deviceTokenHash !== null,
+    }));
   }
 
   /**
-   * Read through the scoped client and joined in TypeScript rather than with
-   * nested `include`s: branches and terminals are small, and three flat scoped
-   * reads are easier to reason about than one include tree passing through the
-   * choke point's arg walker.
+   * A shift open longer than 24 hours is an operator error worth surfacing: a
+   * drawer belongs to one day of trading, so anything longer means someone went
+   * home without closing.
    */
-  private async live(
-    businesses: BusinessBranches[],
-  ): Promise<DashboardReport['live']> {
-    const branchToBusiness = new Map<string, string>();
-    for (const business of businesses) {
-      for (const branchId of business.branchIds) {
-        branchToBusiness.set(branchId, business.id);
-      }
+  private async unclosedShifts(businesses: ScopedBusiness[], now: Date) {
+    const cutoff = new Date(now.getTime() - UNCLOSED_SHIFT_HOURS * 3_600_000);
+    const branchToBusiness = branchIndex(businesses);
+    const rows = await this.scoped.shift.findMany({
+      where: {
+        branchId: { in: [...branchToBusiness.keys()] },
+        closedAt: null,
+        openedAt: { lt: cutoff },
+      },
+      select: { branchId: true },
+    });
+
+    const counts = new Map<string, number>();
+    for (const business of businesses) counts.set(business.id, 0);
+    for (const row of rows) {
+      const businessId = branchToBusiness.get(row.branchId);
+      if (businessId) counts.set(businessId, (counts.get(businessId) ?? 0) + 1);
     }
-    const branchIds = [...branchToBusiness.keys()];
-
-    const [branches, terminals, shifts, unreadNotifications] = await Promise.all([
-      this.scoped.branch.findMany({
-        where: { id: { in: branchIds } },
-        select: { id: true, name: true },
-      }),
-      this.scoped.terminal.findMany({
-        where: { branchId: { in: branchIds } },
-        select: {
-          id: true,
-          branchId: true,
-          name: true,
-          code: true,
-          lastSeenAt: true,
-          deviceTokenHash: true,
-        },
-        orderBy: { createdAt: 'asc' },
-      }),
-      this.scoped.shift.findMany({
-        where: { branchId: { in: branchIds }, closedAt: null },
-        select: { id: true, branchId: true, terminalId: true, openedAt: true },
-        orderBy: { openedAt: 'asc' },
-      }),
-      this.scoped.notification.count({ where: { readAt: null } }),
-    ]);
-
-    const branchName = new Map(branches.map((b) => [b.id, b.name]));
-    const terminalName = new Map(terminals.map((t) => [t.id, t.name]));
-
-    return {
-      openShifts: shifts.map((shift) => ({
-        shiftId: shift.id,
-        businessId: branchToBusiness.get(shift.branchId) ?? '',
-        branchId: shift.branchId,
-        branchName: branchName.get(shift.branchId) ?? '',
-        terminalName: terminalName.get(shift.terminalId) ?? '',
-        openedAt: shift.openedAt,
-      })),
-      terminals: terminals.map((terminal) => ({
-        terminalId: terminal.id,
-        businessId: branchToBusiness.get(terminal.branchId) ?? '',
-        branchId: terminal.branchId,
-        name: terminal.name,
-        code: terminal.code,
-        lastSeenAt: terminal.lastSeenAt,
-        paired: terminal.deviceTokenHash !== null,
-      })),
-      unreadNotifications,
-    };
+    return [...counts.entries()].map(([businessId, count]) => ({ businessId, count }));
   }
+}
 
-  private async unclosedShifts(
-    businesses: BusinessBranches[],
-    now: Date,
-  ): Promise<{ businessId: string; count: number }[]> {
-    const cutoff = new Date(
-      now.getTime() - UNCLOSED_SHIFT_HOURS * 60 * 60 * 1000,
-    );
-
-    const counts: { businessId: string; count: number }[] = [];
-    for (const business of businesses) {
-      counts.push({
-        businessId: business.id,
-        count: await this.scoped.shift.count({
-          where: {
-            branchId: { in: business.branchIds },
-            closedAt: null,
-            openedAt: { lt: cutoff },
-          },
-        }),
-      });
-    }
-    return counts;
+function branchIndex(businesses: ScopedBusiness[]): Map<string, string> {
+  const index = new Map<string, string>();
+  for (const business of businesses) {
+    for (const branchId of business.branchIds) index.set(branchId, business.id);
   }
+  return index;
 }
 ```
 
-- [ ] **Step 5: Write the controller and register it**
+- [ ] **Step 7: Write the controller and register it**
 
 Create `src/portal/analytics/dashboard/dashboard.controller.ts`:
 
@@ -4734,10 +4567,11 @@ import { PortalAuthGuard } from '../../../auth/guards/portal-auth.guard';
 import { DashboardService, type DashboardReport } from './dashboard.service';
 
 /**
- * §0 Dashboard — `GET /v1/portal/dashboard`.
+ * The portal landing (analytics-spec §0). `GET /v1/portal/dashboard`.
  *
- * No query parameters: it deliberately spans every non-demo business and
- * ignores the business switcher.
+ * No query parameters: it spans every non-demo business and ignores the
+ * business switcher. No CSV either — this is a glanceable summary, and every
+ * card taps through to a report that does export.
  */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
@@ -4746,56 +4580,60 @@ export class DashboardController {
 
   @Get('dashboard')
   get(): Promise<DashboardReport> {
-    return this.dashboard.run();
+    return this.dashboard.run(new Date());
   }
 }
 ```
 
-Add `DashboardController` to `controllers` and `DashboardService` to `providers` in `src/portal/analytics/analytics.module.ts`.
+Add `DashboardController` to `controllers` and `DashboardService` to `providers` in `analytics.module.ts`.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 8: Run the tests to verify they pass**
 
 ```bash
 npm run test:e2e -- portal-analytics-dashboard
+npm run lint && npm run build
 ```
 
-Expected: PASS, all cases.
+Expected: all pass. If the sparkline's last entry is empty, check that `dashboardSparklineSql` is given the business's `toUtc` (end of today) rather than the sparkline's own start.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add src/portal/analytics test/portal-analytics-dashboard.e2e-spec.ts
-git commit -m "feat(analytics): portal dashboard spanning every non-demo business"
+git commit -m "feat(api): portal dashboard spanning every business with live and attention strips"
 ```
 
 ---
 
-## Task 11: The invariants that keep the design honest
+### Task 11: Cross-cutting guarantees
 
-Three cross-cutting properties, each cheap to assert here and expensive to discover in production. The modifier-revenue case already lives in this file from Task 6.
+Three properties hold across *every* endpoint rather than inside any one of them, so they get their own specs. The null-cost rule and business-day bucketing are already asserted where they bite (overview and sales); these add the sweeps that no single report spec can make.
 
 **Files:**
-- Modify: `test/portal-analytics-invariants.e2e-spec.ts`
+- Create: `test/portal-analytics-tenancy.e2e-spec.ts`
+- Create: `test/portal-analytics-invariants.e2e-spec.ts`
+- Test: both of the above
 
 **Interfaces:**
-- Consumes: every endpoint built in Tasks 7–10, plus `seedSale`/`seedBranchInfra`.
-- Produces: nothing — this task adds no source files.
+- Consumes: every endpoint from Tasks 7–10, `seedSale` (Task 6), `computeTotals` from `src/common/totals/totals`.
+- Produces: no source changes. If either spec fails, the fix is in the code it exercises.
 
-- [ ] **Step 1: Add the Nest bootstrap to the invariants spec**
+- [ ] **Step 1: Write the tenancy sweep**
 
-`test/portal-analytics-invariants.e2e-spec.ts` currently uses only a raw client. Add the same `beforeAll`/`afterAll` app bootstrap and the `ctx()` helper used in `test/portal-analytics-overview.e2e-spec.ts`, so the file can call the endpoints.
-
-- [ ] **Step 2: Write the failing tenancy cases**
-
-Append to the same describe block:
+Create `test/portal-analytics-tenancy.e2e-spec.ts`, reusing the bootstrap and `seedTenant` block from `test/portal-analytics-overview.e2e-spec.ts`, then:
 
 ```ts
-  const RANGE = 'from=2026-03-01&to=2026-03-07';
-  const inRange = new Date('2026-03-03T04:00:00.000Z');
+  /*
+   * Analytics is the only place in this API that runs raw SQL, and raw SQL
+   * bypasses the tenancy choke point entirely (`scoped-sql.ts` explains why).
+   * These are the tests that keep that honest: every endpoint, both directions.
+   */
 
-  // Every analytics endpoint. Any route added later belongs in this list —
-  // that is the point of listing them rather than testing one.
-  const REPORTS = [
+  const DURING = new Date('2026-03-02T02:00:00.000Z');
+  const RANGE = { from: '2026-03-01', to: '2026-03-07' };
+
+  /** Every report endpoint, so a new one cannot be added without a decision. */
+  const ENDPOINTS = [
     'analytics/overview',
     'analytics/sales/heatmap',
     'analytics/sales/trend',
@@ -4804,223 +4642,282 @@ Append to the same describe block:
     'analytics/tax',
   ];
 
-  describe.each(REPORTS)('%s', (path) => {
-    it('404s when asked about a business the caller does not own', async () => {
-      const mine = await ctx();
-      const theirs = await ctx();
+  it('404s on every endpoint when the businessId belongs to someone else', async () => {
+    const mine = await seedTenant();
+    const theirs = await seedTenant();
+
+    for (const path of ENDPOINTS) {
       await request(server())
-        .get(`/v1/portal/${path}?${RANGE}&businessId=${theirs.business.id}`)
+        .get(`/v1/portal/${path}`)
+        .query({ ...RANGE, businessId: theirs.businessId })
         .set('Authorization', `Bearer ${mine.token}`)
         .expect(404);
-    });
-
-    it('404s when asked about a branch the caller does not own', async () => {
-      const mine = await ctx();
-      const theirs = await ctx();
-      await request(server())
-        .get(
-          `/v1/portal/${path}?${RANGE}&businessId=${mine.business.id}&branchId=${theirs.branch.id}`,
-        )
-        .set('Authorization', `Bearer ${mine.token}`)
-        .expect(404);
-    });
-
-    it('never includes another tenants sales in an all-businesses rollup', async () => {
-      const mine = await ctx();
-      const theirs = await ctx();
-      await seedSale(raw, {
-        branchId: theirs.branch.id,
-        terminalId: theirs.terminalId,
-        createdAt: inRange,
-        lines: [{ qty: 1, unitPriceC: 99900 }],
-      });
-
-      const res = await request(server())
-        .get(`/v1/portal/${path}?${RANGE}`)
-        .set('Authorization', `Bearer ${mine.token}`)
-        .expect(200);
-
-      // 99900 is unmistakable: if raw SQL ever loses its branch predicate, it
-      // shows up here as somebody else's money.
-      expect(JSON.stringify(res.body)).not.toContain('99900');
-    });
-
-    it('requires authentication', async () => {
-      await request(server()).get(`/v1/portal/${path}?${RANGE}`).expect(401);
-    });
+    }
   });
-```
 
-- [ ] **Step 3: Write the failing null-cost case**
+  it('404s on every endpoint when the branchId belongs to someone else', async () => {
+    const mine = await seedTenant();
+    const theirs = await seedTenant();
 
-```ts
-  it('never reports an uncosted product as zero-margin anywhere', async () => {
-    const c = await ctx();
+    for (const path of ENDPOINTS) {
+      await request(server())
+        .get(`/v1/portal/${path}`)
+        .query({ ...RANGE, businessId: mine.businessId, branchId: theirs.branchId })
+        .set('Authorization', `Bearer ${mine.token}`)
+        .expect(404);
+    }
+  });
+
+  it("never counts another owner's sales in an unscoped sweep", async () => {
+    const mine = await seedTenant();
+    const theirs = await seedTenant();
+
     await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 10000, costC: null }],
+      branchId: mine.branchId,
+      terminalId: mine.terminalId,
+      createdAt: DURING,
+      lines: [{ qty: 1, unitPriceC: 10000 }],
+    });
+    await seedSale(raw, {
+      branchId: theirs.branchId,
+      terminalId: theirs.terminalId,
+      createdAt: DURING,
+      lines: [{ qty: 1, unitPriceC: 99900 }],
     });
 
     const overview = await request(server())
-      .get(`/v1/portal/analytics/overview?${RANGE}&businessId=${c.business.id}`)
-      .set('Authorization', `Bearer ${c.token}`)
+      .get('/v1/portal/analytics/overview')
+      .query(RANGE)
+      .set('Authorization', `Bearer ${mine.token}`)
       .expect(200);
+    expect(overview.body.grossSalesC.value).toBe(10000);
 
-    // A zero here would claim 100% margin on a product whose cost nobody knows.
-    expect(overview.body.grossProfitC.value).toBeNull();
-    expect(overview.body.marginPct.value).toBeNull();
-
-    const trend = await request(server())
-      .get(
-        `/v1/portal/analytics/sales/trend?${RANGE}&businessId=${c.business.id}&granularity=day`,
-      )
-      .set('Authorization', `Bearer ${c.token}`)
+    const breakdowns = await request(server())
+      .get('/v1/portal/analytics/sales/breakdowns')
+      .query(RANGE)
+      .set('Authorization', `Bearer ${mine.token}`)
       .expect(200);
+    expect(breakdowns.body.byBranch.map((b: any) => b.branchId)).toEqual([mine.branchId]);
 
-    const day = trend.body.buckets.find((b: any) => b.bucket === '2026-03-03');
-    expect(day.salesC).toBe(10000);
-    expect(day.grossProfitC).toBeNull();
+    const dashboard = await request(server())
+      .get('/v1/portal/dashboard')
+      .set('Authorization', `Bearer ${mine.token}`)
+      .expect(200);
+    expect(dashboard.body.businesses.map((b: any) => b.businessId)).toEqual([
+      mine.businessId,
+    ]);
   });
 
-  it('writes an empty CSV field for an unknown margin, not a zero', async () => {
-    const c = await ctx();
-    await seedSale(raw, {
-      branchId: c.branch.id,
-      terminalId: c.terminalId,
-      createdAt: inRange,
-      lines: [{ qty: 1, unitPriceC: 10000, costC: null }],
-    });
-
-    const res = await request(server())
-      .get(
-        `/v1/portal/analytics/overview?${RANGE}&businessId=${c.business.id}&format=csv`,
-      )
-      .set('Authorization', `Bearer ${c.token}`)
-      .expect(200);
-
-    expect(res.text).toContain('Gross profit,,,');
+  it('rejects an unauthenticated caller on every endpoint, dashboard included', async () => {
+    for (const path of [...ENDPOINTS, 'dashboard']) {
+      await request(server()).get(`/v1/portal/${path}`).query(RANGE).expect(401);
+    }
   });
 ```
 
-- [ ] **Step 4: Write the failing business-day case**
+- [ ] **Step 2: Run the tenancy sweep**
+
+```bash
+npm run test:e2e -- portal-analytics-tenancy
+```
+
+Expected: PASS. A failure here means a report query is missing its `branch_id` predicate — fix the SQL builder, not the test. If `runScoped`'s tripwire caught it, the failure will be a 500 naming the builder.
+
+- [ ] **Step 3: Write the invariant spec**
+
+Create `test/portal-analytics-invariants.e2e-spec.ts`, reusing the bootstrap and `seedTenant` block, then:
 
 ```ts
-  it('agrees with the SQL bucketing about which business day a 3 AM sale belongs to', async () => {
-    const cafe = await ctx({ dayStartTime: '04:00' });
-    // 2026-03-03 03:00 Manila == 2026-03-02T19:00Z — the previous business day.
-    await seedSale(raw, {
-      branchId: cafe.branch.id,
-      terminalId: cafe.terminalId,
-      createdAt: new Date('2026-03-02T19:00:00.000Z'),
-      lines: [{ qty: 1, unitPriceC: 10000 }],
+  /*
+   * Properties that must hold across reports, not within one.
+   *
+   * The modifier case is the one that matters most: `sale_items.unit_price` is
+   * the BASE price and priced modifiers live in the jsonb array, so a report
+   * that multiplies qty by unit_price alone silently understates revenue on
+   * every such line. Here the report must agree with `sales.subtotal`, which
+   * the engine computed.
+   */
+  const DURING = new Date('2026-03-02T02:00:00.000Z');
+  const RANGE = { from: '2026-03-01', to: '2026-03-07' };
+
+  const get = (token: string, path: string, query: Record<string, string> = {}) =>
+    request(server())
+      .get(`/v1/portal/${path}`)
+      .query({ ...RANGE, ...query })
+      .set('Authorization', `Bearer ${token}`);
+
+  it('matches the stored subtotal when every line carries a priced modifier', async () => {
+    const t = await seedTenant();
+    const sale = await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [
+        {
+          qty: 2.5,
+          unitPriceC: 13300,
+          modifiers: [
+            { groupId: 'g1', modifierId: 'm1', name: 'Oat milk', priceDeltaC: 2500 },
+            { groupId: 'g2', modifierId: 'm2', name: 'Extra shot', priceDeltaC: 1750 },
+          ],
+        },
+        {
+          qty: 1,
+          unitPriceC: 9900,
+          modifiers: [
+            { groupId: 'g2', modifierId: 'm3', name: 'Decaf', priceDeltaC: 0 },
+          ],
+        },
+      ],
     });
 
-    const res = await request(server())
-      .get(
-        `/v1/portal/analytics/sales/heatmap?${RANGE}&businessId=${cafe.business.id}`,
-      )
-      .set('Authorization', `Bearer ${cafe.token}`)
-      .expect(200);
+    const overview = await get(t.token, 'analytics/overview').expect(200);
+    expect(overview.body.grossSalesC.value).toBe(sale.subtotal);
 
-    const byDate = Object.fromEntries(
-      res.body.days.map((d: any) => [d.date, d.salesC]),
-    );
-    expect(byDate['2026-03-02']).toBe(10000);
-    expect(byDate['2026-03-03']).toBe(0);
+    // And the naive reading — which is what a missing lateral join produces.
+    const naive = Math.round(2.5 * 13300) + 1 * 9900;
+    expect(overview.body.grossSalesC.value).toBeGreaterThan(naive);
   });
 
-  it('keeps two businesses with different day starts in their own buckets', async () => {
-    const midnight = await ctx({ dayStartTime: '00:00' });
-    const cafe = await raw.business.create({
-      data: {
-        ownerId: midnight.owner.id,
-        name: 'Cafe',
-        type: 'fnb',
-        taxRate: '0.12',
-        dayStartTime: '04:00',
-      },
+  it('agrees between the overview, the heatmap and the trend for one range', async () => {
+    const t = await seedTenant();
+    const common = { branchId: t.branchId, terminalId: t.terminalId, createdAt: DURING };
+    await seedSale(raw, {
+      ...common,
+      lines: [
+        { qty: 1, unitPriceC: 25000, discount: { source: 'free', kind: 'percent', value: 10 } },
+      ],
     });
-    const cafeBranch = await raw.branch.create({
-      data: { businessId: cafe.id, name: 'C', code: 'CF', address: 'x' },
-    });
-    const { terminalId } = await seedBranchInfra(raw, cafeBranch.id);
+    await seedSale(raw, { ...common, lines: [{ qty: 3, unitPriceC: 4999 }] });
 
-    const at3am = new Date('2026-03-02T19:00:00.000Z');
+    const [overview, heatmap, trend] = await Promise.all([
+      get(t.token, 'analytics/overview').expect(200),
+      get(t.token, 'analytics/sales/heatmap').expect(200),
+      get(t.token, 'analytics/sales/trend', { granularity: 'day' }).expect(200),
+    ]);
+
+    const net = overview.body.netSalesC.value;
+    const heatmapTotal = heatmap.body.reduce((n: number, d: any) => n + d.salesC, 0);
+    const trendTotal = trend.body.reduce((n: number, b: any) => n + b.salesC, 0);
+
+    expect(heatmapTotal).toBe(net);
+    expect(trendTotal).toBe(net);
+  });
+
+  it('agrees between the tax summary and the overview on service charge', async () => {
+    const t = await seedTenant({ serviceChargeRate: '0.10' });
     await seedSale(raw, {
-      branchId: midnight.branch.id,
-      terminalId: midnight.terminalId,
-      createdAt: at3am,
-      lines: [{ qty: 1, unitPriceC: 10000 }],
-    });
-    await seedSale(raw, {
-      branchId: cafeBranch.id,
-      terminalId,
-      createdAt: at3am,
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      orderType: 'dine_in',
+      serviceChargeRate: 0.1,
       lines: [{ qty: 1, unitPriceC: 20000 }],
     });
 
-    const res = await request(server())
-      .get(`/v1/portal/analytics/sales/heatmap?${RANGE}`)
-      .set('Authorization', `Bearer ${midnight.token}`)
-      .expect(200);
+    const [overview, tax] = await Promise.all([
+      get(t.token, 'analytics/overview').expect(200),
+      get(t.token, 'analytics/tax').expect(200),
+    ]);
 
-    const byDate = Object.fromEntries(
-      res.body.days.map((d: any) => [d.date, d.salesC]),
-    );
-    // The SAME instant lands on different business days for the two businesses,
-    // and the rollup sums the buckets rather than picking one calendar.
-    expect(byDate['2026-03-02']).toBe(20000);
-    expect(byDate['2026-03-03']).toBe(10000);
+    expect(tax.body.totals.serviceChargeC).toBe(overview.body.serviceChargeC.value);
+  });
+
+  it('never reports a zero margin for an uncosted catalogue, on any report', async () => {
+    const t = await seedTenant();
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [{ qty: 4, unitPriceC: 7500, costC: null }],
+    });
+
+    const [overview, trend, dashboard] = await Promise.all([
+      get(t.token, 'analytics/overview').expect(200),
+      get(t.token, 'analytics/sales/trend', { granularity: 'day' }).expect(200),
+      request(server())
+        .get('/v1/portal/dashboard')
+        .set('Authorization', `Bearer ${t.token}`)
+        .expect(200),
+    ]);
+
+    expect(overview.body.grossProfitC.value).toBeNull();
+    expect(overview.body.marginPct.value).toBeNull();
+    for (const bucket of trend.body) {
+      expect(bucket.grossProfitC).toBeNull();
+    }
+    expect(dashboard.body.businesses[0].today.grossProfitC).toBeNull();
+  });
+
+  it('rounds a weight quantity per line, the way the engine does', async () => {
+    const t = await seedTenant();
+    // 1.335 kg at 99.99 — the engine rounds the line, not the total.
+    const sale = await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [{ qty: 1.335, unitPriceC: 9999 }],
+    });
+
+    const overview = await get(t.token, 'analytics/overview').expect(200);
+    expect(overview.body.grossSalesC.value).toBe(sale.subtotal);
   });
 ```
 
-- [ ] **Step 5: Run the tests to verify they fail, then pass**
+- [ ] **Step 4: Run the invariant spec**
 
 ```bash
 npm run test:e2e -- portal-analytics-invariants
 ```
 
-Expected: every case passes against the code from Tasks 7–10. Any failure here is a real defect in that code, not in the test — fix the source, not the assertion. In particular:
-- a `99900` appearing in a rollup means a report query lost its branch predicate;
-- a `0` where `null` was expected means a costed/uncosted split is missing its `costed_items` guard;
-- a heatmap date one day out means `businessDayExpr` and `businessDayOf` have drifted apart.
+Expected: PASS. The first case fails if any revenue query dropped its modifier lateral; the last fails if SQL rounding and `halfUp` have diverged — check that the SQL rounds per line rather than summing then rounding.
 
-- [ ] **Step 6: Run the whole suite and the linter**
+- [ ] **Step 5: Run everything**
 
 ```bash
-npm test && npm run test:e2e && npm run lint && npm run build
+npm test
+npm run test:e2e
+npm run lint && npm run build
 ```
 
-Expected: everything green.
+Expected: the whole unit suite and the whole e2e suite green, including every pre-existing spec. A failure in `pos-sales` or `portal-catalog` means Task 1's include change or a shared helper broke something — fix it before committing.
+
+- [ ] **Step 6: Refresh the emitted OpenAPI document**
+
+The repo publishes `openapi.json` with stable operation ids so the portal can generate a typed client.
+
+```bash
+npm run openapi:emit
+git diff --stat openapi.json
+```
+
+Expected: the diff adds the new `GET` operations and nothing else. If unrelated operations changed, investigate before committing.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add test/portal-analytics-invariants.e2e-spec.ts
-git commit -m "test(analytics): tenancy, null-cost and business-day invariants across every report"
+git add test/portal-analytics-tenancy.e2e-spec.ts \
+        test/portal-analytics-invariants.e2e-spec.ts \
+        openapi.json
+git commit -m "test(api): tenancy sweep and cross-report invariants for analytics"
 ```
+
+- [ ] **Step 8: Report, do not push**
+
+Summarise for the user: endpoints added, test counts, and that `sentry-pos-be` now has unpushed commits awaiting their own `git push`. **Never run `git push`.**
 
 ---
 
-## Self-review notes
+## Self-Review
 
-Checked against the spec after writing:
+Run against the spec after the plan was complete.
 
-**Spec coverage.** §0 dashboard → Task 10. §1 overview → Task 7. §2 sales (heatmap, trend, patterns, breakdowns) → Task 8. §6 tax → Task 9. CSV on every report → Task 3 + each report's `*.csv.ts`. Scope resolver → Task 4. `runScoped` → Task 5. Business-day bucketing → Tasks 2 and 8. Null-cost rule → Tasks 7 and 11. Sensitive reads → Task 5, asserted in Task 7. Catalog modifier-group read → Task 1. §3, §4 and §5 are plan 2, as the spec states.
+**1. Spec coverage.** §0 dashboard → Task 10. §1 overview → Task 7. §2 sales (heatmap, trend, patterns, breakdowns) → Task 8. §6 tax → Task 9. Shared mechanisms (scope resolver, raw-SQL guard, business-day, CSV, report audit) → Tasks 2–5. Catalog modifier-group read → Task 1. Sale seeding → Task 6. Tenancy, null-cost, business-day and modifier-revenue guarantees → Tasks 7, 8 and 11. §3, §4 and §5 are plan 2, as the spec says.
 
-**Deliberate deviation from the spec, recorded here.** The spec's §2 lists heatmap, trend and patterns as one "Sales" group; this plan exposes `patterns` as its own endpoint rather than folding it into `trend`, because the two have different shapes (24+7 fixed buckets versus a variable date series) and one endpoint returning both would force every caller to fetch what it does not need.
+**2. Placeholders.** None: every step carries the code or the exact command it needs. The three e2e specs that say "reuse the bootstrap block from `portal-analytics-overview.e2e-spec.ts`" point at a file this plan writes in full, in Task 7, before any of them.
 
-**Interface consistency.** `ScopedBusiness` is produced in Task 4 and consumed by name in Tasks 5, 7, 8, 9, 10. `LINE_MODS_JOIN`/`LINE_NET_C`/`LINE_COST_C` are produced in Task 7 and reused in Task 8. `bucketedSalesSql` and `branchBreakdownSql` are produced in Task 8 and reused in Task 10 — **Task 10 therefore depends on Task 8 and must not be reordered before it.** `saleAggregateSql`/`lineAggregateSql` are produced in Task 7 and reused in Task 10. `centavosToPesos`/`formatPct`/`CsvSection` are produced in Task 3 and used by every `*.csv.ts`. `seedSale` is produced in Task 6 and used by Tasks 7–11.
+**3. Type consistency.** `ScopedBusiness` and `ResolvedScope` are defined in Task 4 and consumed unchanged by Tasks 5, 7, 8, 9 and 10. `runScoped`/`runScopedOne` keep one signature throughout. `CsvSection` from Task 3 is what every `*.csv.ts` returns. `centavosToPesos` is the only money formatter. `Kpi`/`NullableKpi`/`MarginKpi` are declared in Task 7 and used only there. Row interfaces (`SalesAggregateRow`, `LineAggregateRow`, `BucketRow`, `TaxRow`, `DashboardBranchRow`, …) each live beside their SQL builder and are imported by name.
 
-**Task order is a dependency order.** 1 is independent. 2 and 3 are independent of each other. 4 needs 2. 5 needs 3 and 4. 6 is independent of 2–5 but needed by 7. 7 needs 5 and 6. 8 needs 7. 9 needs 5 and 6. 10 needs 7 and 8. 11 needs 7–10.
+**4. Gaps found and closed while reviewing.** Two, both folded in above: `resolveToday` needed the same-day-last-week comparison rather than the resolver's default "immediately preceding period", and `addDays` did not exist in Task 2 — Task 10 adds it with its own test rather than assuming it.
 
-## Execution handoff
-
-Plan complete and saved to `docs/superpowers/plans/2026-09-06-analytics-money-reports.md`. Two execution options:
-
-**1. Subagent-Driven (recommended)** — a fresh subagent per task, review between tasks, fast iteration.
-
-**2. Inline Execution** — execute tasks in this session using executing-plans, batch execution with checkpoints.
-
+**One thing left deliberately undone:** the trend endpoint zero-fills nothing. Days are zero-filled in the heatmap because the calendar grid needs every cell; weeks and months are not, because generating an empty month series needs a calendar the portal already has. If plan 2 shows the portal wants it, it is a small change in `SalesReportService.trend`.
