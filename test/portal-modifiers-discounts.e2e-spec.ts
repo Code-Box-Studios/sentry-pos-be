@@ -454,4 +454,63 @@ describe('Portal modifiers + discounts (e2e)', () => {
       .set('Authorization', `Bearer ${b.token}`)
       .expect(404);
   });
+
+  it('returns the linked modifier group ids on a product read', async () => {
+    const { token, businessId, productId } = await ctx();
+    const group = await createGroup(token, businessId, milkGroup());
+
+    await request(server())
+      .put(`/v1/portal/products/${productId}/modifier-groups`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ groupIds: [group.id] })
+      .expect(200);
+
+    const res = await request(server())
+      .get(`/v1/portal/products/${productId}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(res.body.modifierGroupIds).toEqual([group.id]);
+  });
+
+  it('reports an empty link set as [] once the links are cleared', async () => {
+    const { token, businessId, productId } = await ctx();
+    const group = await createGroup(token, businessId, milkGroup());
+
+    const link = (groupIds: string[]) =>
+      request(server())
+        .put(`/v1/portal/products/${productId}/modifier-groups`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ groupIds })
+        .expect(200);
+
+    await link([group.id]);
+    await link([]);
+
+    const res = await request(server())
+      .get(`/v1/portal/products/${productId}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(res.body.modifierGroupIds).toEqual([]);
+  });
+
+  it('lists products with their link sets, so the list cannot claim "no groups" wrongly', async () => {
+    const { token, businessId, productId } = await ctx();
+    const group = await createGroup(token, businessId, milkGroup());
+
+    await request(server())
+      .put(`/v1/portal/products/${productId}/modifier-groups`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ groupIds: [group.id] })
+      .expect(200);
+
+    const res = await request(server())
+      .get(`/v1/portal/businesses/${businessId}/products`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    const listed = res.body.find((p: any) => p.id === productId);
+    expect(listed.modifierGroupIds).toEqual([group.id]);
+  });
 });

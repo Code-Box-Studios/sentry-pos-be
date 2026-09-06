@@ -13,17 +13,30 @@ import { assertBusinessOwned } from '../shared/tenant-guards';
 import { CreateProductDto, VariantInputDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 
-type ProductWithVariants = Prisma.ProductGetPayload<{
-  include: { variants: true };
+type ProductWithRelations = Prisma.ProductGetPayload<{
+  include: {
+    variants: true;
+    productModifierGroups: { select: { groupId: true } };
+  };
 }>;
 
 /**
  * Variants load oldest-first within a product (stable display order); products
  * themselves list newest-first (see `list`). The choke point injects
- * `deletedAt: null`, so only live variants come back.
+ * `deletedAt: null`, so only live variants and live links come back.
+ *
+ * `productModifierGroups` is a CHILD_ONLY model — no top-level access — but a
+ * relation include through its scoped parent is exactly how it is meant to be
+ * read. EVERY read path uses this one constant so `modifierGroupIds` is never a
+ * guess: a response saying `[]` because the caller forgot the include would be
+ * indistinguishable from a product that genuinely has no groups.
  */
-const VARIANTS_INCLUDE = {
+const PRODUCT_INCLUDE = {
   variants: { orderBy: { createdAt: 'asc' as const } },
+  productModifierGroups: {
+    select: { groupId: true },
+    orderBy: { createdAt: 'asc' as const },
+  },
 };
 
 export interface VariantResponse {
@@ -55,6 +68,8 @@ export interface ProductResponse {
   updatedAt: Date;
   deletedAt: Date | null;
   variants: VariantResponse[];
+  /** Linked modifier groups, oldest link first. The PUT that sets them is a replace-set. */
+  modifierGroupIds: string[];
 }
 
 function serializeVariant(v: ProductVariant): VariantResponse {
@@ -71,7 +86,12 @@ function serializeVariant(v: ProductVariant): VariantResponse {
 
 /** Map the schema (price/cost centavos, Decimal lowStockThreshold) → the API. */
 function serializeProduct(
-  p: Product & { variants?: ProductVariant[] },
+  p: Product & {
+    variants?: ProductVariant[];
+    // Required, not optional: the compiler is what guarantees every read path
+    // loaded PRODUCT_INCLUDE, so an empty array always means "no groups".
+    productModifierGroups: { groupId: string }[];
+  },
 ): ProductResponse {
   return {
     id: p.id,
@@ -93,6 +113,7 @@ function serializeProduct(
     updatedAt: p.updatedAt,
     deletedAt: p.deletedAt,
     variants: (p.variants ?? []).map(serializeVariant),
+    modifierGroupIds: p.productModifierGroups.map((link) => link.groupId),
   };
 }
 
@@ -156,7 +177,7 @@ export class ProductsService {
     await assertBusinessOwned(this.scoped, businessId);
     const rows = await this.scoped.product.findMany({
       where: { businessId },
-      include: VARIANTS_INCLUDE,
+      include: PRODUCT_INCLUDE,
       orderBy: { createdAt: 'desc' },
     });
     return rows.map(serializeProduct);
@@ -219,7 +240,7 @@ export class ProductsService {
             })),
           },
         },
-        include: VARIANTS_INCLUDE,
+        include: PRODUCT_INCLUDE,
       });
       return serializeProduct(created);
     } catch (err) {
@@ -314,7 +335,13 @@ export class ProductsService {
       return serializeProduct(await this.loadOwned(id));
     }
     const deleted = await this.scoped.product.delete({ where: { id } });
-    return serializeProduct({ ...deleted, variants: current.variants });
+    // The delete response carries no relations, so report the ones the product
+    // held at the moment it went — the same choice `variants` already makes.
+    return serializeProduct({
+      ...deleted,
+      variants: current.variants,
+      productModifierGroups: current.productModifierGroups,
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -435,10 +462,10 @@ export class ProductsService {
     }
   }
 
-  private async loadOwned(id: string): Promise<ProductWithVariants> {
+  private async loadOwned(id: string): Promise<ProductWithRelations> {
     const product = await this.scoped.product.findFirst({
       where: { id },
-      include: VARIANTS_INCLUDE,
+      include: PRODUCT_INCLUDE,
     });
     if (!product) throw new NotFoundError('Product not found.');
     return product;
