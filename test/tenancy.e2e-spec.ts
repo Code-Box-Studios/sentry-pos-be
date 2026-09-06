@@ -885,4 +885,29 @@ describe('Tenancy + audit choke-point extension (e2e)', () => {
     expect(ids).toContain(created.id);
     expect(ids).not.toContain(bNotif.id);
   });
+
+  it('REGRESSION: selecting a TO-ONE relation does not get an illegal `where`', async () => {
+    // Prisma accepts `where` only on a to-MANY relation load. The soft-delete
+    // injector used to add one to every relation, so any query selecting a
+    // to-one relation (e.g. the dashboard's shift -> branch) died with
+    // "Unknown argument `where`". The parent row is already scoped and
+    // soft-delete-filtered, so leaving the to-one unfiltered is correct.
+    const a = await seedOwnerTree('A');
+
+    const rows = await runAs(ownerCtx(a.owner.id), () =>
+      scoped.product.findMany({
+        where: { id: a.product.id },
+        select: {
+          id: true,
+          category: { select: { name: true } },
+          business: { select: { name: true } },
+          variants: { select: { id: true } },
+        },
+      }),
+    );
+
+    expect(rows).toHaveLength(1);
+    expect((rows[0] as any).category.name).toBeDefined();
+    expect((rows[0] as any).business.name).toBeDefined();
+  });
 });

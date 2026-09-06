@@ -90,3 +90,9 @@ export function previousPeriod(
     toUtc: new Date(fromUtc),
   };
 }
+
+/** Shift a `YYYY-MM-DD` date by whole days. Safe: no DST to fall into. */
+export function addDays(date: string, days: number): string {
+  const base = businessDayStartUtc(date, 0).getTime() + days * DAY_MS;
+  return businessDayOf(new Date(base), 0);
+}

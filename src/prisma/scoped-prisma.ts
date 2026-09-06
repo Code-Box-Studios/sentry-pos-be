@@ -87,14 +87,26 @@ function camel(name: string): string {
   return name.charAt(0).toLowerCase() + name.slice(1);
 }
 
+/**
+ * modelName(camel) -> (relationFieldName -> is this relation a LIST?).
+ *
+ * Load-bearing for nested soft-delete: Prisma accepts `where` on a to-MANY
+ * relation load only. Putting one on a to-one relation is a
+ * PrismaClientValidationError ("Unknown argument `where`"), so the injector
+ * below has to know which is which.
+ */
+const RELATION_IS_LIST: Record<string, Record<string, boolean>> = {};
+
 for (const model of Prisma.dmmf.datamodel.models) {
   const key = camel(model.name);
   const rels: Record<string, string> = {};
+  const lists: Record<string, boolean> = {};
   const fks: FkRef[] = [];
   for (const field of model.fields) {
     if (field.kind === 'object') {
       const target = camel(field.type);
       rels[field.name] = target;
+      lists[field.name] = field.isList;
       const from = field.relationFromFields ?? [];
       // Single-column belongs-to FKs (all FKs in this schema are single-column).
       if (from.length === 1) {
@@ -103,6 +115,7 @@ for (const model of Prisma.dmmf.datamodel.models) {
     }
   }
   RELATION_TARGET[key] = rels;
+  RELATION_IS_LIST[key] = lists;
   FK_REFS[key] = fks;
 }
 
@@ -311,6 +324,20 @@ function injectNestedSoftDelete(
 ): AnyArgs | undefined {
   if (!args) return args;
   const rels = RELATION_TARGET[model] ?? {};
+  const lists = RELATION_IS_LIST[model] ?? {};
+
+  /**
+   * A `where` filter is only legal on a to-MANY relation load. A to-one
+   * relation (`shift.branch`, `saleItem.sale`) takes no `where` at all, and
+   * adding one throws PrismaClientValidationError. So to-one relations are
+   * loaded unfiltered: a soft-deleted parent still resolves through them.
+   *
+   * That is acceptable because the PARENT row is already scoped and
+   * soft-delete-filtered by the caller's own query — you cannot reach a
+   * to-one relation without first matching a live row that points at it.
+   */
+  const filterable = (relField: string, targetModel: string): boolean =>
+    lists[relField] === true && SOFT_DELETABLE.has(targetModel);
 
   const walkClause = (clause: AnyArgs): AnyArgs => {
     const out: AnyArgs = {};
@@ -319,7 +346,7 @@ function injectNestedSoftDelete(
       if (targetModel && value && typeof value === 'object') {
         // Nested relation load: value is `true` or an args object.
         const nested: AnyArgs = value === true ? {} : { ...value };
-        if (SOFT_DELETABLE.has(targetModel)) {
+        if (filterable(key, targetModel)) {
           nested.where = mergeDeletedNull(nested.where);
         }
         // Recurse into the nested relation's own include/select.
@@ -327,7 +354,7 @@ function injectNestedSoftDelete(
         out[key] = deeper;
       } else if (targetModel && value === true) {
         // Relation requested with `true` — expand to args carrying the filter.
-        if (SOFT_DELETABLE.has(targetModel)) {
+        if (filterable(key, targetModel)) {
           out[key] = { where: { deletedAt: null } };
         } else {
           out[key] = true;

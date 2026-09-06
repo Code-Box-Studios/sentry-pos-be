@@ -1,4 +1,5 @@
 import {
+  addDays,
   businessDayOf,
   businessDayRangeUtc,
   businessDaySeries,
@@ -102,5 +103,13 @@ describe('previousPeriod', () => {
     const prev = previousPeriod(fromUtc, toUtc);
     expect(prev.toUtc).toEqual(fromUtc);
     expect(prev.fromUtc.toISOString()).toBe('2026-03-01T16:00:00.000Z');
+  });
+});
+
+describe('addDays', () => {
+  it('moves forward and backward across a month boundary', () => {
+    expect(addDays('2026-03-01', -1)).toBe('2026-02-28');
+    expect(addDays('2026-02-28', 1)).toBe('2026-03-01');
+    expect(addDays('2026-03-08', -7)).toBe('2026-03-01');
   });
 });

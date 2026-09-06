@@ -9,8 +9,11 @@ import {
 } from '../../../common/errors/api-errors';
 import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
 import {
+  addDays,
+  businessDayOf,
   businessDayRangeUtc,
   businessDaySeries,
+  businessDayStartUtc,
   parseDayStart,
   previousPeriod,
 } from './business-day';
@@ -141,6 +144,79 @@ export class AnalyticsScopeService {
       from: query.from,
       to: query.to,
       dayCount: days.length,
+    };
+  }
+
+  /**
+   * The dashboard's scope: every non-demo business, each windowed on ITS OWN
+   * today.
+   *
+   * "Today" is not one date across a tenant — at 3 AM a midnight retailer is
+   * already on the new business day while an 04:00 cafe is still on yesterday's.
+   * So each business gets `businessDayOf(now, its own day start)`.
+   *
+   * `previousFromUtc`/`previousToUtc` here mean the SAME BUSINESS DAY ONE WEEK
+   * EARLIER, not the immediately preceding period — that is the comparison
+   * analytics-spec §0 asks for, and weekday-to-weekday is the only fair one for
+   * a single day.
+   *
+   * `from`/`to` carry the first business's today and exist only so the audit
+   * rows say which day was viewed.
+   */
+  async resolveToday(now: Date): Promise<ResolvedScope> {
+    const businesses = await this.scoped.business.findMany({
+      where: { isDemo: false },
+      select: { id: true, name: true, dayStartTime: true, taxRate: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    const branches = await this.scoped.branch.findMany({
+      where: { businessId: { in: businesses.map((b) => b.id) } },
+      select: { id: true, businessId: true },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const byBusiness = new Map<string, string[]>();
+    for (const branch of branches) {
+      const list = byBusiness.get(branch.businessId);
+      if (list) list.push(branch.id);
+      else byBusiness.set(branch.businessId, [branch.id]);
+    }
+
+    const scopedBusinesses: ScopedBusiness[] = [];
+    for (const business of businesses) {
+      const branchIds = byBusiness.get(business.id);
+      if (!branchIds || branchIds.length === 0) continue;
+
+      const dayStartMinutes = parseDayStart(business.dayStartTime);
+      const today = businessDayOf(now, dayStartMinutes);
+      const lastWeek = addDays(today, -7);
+
+      scopedBusinesses.push({
+        id: business.id,
+        name: business.name,
+        dayStartTime: business.dayStartTime,
+        dayStartMinutes,
+        taxRate: Number(business.taxRate),
+        branchIds,
+        fromUtc: businessDayStartUtc(today, dayStartMinutes),
+        toUtc: businessDayStartUtc(addDays(today, 1), dayStartMinutes),
+        previousFromUtc: businessDayStartUtc(lastWeek, dayStartMinutes),
+        previousToUtc: businessDayStartUtc(
+          addDays(lastWeek, 1),
+          dayStartMinutes,
+        ),
+      });
+    }
+
+    const first = scopedBusinesses[0];
+    const stamp = businessDayOf(now, first ? first.dayStartMinutes : 0);
+
+    return {
+      businesses: scopedBusinesses,
+      branchIds: scopedBusinesses.flatMap((b) => b.branchIds),
+      from: stamp,
+      to: stamp,
+      dayCount: 1,
     };
   }
 }
