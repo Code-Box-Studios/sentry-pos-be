@@ -218,7 +218,7 @@ All under `/v1/portal`, all gated by `PortalAuthGuard`, all `GET`.
 ```ts
 class AnalyticsQueryDto {
   businessId?: string;   // uuid; omit for all non-demo businesses
-  branchId?: string;     // uuid; 400 unless businessId is also given
+  branchId?: string;     // uuid; 422 unless businessId is also given
   from: string;          // YYYY-MM-DD, business-day, inclusive — required
   to: string;            // YYYY-MM-DD, business-day, inclusive — required
   format?: 'json' | 'csv';   // default json
@@ -228,7 +228,7 @@ class AnalyticsQueryDto {
 Range presets (today / yesterday / 7 days / 30 days / this month) resolve **in
 the portal**, not the API: the API takes explicit dates only, which keeps it
 testable and keeps "what is today" a single question answered against the
-business day. `to` before `from` is a 400; a range longer than 366 days is a 400.
+business day. `to` before `from` is a 422; a range longer than 366 days is a 422.
 
 ### §0 Dashboard — `GET /dashboard`
 
@@ -405,9 +405,9 @@ Uses the established `api-errors` classes and the existing exception filter.
 
 | Case | Response |
 |---|---|
-| `branchId` without `businessId` | 400 `validation` |
-| `to` < `from`, or range > 366 days | 400 `validation` |
-| Malformed date, bad `granularity`/`by`/`format`/`type` | 400 `validation` |
+| `branchId` without `businessId` | 422 `validation` |
+| `to` < `from`, or range > 366 days | 422 `validation` |
+| Malformed date, bad `granularity`/`by`/`format`/`type` | 422 `validation` |
 | `businessId` or `branchId` not owned, or soft-deleted | 404 `not_found` — no existence leak |
 | Owner suspended | handled upstream by `PortalAuthGuard`, unchanged |
 
