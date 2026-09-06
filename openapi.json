@@ -1358,6 +1358,104 @@
         ]
       }
     },
+    "/v1/portal/dashboard": {
+      "get": {
+        "operationId": "DashboardController_get",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Dashboard"
+        ]
+      }
+    },
+    "/v1/portal/analytics/overview": {
+      "get": {
+        "operationId": "OverviewController_get",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Overview"
+        ]
+      }
+    },
+    "/v1/portal/analytics/sales/heatmap": {
+      "get": {
+        "operationId": "SalesReportController_heatmap",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "SalesReport"
+        ]
+      }
+    },
+    "/v1/portal/analytics/sales/trend": {
+      "get": {
+        "operationId": "SalesReportController_trend",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "SalesReport"
+        ]
+      }
+    },
+    "/v1/portal/analytics/sales/patterns": {
+      "get": {
+        "operationId": "SalesReportController_patterns",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "SalesReport"
+        ]
+      }
+    },
+    "/v1/portal/analytics/sales/breakdowns": {
+      "get": {
+        "operationId": "SalesReportController_breakdowns",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "SalesReport"
+        ]
+      }
+    },
+    "/v1/portal/analytics/tax": {
+      "get": {
+        "operationId": "TaxReportController_get",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "TaxReport"
+        ]
+      }
+    },
     "/v1/pos/pairing/sign-in": {
       "post": {
         "operationId": "ownerSignIn",
