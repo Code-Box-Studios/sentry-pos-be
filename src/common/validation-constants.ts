@@ -8,3 +8,6 @@ export const HHMM_REGEX = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 /** Branch code: 2–6 uppercase letters or digits, unique per business. */
 export const BRANCH_CODE_REGEX = /^[A-Z0-9]{2,6}$/;
+
+/** `YYYY-MM-DD` calendar date (e.g. an analytics range endpoint). */
+export const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
