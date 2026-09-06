@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '../../auth/auth.module';
 import { AnalyticsScopeService } from './scope/analytics-scope.service';
 import { ReportAuditService } from './report-audit.service';
+import { OverviewController } from './overview/overview.controller';
+import { OverviewService } from './overview/overview.service';
 
 /**
  * Analytics (tenant scope) — `analytics-spec.md`. Controllers arrive one report
@@ -13,7 +15,7 @@ import { ReportAuditService } from './report-audit.service';
  */
 @Module({
   imports: [AuthModule],
-  controllers: [],
-  providers: [AnalyticsScopeService, ReportAuditService],
+  controllers: [OverviewController],
+  providers: [AnalyticsScopeService, ReportAuditService, OverviewService],
 })
 export class AnalyticsModule {}

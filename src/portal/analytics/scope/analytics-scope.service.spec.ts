@@ -42,8 +42,11 @@ const cafe: BusinessRow = {
   taxRate: new Prisma.Decimal('0.12'),
 };
 
-const query = (over: Partial<AnalyticsQueryDto> = {}): AnalyticsQueryDto =>
-  ({ from: '2026-03-01', to: '2026-03-07', ...over }) as AnalyticsQueryDto;
+const query = (over: Partial<AnalyticsQueryDto> = {}): AnalyticsQueryDto => ({
+  from: '2026-03-01',
+  to: '2026-03-07',
+  ...over,
+});
 
 describe('AnalyticsScopeService.resolve', () => {
   it('rejects a branchId without a businessId', async () => {

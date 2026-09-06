@@ -50,9 +50,9 @@ describe('runScoped', () => {
 describe('runScopedOne', () => {
   it('returns the single row an aggregate produces', async () => {
     const { raw } = fakeRaw([{ n: 1 }]);
-    await expect(runScopedOne(raw, business(['br-1']), scopedSql)).resolves.toEqual(
-      { n: 1 },
-    );
+    await expect(
+      runScopedOne(raw, business(['br-1']), scopedSql),
+    ).resolves.toEqual({ n: 1 });
   });
 
   it('throws when a query meant to aggregate returns more than one row', async () => {
