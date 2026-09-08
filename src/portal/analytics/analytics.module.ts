@@ -10,6 +10,8 @@ import { TaxReportController } from './tax/tax-report.controller';
 import { TaxReportService } from './tax/tax-report.service';
 import { DashboardController } from './dashboard/dashboard.controller';
 import { DashboardService } from './dashboard/dashboard.service';
+import { ProductsReportController } from './products/products-report.controller';
+import { ProductsReportService } from './products/products-report.service';
 
 /**
  * Analytics (tenant scope) — `analytics-spec.md`. Controllers arrive one report
@@ -26,6 +28,7 @@ import { DashboardService } from './dashboard/dashboard.service';
     OverviewController,
     SalesReportController,
     TaxReportController,
+    ProductsReportController,
   ],
   providers: [
     AnalyticsScopeService,
@@ -34,6 +37,7 @@ import { DashboardService } from './dashboard/dashboard.service';
     SalesReportService,
     TaxReportService,
     DashboardService,
+    ProductsReportService,
   ],
 })
 export class AnalyticsModule {}

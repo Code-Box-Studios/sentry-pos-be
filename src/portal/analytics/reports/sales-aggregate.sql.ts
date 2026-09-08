@@ -1,5 +1,6 @@
 import { Prisma } from '@prisma/client';
 import type { ScopedBusiness } from '../scope/analytics-scope.service';
+import { LINE_COST_C, LINE_MONEY_JOINS, LINE_NET_C } from './line-money.sql';
 
 /**
  * The two aggregates every money report is built from.
@@ -79,24 +80,15 @@ export function lineAggregateSql(
   return Prisma.sql`
     SELECT
       COUNT(*) FILTER (WHERE si.cost_snapshot IS NOT NULL)::bigint AS costed_lines,
-      COALESCE(SUM(line.net_c) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+      COALESCE(SUM(${LINE_NET_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
         AS costed_revenue_c,
-      COALESCE(SUM(round(si.qty * si.cost_snapshot)) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+      COALESCE(SUM(${LINE_COST_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
         AS costed_cost_c,
-      COALESCE(SUM(line.net_c) FILTER (WHERE si.cost_snapshot IS NULL), 0)::bigint
+      COALESCE(SUM(${LINE_NET_C}) FILTER (WHERE si.cost_snapshot IS NULL), 0)::bigint
         AS uncosted_revenue_c
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
-    CROSS JOIN LATERAL (
-      SELECT COALESCE(SUM((m->>'priceDeltaC')::int), 0) AS mods_c
-      FROM jsonb_array_elements(
-        CASE WHEN jsonb_typeof(si.modifiers) = 'array'
-             THEN si.modifiers ELSE '[]'::jsonb END
-      ) AS m
-    ) mods
-    CROSS JOIN LATERAL (
-      SELECT round(si.qty * (si.unit_price + mods.mods_c)) - si.discount AS net_c
-    ) line
+    ${LINE_MONEY_JOINS}
     WHERE s.branch_id = ANY(${business.branchIds}::uuid[])
       AND s.deleted_at IS NULL
       AND si.deleted_at IS NULL
