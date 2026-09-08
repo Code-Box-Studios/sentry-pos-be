@@ -6,6 +6,7 @@ import {
   LINE_NET_C,
   completedLinesInWindow,
 } from './line-money.sql';
+import { bucketExpr, type Granularity } from './sales-series.sql';
 
 /**
  * Per-product sold aggregates (analytics-spec §3), with the per-category rollup
@@ -134,5 +135,45 @@ export function zeroSalesSql(business: ScopedBusiness): Prisma.Sql {
           AND s.created_at <  ${business.toUtc}
       )
     ORDER BY p.name ASC
+  `;
+}
+
+export interface ProductTrendRow {
+  bucket: Date;
+  units: number;
+  revenue_c: bigint;
+  costed_lines: bigint;
+  costed_revenue_c: bigint;
+  costed_cost_c: bigint;
+}
+
+/**
+ * One product's sales per bucket, variants MERGED.
+ *
+ * The top-sellers list splits variants because that is what sells; this
+ * drill-down deliberately does not, because the question it answers is "how is
+ * this product doing", not "how is this SKU doing".
+ */
+export function productTrendSql(
+  business: ScopedBusiness,
+  productId: string,
+  granularity: Granularity,
+): Prisma.Sql {
+  return Prisma.sql`
+    SELECT
+      ${bucketExpr(business, granularity)} AS bucket,
+      COALESCE(SUM(si.qty), 0)::float8 AS units,
+      COALESCE(SUM(${LINE_NET_C}), 0)::bigint AS revenue_c,
+      COUNT(*) FILTER (WHERE si.cost_snapshot IS NOT NULL)::bigint AS costed_lines,
+      COALESCE(SUM(${LINE_NET_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+        AS costed_revenue_c,
+      COALESCE(SUM(${LINE_COST_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+        AS costed_cost_c
+    FROM sale_items si
+    JOIN sales s ON s.id = si.sale_id
+    ${LINE_MONEY_JOINS}
+    WHERE ${completedLinesInWindow(business)}
+      AND si.product_id = ${productId}::uuid
+    GROUP BY 1
   `;
 }

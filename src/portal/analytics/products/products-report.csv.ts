@@ -1,5 +1,6 @@
 import { centavosToPesos, type CsvSection } from '../csv';
 import type {
+  ProductTrendReport,
   SlowProductsReport,
   SoldRow,
   TopProductsReport,
@@ -48,6 +49,21 @@ export function slowProductsCsv(report: SlowProductsReport): CsvSection[] {
       title: 'No sales in this period',
       columns: ['Product', 'Category'],
       rows: report.zeroSales.map((z) => [z.name, z.categoryName]),
+    },
+  ];
+}
+
+export function productTrendCsv(report: ProductTrendReport): CsvSection[] {
+  return [
+    {
+      columns: ['Bucket', 'Units', 'Revenue', 'Gross profit', 'Margin %'],
+      rows: report.buckets.map((b) => [
+        b.bucket,
+        b.units,
+        centavosToPesos(b.revenueC),
+        centavosToPesos(b.grossProfitC),
+        asPercent(b.marginPct),
+      ]),
     },
   ];
 }

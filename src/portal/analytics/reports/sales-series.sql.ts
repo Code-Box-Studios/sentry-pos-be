@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { MANILA_OFFSET_MINUTES } from '../scope/business-day';
 import type { ScopedBusiness } from '../scope/analytics-scope.service';
+import { LINE_COST_C, LINE_MONEY_JOINS, LINE_NET_C } from './line-money.sql';
 
 /**
  * Bucketed sales queries (analytics-spec §2).
@@ -52,8 +53,15 @@ export function heatmapSql(business: ScopedBusiness): Prisma.Sql {
 
 export type Granularity = 'day' | 'week' | 'month';
 
-/** `date_trunc` on the bucket date. Postgres weeks start Monday, as §2 asks. */
-function truncated(
+/**
+ * `date_trunc` on the business-day date. Postgres weeks start Monday, as §2
+ * asks.
+ *
+ * Exported because §3's per-product trend and §4's profit-over-time bucket the
+ * same way. Three reports quietly disagreeing about what a "week" is would be a
+ * bug nobody could see.
+ */
+export function bucketExpr(
   business: ScopedBusiness,
   granularity: Granularity,
 ): Prisma.Sql {
@@ -66,7 +74,7 @@ export function trendSalesSql(
   granularity: Granularity,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT ${truncated(business, granularity)} AS bucket,
+    SELECT ${bucketExpr(business, granularity)} AS bucket,
            COALESCE(SUM(${NET_SALES}), 0)::bigint AS sales_c,
            COUNT(*)::bigint AS transactions
     FROM sales s
@@ -92,24 +100,15 @@ export function trendLinesSql(
   granularity: Granularity,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT ${truncated(business, granularity)} AS bucket,
+    SELECT ${bucketExpr(business, granularity)} AS bucket,
            COUNT(*) FILTER (WHERE si.cost_snapshot IS NOT NULL)::bigint AS costed_lines,
-           COALESCE(SUM(line.net_c) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+           COALESCE(SUM(${LINE_NET_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
              AS costed_revenue_c,
-           COALESCE(SUM(round(si.qty * si.cost_snapshot)) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
+           COALESCE(SUM(${LINE_COST_C}) FILTER (WHERE si.cost_snapshot IS NOT NULL), 0)::bigint
              AS costed_cost_c
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
-    CROSS JOIN LATERAL (
-      SELECT COALESCE(SUM((m->>'priceDeltaC')::int), 0) AS mods_c
-      FROM jsonb_array_elements(
-        CASE WHEN jsonb_typeof(si.modifiers) = 'array'
-             THEN si.modifiers ELSE '[]'::jsonb END
-      ) AS m
-    ) mods
-    CROSS JOIN LATERAL (
-      SELECT round(si.qty * (si.unit_price + mods.mods_c)) - si.discount AS net_c
-    ) line
+    ${LINE_MONEY_JOINS}
     WHERE ${completedInWindow(business)}
       AND si.deleted_at IS NULL
     GROUP BY 1

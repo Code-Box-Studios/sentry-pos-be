@@ -446,4 +446,123 @@ describe('Portal analytics — products (e2e)', () => {
     expect(res.headers['content-type']).toContain('text/csv');
     expect(res.text).toContain('Latte,2,240.00');
   });
+  const trend = (
+    token: string,
+    productId: string,
+    query: Record<string, string> = {},
+  ) =>
+    request(server())
+      .get(`/v1/portal/analytics/products/${productId}/trend`)
+      .query({ ...RANGE, ...query })
+      .set('Authorization', `Bearer ${token}`);
+
+  it('reports one product units, revenue and margin per bucket', async () => {
+    const t = await seedTenant();
+    const category = await seedCategory(t.businessId);
+    const latte = await seedProduct(t.businessId, category.id, 'Latte', {
+      price: 12000,
+    });
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [
+        {
+          name: 'Latte',
+          productId: latte.id,
+          qty: 2,
+          unitPriceC: 12000,
+          costC: 4000,
+        },
+      ],
+    });
+
+    const res = await trend(t.token, latte.id, {
+      businessId: t.businessId,
+      granularity: 'day',
+    }).expect(200);
+
+    const day = res.body.buckets.find((b: any) => b.bucket === '2026-03-02');
+    expect(day).toMatchObject({
+      units: 2,
+      revenueC: 24000,
+      grossProfitC: 16000,
+    });
+    // Margins are FRACTIONS, matching overview.math.
+    expect(day.marginPct).toBeCloseTo(16000 / 24000);
+  });
+
+  it('merges variants into the product trend', async () => {
+    const t = await seedTenant();
+    const category = await seedCategory(t.businessId);
+    const latte = await seedProduct(t.businessId, category.id, 'Latte', {
+      price: 12000,
+    });
+    const large = await raw.productVariant.create({
+      data: { productId: latte.id, name: 'Large', price: 14000 },
+    });
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [
+        { name: 'Latte', productId: latte.id, qty: 1, unitPriceC: 12000 },
+        {
+          name: 'Latte — Large',
+          productId: latte.id,
+          variantId: large.id,
+          qty: 1,
+          unitPriceC: 14000,
+        },
+      ],
+    });
+
+    const res = await trend(t.token, latte.id, {
+      businessId: t.businessId,
+      granularity: 'day',
+    }).expect(200);
+
+    const day = res.body.buckets.find((b: any) => b.bucket === '2026-03-02');
+    expect(day).toMatchObject({ units: 2, revenueC: 26000 });
+  });
+
+  it('zero-fills days with no sales of that product', async () => {
+    const t = await seedTenant();
+    const category = await seedCategory(t.businessId);
+    const latte = await seedProduct(t.businessId, category.id, 'Latte', {
+      price: 12000,
+    });
+
+    const res = await trend(t.token, latte.id, {
+      businessId: t.businessId,
+      granularity: 'day',
+    }).expect(200);
+
+    expect(res.body.buckets).toHaveLength(7);
+    expect(res.body.buckets[0]).toEqual({
+      bucket: '2026-03-01',
+      units: 0,
+      revenueC: 0,
+      grossProfitC: null,
+      marginPct: null,
+    });
+  });
+
+  it('404s for a product the caller does not own', async () => {
+    const mine = await seedTenant();
+    const theirs = await seedTenant();
+    const category = await seedCategory(theirs.businessId);
+    const notMine = await seedProduct(theirs.businessId, category.id, 'X');
+
+    await trend(mine.token, notMine.id, {
+      businessId: mine.businessId,
+    }).expect(404);
+  });
+
+  it('422s on a productId that is not a uuid', async () => {
+    const t = await seedTenant();
+    await trend(t.token, 'not-a-uuid', { businessId: t.businessId }).expect(
+      422,
+    );
+  });
 });
