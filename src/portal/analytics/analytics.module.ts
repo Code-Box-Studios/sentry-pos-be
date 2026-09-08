@@ -12,6 +12,8 @@ import { DashboardController } from './dashboard/dashboard.controller';
 import { DashboardService } from './dashboard/dashboard.service';
 import { ProductsReportController } from './products/products-report.controller';
 import { ProductsReportService } from './products/products-report.service';
+import { ProfitReportController } from './profit/profit-report.controller';
+import { ProfitReportService } from './profit/profit-report.service';
 
 /**
  * Analytics (tenant scope) — `analytics-spec.md`. Controllers arrive one report
@@ -29,6 +31,7 @@ import { ProductsReportService } from './products/products-report.service';
     SalesReportController,
     TaxReportController,
     ProductsReportController,
+    ProfitReportController,
   ],
   providers: [
     AnalyticsScopeService,
@@ -38,6 +41,7 @@ import { ProductsReportService } from './products/products-report.service';
     TaxReportService,
     DashboardService,
     ProductsReportService,
+    ProfitReportService,
   ],
 })
 export class AnalyticsModule {}
