@@ -84,7 +84,7 @@ The "what sells" and "restock-or-retire" lists. This task also builds the per-pr
 **Interfaces:**
 - Consumes: `ScopedBusiness`, `ResolvedScope`, `AnalyticsScopeService.resolve` (`scope/analytics-scope.service.ts`); `runScoped` (`scoped-sql.ts`); `renderReport` (`report-response.ts`); `ReportAuditService.log`; `centavosToPesos`, `CsvSection` (`csv.ts`); `grossProfitC`, `marginPct` (`overview/overview.math.ts`).
 - Produces:
-  - `MODS_LATERAL`, `LINE_NET_LATERAL` — the two shared lateral blocks, exported for §4 to reuse
+  - `LINE_MONEY_JOINS`/`LINE_NET_C`/`LINE_COST_C` (shared, in `reports/line-money.sql.ts`) — the two shared lateral blocks, exported for §4 to reuse
   - `productSalesSql(business): Prisma.Sql`, `ProductSalesRow`
   - `categorySalesSql(business): Prisma.Sql`, `CategorySalesRow`
   - `zeroSalesSql(business): Prisma.Sql`, `ZeroSalesRow`
@@ -462,37 +462,18 @@ import type { ScopedBusiness } from '../scope/analytics-scope.service';
  * ranking/display figures. Money stays integer centavos.
  */
 
-/** Sum of the chosen modifiers' price deltas for a `sale_items` row. */
-export const MODS_LATERAL = Prisma.sql`
-  CROSS JOIN LATERAL (
-    SELECT COALESCE(SUM((m->>'priceDeltaC')::int), 0) AS mods_c
-    FROM jsonb_array_elements(
-      CASE WHEN jsonb_typeof(si.modifiers) = 'array'
-           THEN si.modifiers ELSE '[]'::jsonb END
-    ) AS m
-  ) mods
-`;
+The modifier-aware line arithmetic and the completed-lines predicate already
+live in `src/portal/analytics/reports/line-money.sql.ts` — import them rather
+than writing a second copy:
 
-/**
- * Line net revenue. MUST follow `MODS_LATERAL` — `unit_price` is the base price
- * and the priced modifiers live in the jsonb (`sales.service.ts:507`), so
- * `qty * unit_price` alone understates every line that has one.
- */
-export const LINE_NET_LATERAL = Prisma.sql`
-  CROSS JOIN LATERAL (
-    SELECT round(si.qty * (si.unit_price + mods.mods_c)) - si.discount AS net_c
-  ) line
-`;
-
-/** Completed, live sale items for this business's branches and window. */
-const SOLD_IN_WINDOW = (business: ScopedBusiness): Prisma.Sql => Prisma.sql`
-  s.branch_id = ANY(${business.branchIds}::uuid[])
-  AND s.deleted_at IS NULL
-  AND si.deleted_at IS NULL
-  AND s.status = 'completed'
-  AND s.created_at >= ${business.fromUtc}
-  AND s.created_at <  ${business.toUtc}
-`;
+```ts
+import {
+  LINE_COST_C,
+  LINE_MONEY_JOINS,
+  LINE_NET_C,
+  completedLinesInWindow,
+} from './line-money.sql';
+```
 
 export interface ProductSalesRow {
   product_id: string;
@@ -520,9 +501,8 @@ export function productSalesSql(business: ScopedBusiness): Prisma.Sql {
         AS costed_cost_c
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
-    ${MODS_LATERAL}
-    ${LINE_NET_LATERAL}
-    WHERE ${SOLD_IN_WINDOW(business)}
+    ${LINE_MONEY_JOINS}
+    WHERE ${completedLinesInWindow(business)}
       AND si.product_id IS NOT NULL
     GROUP BY si.product_id, si.variant_id
   `;
@@ -546,9 +526,8 @@ export function categorySalesSql(business: ScopedBusiness): Prisma.Sql {
     JOIN sales s ON s.id = si.sale_id
     JOIN products p ON p.id = si.product_id
     JOIN categories c ON c.id = p.category_id
-    ${MODS_LATERAL}
-    ${LINE_NET_LATERAL}
-    WHERE ${SOLD_IN_WINDOW(business)}
+    ${LINE_MONEY_JOINS}
+    WHERE ${completedLinesInWindow(business)}
       AND si.product_id IS NOT NULL
     GROUP BY c.id, c.name
   `;
@@ -961,7 +940,7 @@ In `src/portal/analytics/analytics.module.ts` add `ProductsReportController` to 
 npm run test:e2e -- portal-analytics-products
 ```
 
-Expected: PASS. If a Latte row reads 24000 instead of 28000, `MODS_LATERAL` is missing from that query.
+Expected: PASS. If a Latte row reads 24000 instead of 28000, `LINE_MONEY_JOINS` is missing from that query.
 
 - [ ] **Step 9: Commit**
 
@@ -1140,9 +1119,8 @@ export function productTrendSql(
         AS costed_cost_c
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
-    ${MODS_LATERAL}
-    ${LINE_NET_LATERAL}
-    WHERE ${SOLD_IN_WINDOW(business)}
+    ${LINE_MONEY_JOINS}
+    WHERE ${completedLinesInWindow(business)}
       AND si.product_id = ${productId}::uuid
     GROUP BY 1
   `;
@@ -1811,7 +1789,7 @@ Where the money goes that isn't cost: discounts, SC/PWD, misc rings, voids, refu
 - Test: `test/portal-analytics-profit.e2e-spec.ts`
 
 **Interfaces:**
-- Consumes: `MODS_LATERAL`, `LINE_NET_LATERAL` (Task 1); `salesAggregateSql` (`sales-aggregate.sql.ts`); `runScoped`, `runScopedOne`.
+- Consumes: `LINE_MONEY_JOINS`/`LINE_NET_C`/`LINE_COST_C` (shared, in `reports/line-money.sql.ts`) (Task 1); `salesAggregateSql` (`sales-aggregate.sql.ts`); `runScoped`, `runScopedOne`.
 - Produces:
   - `discountTotalsSql`, `lineDiscountsSql`, `orderDiscountsSql`, `miscLinesSql`, `statusValueSql`, `overShortSql` with their row types
   - `interface LeaksReport`
@@ -2029,7 +2007,7 @@ Create `src/portal/analytics/reports/leaks.sql.ts`:
 ```ts
 import { Prisma } from '@prisma/client';
 import type { ScopedBusiness } from '../scope/analytics-scope.service';
-import { LINE_NET_LATERAL, MODS_LATERAL } from './product-sales.sql';
+import { LINE_MONEY_JOINS, LINE_NET_C } from './line-money.sql';
 
 /**
  * The leaks queries (analytics-spec §4).
@@ -2139,8 +2117,7 @@ export function miscLinesSql(business: ScopedBusiness): Prisma.Sql {
     SELECT COALESCE(SUM(line.net_c), 0)::bigint AS revenue_c
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
-    ${MODS_LATERAL}
-    ${LINE_NET_LATERAL}
+    ${LINE_MONEY_JOINS}
     WHERE ${COMPLETED(business)}
       AND si.deleted_at IS NULL
       AND si.product_id IS NULL
@@ -3664,9 +3641,9 @@ git commit -m "test(api): extend the analytics tenancy sweep to product, profit 
 4. Over/short windows on `closed_at`, not `created_at`.
 5. `orderLevelDiscountC` is derived (`sales.discount − (Σ line discounts − sc_pwd_discount)`) because the engine never stores it separately.
 
-**Interface consistency.** `MODS_LATERAL`/`LINE_NET_LATERAL` are produced in Task 1 and reused in Tasks 2 and 4. `bucketExpr` is exported in Task 2 and reused in Task 3. `categorySalesSql` gains costed columns in Task 3, which Task 1's consumer ignores. `runScopedOne` (existing) is used for every single-row aggregate. Margins are fractions everywhere, matching `overview.math`.
+**Interface consistency.** `LINE_MONEY_JOINS`/`LINE_NET_C`/`LINE_COST_C` come from the existing `reports/line-money.sql.ts` and are reused by Tasks 1, 2 and 4. `bucketExpr` is exported in Task 2 and reused in Task 3. `categorySalesSql` gains costed columns in Task 3, which Task 1's consumer ignores. `runScopedOne` (existing) is used for every single-row aggregate. Margins are fractions everywhere, matching `overview.math`.
 
-**Task order is a dependency order.** 1 → 2 (needs `MODS_LATERAL`, `SOLD_IN_WINDOW`). 1, 2 → 3 (needs `productSalesSql`, `categorySalesSql`, `bucketExpr`). 1 → 4 (needs the laterals). 5 → 6 → 7 (same file and service, built up). All → 8.
+**Task order is a dependency order.** 1 → 2 (needs `productSalesSql`). 1, 2 → 3 (needs `productSalesSql`, `categorySalesSql`, `bucketExpr`). 1 → 4 (needs the laterals). 5 → 6 → 7 (same file and service, built up). All → 8.
 
 ## Execution handoff
 
