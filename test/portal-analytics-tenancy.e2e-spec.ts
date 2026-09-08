@@ -32,7 +32,18 @@ const ENDPOINTS = [
   'analytics/sales/patterns',
   'analytics/sales/breakdowns',
   'analytics/tax',
+  'analytics/products/top',
+  'analytics/products/slow',
+  'analytics/profit',
+  'analytics/leaks',
+  'analytics/inventory/movements',
+  'analytics/inventory/shrinkage',
+  'analytics/inventory/on-hand',
 ];
+
+// `analytics/products/:productId/trend` is deliberately absent: it needs a
+// product id, so its ownership case lives in the products spec, where a foreign
+// product id asserts 404.
 
 describe('Portal analytics — tenancy (e2e)', () => {
   let app: INestApplication;
