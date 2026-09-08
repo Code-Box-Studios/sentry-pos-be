@@ -259,4 +259,237 @@ describe('Portal analytics — profit & leaks (e2e)', () => {
     expect(res.headers['content-type']).toContain('text/csv');
     expect(res.text).toContain('Uncosted,50.00,,,');
   });
+
+  const leaks = (token: string, query: Record<string, string> = {}) =>
+    request(server())
+      .get('/v1/portal/analytics/leaks')
+      .query({ ...RANGE, ...query })
+      .set('Authorization', `Bearer ${token}`);
+
+  it('attributes a named line discount to its name', async () => {
+    const t = await seedTenant();
+    const discount = await raw.discount.create({
+      data: {
+        businessId: t.businessId,
+        name: 'Staff 10%',
+        kind: 'percent',
+        value: 10,
+        appliesTo: 'line',
+      },
+    });
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [
+        {
+          name: 'Latte',
+          qty: 1,
+          unitPriceC: 10000,
+          discount: {
+            source: 'named',
+            discountId: discount.id,
+            name: 'Staff 10%',
+            kind: 'percent',
+            value: 10,
+          },
+        },
+      ],
+    });
+
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+
+    expect(res.body.discountsByName).toEqual([
+      expect.objectContaining({
+        discountId: discount.id,
+        name: 'Staff 10%',
+        timesUsed: 1,
+        amountC: 1000,
+      }),
+    ]);
+  });
+
+  it('reports the order-level discount as the unattributed remainder', async () => {
+    const t = await seedTenant();
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [{ name: 'Latte', qty: 1, unitPriceC: 10000 }],
+      orderDiscount: { source: 'free', kind: 'fixed', value: 2500 },
+    });
+
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+
+    // sales.discount carries line promos PLUS the order discount; there is no
+    // line discount here, so the whole 2500 is order-level.
+    expect(res.body.orderLevelDiscountC).toBe(2500);
+  });
+
+  it('does not double-count a line promo as an order discount', async () => {
+    const t = await seedTenant();
+    const discount = await raw.discount.create({
+      data: {
+        businessId: t.businessId,
+        name: 'Staff 10%',
+        kind: 'percent',
+        value: 10,
+        appliesTo: 'line',
+      },
+    });
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [
+        {
+          name: 'Latte',
+          qty: 1,
+          unitPriceC: 10000,
+          discount: {
+            source: 'named',
+            discountId: discount.id,
+            name: 'Staff 10%',
+            kind: 'percent',
+            value: 10,
+          },
+        },
+      ],
+    });
+
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+
+    expect(res.body.discountsByName[0].amountC).toBe(1000);
+    expect(res.body.orderLevelDiscountC).toBe(0);
+  });
+
+  it('reports SC/PWD discount, VAT-exempt sales and the sale count', async () => {
+    const t = await seedTenant();
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      scPwd: { idNo: 'SC-1', name: 'Lola' },
+      lines: [{ name: 'Meal', qty: 1, unitPriceC: 10000, scPwdMarked: true }],
+    });
+
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+
+    expect(res.body.scPwd.saleCount).toBe(1);
+    expect(res.body.scPwd.discountC).toBeGreaterThan(0);
+    expect(res.body.scPwd.vatExemptSalesC).toBeGreaterThan(0);
+  });
+
+  it('reports misc rings as a share of net sales', async () => {
+    const t = await seedTenant();
+    const category = await seedCategory(t.businessId);
+    const latte = await seedProduct(t.businessId, category.id, 'Latte', {
+      price: 7500,
+    });
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      lines: [
+        // A misc line is one with NO productId; the catalogue line must carry
+        // one or it counts as misc too.
+        { name: 'Open item', productId: null, qty: 1, unitPriceC: 2500 },
+        { name: 'Latte', productId: latte.id, qty: 1, unitPriceC: 7500 },
+      ],
+    });
+
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+
+    expect(res.body.miscLines.revenueC).toBe(2500);
+    // A FRACTION, like every other ratio in these reports.
+    expect(res.body.miscLines.pctOfNetSales).toBeCloseTo(0.25);
+  });
+
+  it('ranks void and refund reasons by value', async () => {
+    const t = await seedTenant();
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      status: 'voided',
+      statusReason: 'Wrong order',
+      lines: [{ name: 'Latte', qty: 1, unitPriceC: 10000 }],
+    });
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      status: 'voided',
+      statusReason: 'Customer left',
+      lines: [{ name: 'Latte', qty: 5, unitPriceC: 10000 }],
+    });
+    await seedSale(raw, {
+      branchId: t.branchId,
+      terminalId: t.terminalId,
+      createdAt: DURING,
+      status: 'refunded',
+      statusReason: 'Spoiled',
+      lines: [{ name: 'Latte', qty: 1, unitPriceC: 20000 }],
+    });
+
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+
+    expect(res.body.voids.count).toBe(2);
+    expect(res.body.voids.valueC).toBe(60000);
+    expect(res.body.voids.reasons[0]).toMatchObject({
+      reason: 'Customer left',
+      valueC: 50000,
+    });
+    expect(res.body.refunds).toMatchObject({ count: 1, valueC: 20000 });
+  });
+
+  it('reports over/short per closed shift, negative meaning short', async () => {
+    const t = await seedTenant();
+    await raw.shift.create({
+      data: {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        openedAt: new Date('2026-03-02T00:00:00.000Z'),
+        closedAt: new Date('2026-03-02T10:00:00.000Z'),
+        openingCash: 100000,
+        expectedCash: 150000,
+        closingCash: 149500,
+      },
+    });
+
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+
+    expect(res.body.overShort).toEqual([
+      expect.objectContaining({
+        branchName: 'Main',
+        expectedCashC: 150000,
+        closingCashC: 149500,
+        varianceC: -500,
+      }),
+    ]);
+  });
+
+  it('leaves an open shift out of over/short', async () => {
+    const t = await seedTenant();
+    await raw.shift.create({
+      data: {
+        branchId: t.branchId,
+        terminalId: t.terminalId,
+        openedAt: new Date('2026-03-02T00:00:00.000Z'),
+        openingCash: 100000,
+      },
+    });
+
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+    expect(res.body.overShort).toEqual([]);
+  });
+
+  it('reports zero and empty rather than failing on a quiet period', async () => {
+    const t = await seedTenant();
+    const res = await leaks(t.token, { businessId: t.businessId }).expect(200);
+
+    expect(res.body.orderLevelDiscountC).toBe(0);
+    expect(res.body.miscLines).toEqual({ revenueC: 0, pctOfNetSales: null });
+    expect(res.body.voids).toEqual({ count: 0, valueC: 0, reasons: [] });
+  });
 });

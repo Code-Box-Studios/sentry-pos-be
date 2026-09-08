@@ -14,6 +14,7 @@ import { ProductsReportController } from './products/products-report.controller'
 import { ProductsReportService } from './products/products-report.service';
 import { ProfitReportController } from './profit/profit-report.controller';
 import { ProfitReportService } from './profit/profit-report.service';
+import { LeaksReportService } from './profit/leaks-report.service';
 
 /**
  * Analytics (tenant scope) — `analytics-spec.md`. Controllers arrive one report
@@ -42,6 +43,7 @@ import { ProfitReportService } from './profit/profit-report.service';
     DashboardService,
     ProductsReportService,
     ProfitReportService,
+    LeaksReportService,
   ],
 })
 export class AnalyticsModule {}

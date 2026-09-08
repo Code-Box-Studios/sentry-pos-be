@@ -139,6 +139,15 @@ export async function seedSale(
             unitPrice: line.unitPriceC,
             costSnapshot: lines[index].costC ?? null,
             discount: lineTotals.grossC - lineTotals.netC,
+            // The POS stamps `discount_id` only when the applied discount was a
+            // NAMED PROMO (`sales.service.ts:496`) — an SC/PWD win leaves it
+            // null. §4's per-discount attribution reads this column, so the
+            // fixture has to reproduce that rule rather than always setting it.
+            discountId:
+              line.discount?.source === 'named' &&
+              lineTotals.applied === 'promo'
+                ? line.discount.discountId
+                : null,
             modifiers: line.modifiers as unknown as Prisma.InputJsonValue,
           };
         }),
