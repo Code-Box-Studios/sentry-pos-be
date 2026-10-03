@@ -46,6 +46,10 @@ export class ReceiveLineDto {
 
 /** Body for `POST /v1/portal/branches/:branchId/stock/receive`. */
 export class ReceiveDto {
+  @IsOptional()
+  @IsUUID()
+  id?: string;
+
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(500)

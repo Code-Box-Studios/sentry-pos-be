@@ -6,6 +6,7 @@ export interface MailMessage {
   to: string;
   subject: string;
   html: string;
+  idempotencyKey?: string;
 }
 
 const DEFAULT_FROM = 'Sentry <no-reply@sentrypos.local>';
@@ -23,18 +24,20 @@ export class MailService {
   private readonly logger = new Logger(MailService.name);
   private readonly resend: Resend | null;
   private readonly from: string;
+  readonly enabled: boolean;
 
   /**
    * Console-transport outbox. Holds every message the console transport
    * "sent", in order; tests read `sentMailbox[0]` / clear it between cases.
-   * Only populated when Resend is NOT configured.
+   * Only populated when email is enabled and Resend is NOT configured.
    */
   readonly sentMailbox: MailMessage[] = [];
 
   constructor(config: ConfigService) {
+    this.enabled = config.get<string>('MAIL_ENABLED')?.trim() !== 'false';
     const apiKey = config.get<string>('RESEND_API_KEY');
     this.from = config.get<string>('MAIL_FROM') ?? DEFAULT_FROM;
-    this.resend = apiKey ? new Resend(apiKey) : null;
+    this.resend = this.enabled && apiKey ? new Resend(apiKey) : null;
   }
 
   /** True when the Resend transport is active (RESEND_API_KEY was set). */
@@ -43,13 +46,20 @@ export class MailService {
   }
 
   async send(message: MailMessage): Promise<void> {
+    if (!this.enabled) return;
     if (this.resend) {
-      await this.resend.emails.send({
-        from: this.from,
-        to: message.to,
-        subject: message.subject,
-        html: message.html,
-      });
+      const result = await this.resend.emails.send(
+        {
+          from: this.from,
+          to: message.to,
+          subject: message.subject,
+          html: message.html,
+        },
+        message.idempotencyKey
+          ? { idempotencyKey: message.idempotencyKey }
+          : undefined,
+      );
+      if (result.error) throw new Error(result.error.message);
       return;
     }
 

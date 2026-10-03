@@ -67,6 +67,28 @@ describe('LockoutService (e2e)', () => {
     await resetDb();
   });
 
+  it('counts concurrent permanent PIN failures without losing increments', async () => {
+    const { user } = await seedOwnerAndUser(
+      'parallel-pin',
+      await hashSecret('123456'),
+    );
+    const results = await Promise.allSettled(
+      Array.from({ length: 4 }, () => lockout.verifyUserPin(user.id, '999999')),
+    );
+    expect(results.every((result) => result.status === 'rejected')).toBe(true);
+    const fresh = await raw.user.findUniqueOrThrow({ where: { id: user.id } });
+    expect(fresh.failedPinCount).toBe(4);
+    expect(fresh.pinLockedUntil!.getTime()).toBeGreaterThan(Date.now());
+    await expect(
+      lockout.verifyUserPin(user.id, '123456'),
+    ).rejects.toBeInstanceOf(PinLockedError);
+    expect(
+      await raw.auditLog.count({
+        where: { action: 'auth.pin_failure', entityId: user.id },
+      }),
+    ).toBe(4);
+  });
+
   // =========================================================================
   // 4-strike sequence for PIN
   // =========================================================================

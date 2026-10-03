@@ -42,7 +42,7 @@ const DECOY_HASH =
   '$argon2id$v=19$m=65536,p=4,t=3$oC3OkBIibBISXXAxDB2G5w$bn2Bi+j0YAUYmt3P6ODBbpWhBhrhH/5mAubxROX/ZWM';
 
 export type LoginResult =
-  | { accessToken: string; refreshToken: string; role: 'owner' }
+  | { accessToken: string; refreshToken: string; role: 'owner' | 'manager' }
   | { totpRequired: true; preAuthToken: string }
   | { totpSetupRequired: true; preAuthToken: string };
 
@@ -103,6 +103,11 @@ export class AuthService {
         'auth.login_failed',
         user.id,
         user.ownerId ?? null,
+        {},
+        this.raw,
+        user.role === 'manager' || user.role === 'cashier'
+          ? 'staff'
+          : undefined,
       );
       await this.lockout.recordFailure(user.id, 'login'); // always throws
       throw new LoginInvalidError(0); // unreachable; satisfies control flow
@@ -116,10 +121,19 @@ export class AuthService {
       const owner = await this.raw.owner.findUnique({
         where: { id: user.ownerId },
       });
-      if (owner && SUSPENDED_STATUSES.has(owner.status)) {
+      if (!owner || SUSPENDED_STATUSES.has(owner.status)) {
         // Failed logins for a suspended owner are still audited above only on
         // wrong password; here the password was right but access is denied.
-        await this.audit.logAuth('auth.login_suspended', user.id, user.ownerId);
+        await this.audit.logAuth(
+          'auth.login_suspended',
+          user.id,
+          user.ownerId,
+          {},
+          this.raw,
+          user.role === 'manager' || user.role === 'cashier'
+            ? 'staff'
+            : undefined,
+        );
         throw new OwnerSuspendedError();
       }
     }
@@ -139,14 +153,38 @@ export class AuthService {
       return { totpSetupRequired: true, preAuthToken };
     }
 
-    // Owner path: mint the access/refresh pair.
+    if (user.deletedAt || user.role === 'cashier' || !user.ownerId) {
+      throw new LoginInvalidError(3);
+    }
+    if (user.role === 'manager') {
+      const profile = await this.raw.staffProfile.findUnique({
+        where: { userId: user.id },
+      });
+      if (
+        !profile ||
+        profile.deletedAt ||
+        profile.status !== 'active' ||
+        !user.pinHash
+      ) {
+        throw new LoginInvalidError(3);
+      }
+    }
+
+    // Owner or active manager path: mint the access/refresh pair.
     const { accessToken, refreshToken } = await this.mintTokenPair(
       user.id,
       user.role,
       user.ownerId ?? undefined,
     );
-    await this.audit.logAuth('auth.login', user.id, user.ownerId ?? null);
-    return { accessToken, refreshToken, role: 'owner' };
+    await this.audit.logAuth(
+      'auth.login',
+      user.id,
+      user.ownerId ?? null,
+      {},
+      this.raw,
+      user.role === 'manager' ? 'staff' : undefined,
+    );
+    return { accessToken, refreshToken, role: user.role };
   }
 
   // -------------------------------------------------------------------------
@@ -178,6 +216,11 @@ export class AuthService {
         'auth.refresh_reuse',
         row.userId,
         row.user.ownerId ?? null,
+        {},
+        this.raw,
+        row.user.role === 'manager' || row.user.role === 'cashier'
+          ? 'staff'
+          : undefined,
       );
       throw new UnauthorizedError('Refresh token reuse detected.');
     }
@@ -188,6 +231,32 @@ export class AuthService {
         data: { revokedAt: new Date() },
       });
       throw new UnauthorizedError('Refresh token has expired.');
+    }
+
+    if (row.user.deletedAt || row.user.role === 'cashier') {
+      throw new UnauthorizedError('Invalid refresh token.');
+    }
+    if (row.user.role !== 'platform_admin') {
+      if (!row.user.ownerId)
+        throw new UnauthorizedError('Invalid refresh token.');
+      const owner = await this.raw.owner.findUnique({
+        where: { id: row.user.ownerId },
+      });
+      if (!owner || SUSPENDED_STATUSES.has(owner.status))
+        throw new OwnerSuspendedError();
+    }
+    if (row.user.role === 'manager') {
+      const profile = await this.raw.staffProfile.findUnique({
+        where: { userId: row.userId },
+      });
+      if (
+        !profile ||
+        profile.deletedAt ||
+        profile.status !== 'active' ||
+        !row.user.pinHash
+      ) {
+        throw new UnauthorizedError('Invalid refresh token.');
+      }
     }
 
     // Rotate: revoke the presented row, mint a fresh 30-day pair.

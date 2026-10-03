@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { Discount } from '@prisma/client';
 import { PortalAuthGuard } from '../../auth/guards/portal-auth.guard';
+import { ManagerAccess } from '../../staff/portal-scope';
 import { DiscountsService } from './discounts.service';
 import { CreateDiscountDto } from './dto/create-discount.dto';
 import { UpdateDiscountDto } from './dto/update-discount.dto';
@@ -26,6 +27,7 @@ export class DiscountsController {
   constructor(private readonly discounts: DiscountsService) {}
 
   @Get('businesses/:businessId/discounts')
+  @ManagerAccess({ action: 'portal_catalog_read', businessParam: 'businessId' })
   list(
     @Param('businessId', ParseUUIDPipe) businessId: string,
   ): Promise<Discount[]> {

@@ -5,6 +5,7 @@ import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
 import { renderReport } from '../report-response';
 import { OverviewService, type OverviewReport } from './overview.service';
 import { overviewCsv } from './overview.csv';
+import { ManagerAccess } from '../../../staff/portal-scope';
 
 /**
  * Overview KPIs (analytics-spec §1). `GET /v1/portal/analytics/overview`.
@@ -14,6 +15,7 @@ import { overviewCsv } from './overview.csv';
  */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
+@ManagerAccess({ action: 'portal_reports', analytics: true })
 export class OverviewController {
   constructor(private readonly overview: OverviewService) {}
 

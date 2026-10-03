@@ -10,15 +10,20 @@ import {
   runWithTxClient,
 } from '../../common/context/request-context';
 import {
+  ForbiddenError,
   NotFoundError,
   StockConflictHttpError,
+  UnauthorizedError,
   ValidationFailedError,
 } from '../../common/errors/api-errors';
 import { computeTotals, type CartTotals } from '../../common/totals/totals';
 import type { Cart } from '../../common/totals/cart';
 import { qtyToMilli, milliToQty } from '../../common/totals/qty';
-import { LockoutService } from '../../common/lockout/lockout.service';
 import { SaleDraftDto, CartLineDto } from './dto/sale-draft.dto';
+import { assertOperatorWrite } from '../operators/operator-write';
+import { permissionFor } from '../../staff/staff-policy';
+import { ApprovalService } from '../operators/approval.service';
+import { ApprovalDto } from '../operators/dto/approval.dto';
 
 // ---------------------------------------------------------------------------
 // FE contract (frontend/pos/src/api/types.ts).
@@ -26,6 +31,9 @@ import { SaleDraftDto, CartLineDto } from './dto/sale-draft.dto';
 
 export interface CompletedSale {
   id: string;
+  operatorUserId: string | null;
+  statusRequestedByUserId: string | null;
+  statusApprovedByUserId: string | null;
   receiptNo: string;
   shiftId: string;
   orderType: string;
@@ -115,13 +123,15 @@ export class SalesService {
   constructor(
     @Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma,
     private readonly raw: PrismaService,
-    private readonly lockout: LockoutService,
+    private readonly approvals: ApprovalService,
   ) {}
 
   async completeSale(
     dto: SaleDraftDto,
   ): Promise<{ replayed: boolean; sale: CompletedSale }> {
     const ctx = getContext();
+    if (!ctx.operator)
+      throw new UnauthorizedError('Unlock this terminal to continue.');
     const branchId = ctx.branchId!;
     const terminalId = ctx.actor!.id;
     const businessId = ctx.businessId!;
@@ -130,23 +140,34 @@ export class SalesService {
     const existing = await this.scoped.sale.findFirst({
       where: { id: dto.id },
     });
-    if (existing) return { replayed: true, sale: this.assemble(existing) };
+    if (existing) return { replayed: true, sale: this.replay(existing) };
 
     // 2. Shift check: the draft's shift must be this terminal's open shift.
     const shift = await this.scoped.shift.findFirst({
       where: { terminalId, closedAt: null },
-      select: { id: true },
+      select: { id: true, operatorUserId: true },
     });
     if (!shift || shift.id !== dto.shiftId) {
       throw new ValidationFailedError("The sale's shift is not open.");
+    }
+    if (shift.operatorUserId !== ctx.operator.userId) {
+      throw new ForbiddenError('Only the shift operator can submit a sale.');
     }
 
     // 3. Business rates for the recompute.
     const business = await this.scoped.business.findFirst({
       where: { id: businessId },
-      select: { taxRate: true, serviceChargeRate: true },
+      select: { taxRate: true, serviceChargeRate: true, allowMiscItems: true },
     });
     if (!business) throw new NotFoundError('Business not found.');
+    if (
+      !business.allowMiscItems &&
+      dto.lines.some((line) => line.productId === null)
+    ) {
+      throw new ValidationFailedError(
+        'Miscellaneous items are disabled for this business.',
+      );
+    }
 
     // 4. Line integrity + current-cost snapshot, and named-discount ownership
     // (BEFORE any lock). Named discount refs are @Allow'd (unvalidated) and the
@@ -191,7 +212,7 @@ export class SalesService {
         // Either a concurrent insert of the same sale.id (idempotency race →
         // return the stored sale) or a (terminalId, receiptNo) collision (422).
         const dup = await this.scoped.sale.findFirst({ where: { id: dto.id } });
-        if (dup) return { replayed: true, sale: this.assemble(dup) };
+        if (dup) return { replayed: true, sale: this.replay(dup) };
         throw new ValidationFailedError(
           'This receipt number is already in use.',
         );
@@ -226,19 +247,31 @@ export class SalesService {
   // -------------------------------------------------------------------------
 
   /**
-   * Ungated void — but only while the sale's shift is still open (§7): a closed
-   * shift's sale must be refunded instead. Restores stock and flags the sale.
+   * Void requires cashier approval, but not an extra PIN for an owner/manager.
+   * A closed shift's sale must be refunded instead.
    */
-  async voidSale(id: string, reason: string): Promise<CompletedSale> {
+  async voidSale(
+    id: string,
+    reason: string,
+    approval?: ApprovalDto,
+  ): Promise<CompletedSale> {
     const trimmed = reason.trim();
     if (!trimmed) throw new ValidationFailedError('A reason is required.');
     const ctx = getContext();
+    const approvedBy = await this.approvals.authorize(
+      'terminal_void',
+      undefined,
+      approval,
+    );
     const branchId = ctx.branchId!;
     const terminalId = ctx.actor!.id;
 
     return this.raw.$transaction((tx) =>
       runWithTxClient(tx, async () => {
+        await tx.$queryRaw`SELECT id FROM terminals WHERE id = ${terminalId}::uuid FOR UPDATE`;
         const locked = await this.lockSale(tx, id, branchId);
+        await assertOperatorWrite(tx);
+        await this.approvals.assertApproverWrite(tx, approvedBy);
         if (!locked) throw new NotFoundError('Sale not found.');
         if (locked.status !== 'completed') {
           throw new ValidationFailedError(
@@ -247,9 +280,13 @@ export class SalesService {
         }
         const open = await this.scoped.shift.findFirst({
           where: { terminalId, closedAt: null },
-          select: { id: true },
+          select: { id: true, operatorUserId: true },
         });
-        if (!open || open.id !== locked.shiftId) {
+        if (
+          !open ||
+          open.id !== locked.shiftId ||
+          open.operatorUserId !== ctx.operator?.userId
+        ) {
           throw new ValidationFailedError(
             "Voids are only allowed while the sale's shift is open.",
           );
@@ -260,17 +297,19 @@ export class SalesService {
             status: 'voided',
             voidedAt: new Date(),
             statusReason: trimmed,
+            statusRequestedByUserId: ctx.operator.userId,
+            statusApprovedByUserId: approvedBy,
           },
         });
-        await this.restoreStock(id, 'void');
+        await this.restoreStock(id, 'void', approvedBy);
         return this.assemble(after);
       }),
     );
   }
 
   /**
-   * PIN-gated refund. The PIN gate runs FIRST (its own lockout + failure audit on
-   * the raw client, outside the refund tx) so a locked terminal never reveals
+   * PIN-gated refund. The PIN gate runs FIRST (its own lockout + failure audit
+   * on the raw client, outside the refund tx) so a locked terminal never reveals
    * whether the sale is refundable. `refund_shift_id` is set only when the refund
    * happens during the sale's OWN open shift, else null (out-of-shift — skips the
    * shift's cash math, §8). Restores stock mirroring the sale's own movements.
@@ -278,10 +317,15 @@ export class SalesService {
   async refundSale(
     id: string,
     reason: string,
-    pin: string,
+    pin?: string,
+    approval?: ApprovalDto,
   ): Promise<CompletedSale> {
     const ctx = getContext();
-    await this.lockout.verifyPinWithLockout(ctx.ownerId!, pin);
+    const approvedBy = await this.approvals.authorize(
+      'terminal_refund',
+      pin,
+      approval,
+    );
 
     const trimmed = reason.trim();
     if (!trimmed) throw new ValidationFailedError('A reason is required.');
@@ -290,7 +334,10 @@ export class SalesService {
 
     return this.raw.$transaction((tx) =>
       runWithTxClient(tx, async () => {
+        await tx.$queryRaw`SELECT id FROM terminals WHERE id = ${terminalId}::uuid FOR UPDATE`;
         const locked = await this.lockSale(tx, id, branchId);
+        await assertOperatorWrite(tx);
+        await this.approvals.assertApproverWrite(tx, approvedBy);
         if (!locked) throw new NotFoundError('Sale not found.');
         if (locked.status !== 'completed') {
           throw new ValidationFailedError(
@@ -299,10 +346,14 @@ export class SalesService {
         }
         const open = await this.scoped.shift.findFirst({
           where: { terminalId, closedAt: null },
-          select: { id: true },
+          select: { id: true, operatorUserId: true },
         });
         const refundShiftId =
-          open && open.id === locked.shiftId ? open.id : null;
+          open &&
+          open.id === locked.shiftId &&
+          open.operatorUserId === ctx.operator?.userId
+            ? open.id
+            : null;
 
         const after = await this.scoped.sale.update({
           where: { id },
@@ -311,9 +362,11 @@ export class SalesService {
             refundedAt: new Date(),
             statusReason: trimmed,
             refundShiftId,
+            statusRequestedByUserId: ctx.operator!.userId,
+            statusApprovedByUserId: approvedBy,
           },
         });
-        await this.restoreStock(id, 'refund');
+        await this.restoreStock(id, 'refund', approvedBy);
         return this.assemble(after);
       }),
     );
@@ -346,6 +399,7 @@ export class SalesService {
   private async restoreStock(
     saleId: string,
     type: 'void' | 'refund',
+    approvedBy: string | null,
   ): Promise<void> {
     const saleMoves = await this.scoped.stockMovement.findMany({
       where: { refId: saleId, type: 'sale' },
@@ -384,6 +438,8 @@ export class SalesService {
           type,
           refId: saleId,
           qtyDelta: restore,
+          operatorUserId: getContext().operator!.userId,
+          approvedByUserId: approvedBy,
         },
       });
     }
@@ -401,6 +457,31 @@ export class SalesService {
     branchId: string,
     terminalId: string,
   ): Promise<CompletedSale> {
+    // Match unlock's lock order (terminal → user) so a simultaneous re-unlock
+    // cannot deadlock with this sale's receipt-sequence update.
+    await tx.$queryRaw`SELECT id FROM terminals WHERE id = ${terminalId}::uuid FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM shifts WHERE id = ${dto.shiftId}::uuid FOR UPDATE`;
+    const shift = await tx.shift.findUnique({
+      where: { id: dto.shiftId },
+      select: {
+        terminalId: true,
+        branchId: true,
+        operatorUserId: true,
+        closedAt: true,
+      },
+    });
+    if (
+      !shift ||
+      shift.terminalId !== terminalId ||
+      shift.branchId !== branchId ||
+      shift.closedAt
+    ) {
+      throw new ValidationFailedError("The sale's shift is not open.");
+    }
+    if (shift.operatorUserId !== getContext().operator?.userId) {
+      throw new ForbiddenError('Only the shift operator can submit a sale.');
+    }
+    await assertOperatorWrite(tx);
     // Tracked lines (real product + trackStock), deduped by product+variant.
     const tracked = dto.lines.filter(
       (l) => l.productId !== null && l.trackStock,
@@ -422,7 +503,24 @@ export class SalesService {
     // fast path can't see an in-flight sibling; this can, because we serialize
     // behind its FOR UPDATE.
     const concurrent = await tx.sale.findFirst({ where: { id: dto.id } });
-    if (concurrent) return this.assemble(concurrent);
+    if (concurrent) return this.replay(concurrent);
+
+    // Freeze the policy through commit, after the replay check: a previously
+    // committed receipt remains retrievable when the owner changes this setting.
+    await tx.$queryRaw`SELECT id FROM businesses WHERE id = ${getContext().businessId}::uuid FOR SHARE`;
+    const business = await tx.business.findUnique({
+      where: { id: getContext().businessId! },
+      select: { allowMiscItems: true },
+    });
+    if (
+      !business ||
+      (!business.allowMiscItems &&
+        dto.lines.some((line) => line.productId === null))
+    ) {
+      throw new ValidationFailedError(
+        'Miscellaneous items are disabled for this business.',
+      );
+    }
 
     // Conflict pass — replicate the FE per-line cumulative check (missing row = 0).
     const conflicts = this.detectConflicts(dto.lines, availableMilli);
@@ -458,6 +556,7 @@ export class SalesService {
           type: 'sale',
           refId: created.id,
           qtyDelta: (-qtyToMilli(l.qty) / 1000).toFixed(3),
+          operatorUserId: getContext().operator!.userId,
         },
       });
     }
@@ -519,6 +618,7 @@ export class SalesService {
       branchId,
       terminalId,
       shiftId: dto.shiftId,
+      operatorUserId: getContext().operator!.userId,
       receiptNo: dto.receiptNo,
       orderType: dto.orderType,
       status: 'completed',
@@ -679,43 +779,84 @@ export class SalesService {
    * be a well-formed id owned by this business. `line.discount`/`orderDiscount`
    * are `@Allow`'d (kept verbatim, unvalidated) and the choke point polices only
    * the sale's TOP-LEVEL FKs — not the nested `sale_items.discountId` — so a
-   * foreign or malformed named-discount id would otherwise land cross-tenant (or
-   * crash to 500 on a bad UUID cast). Free-form (`source:'free'`) discounts carry
-   * no id and are staff discretion (recorded in the snapshot), so they are skipped.
+   * A terminal controls its submitted snapshot, so named values must match
+   * the currently active business discount. Free-form discounts are owner-only.
    */
   private async validateDiscounts(dto: SaleDraftDto): Promise<void> {
     const refs: unknown[] = [
       dto.orderDiscount,
       ...dto.lines.map((l) => l.discount),
     ];
-    const namedIds = refs
-      .filter(
-        (d): d is { source: string; discountId: unknown } =>
-          !!d &&
-          typeof d === 'object' &&
-          (d as { source?: unknown }).source === 'named',
-      )
-      .map((d) => d.discountId);
-
-    if (namedIds.length === 0) return;
-
-    for (const id of namedIds) {
-      if (typeof id !== 'string' || !UUID_RE.test(id)) {
-        throw new ValidationFailedError(
-          'A named discount reference is malformed.',
-        );
+    const named: {
+      id: string;
+      kind: string;
+      value: number;
+      use: 'order' | 'line';
+    }[] = [];
+    for (const [index, value] of refs.entries()) {
+      if (value == null) continue;
+      if (typeof value !== 'object' || Array.isArray(value)) {
+        throw new ValidationFailedError('Discount is malformed.');
+      }
+      const d = value as Record<string, unknown>;
+      if (
+        (d.kind !== 'percent' && d.kind !== 'fixed') ||
+        !Number.isInteger(d.value) ||
+        (d.value as number) < 0 ||
+        (d.kind === 'percent' && (d.value as number) > 100)
+      ) {
+        throw new ValidationFailedError('Discount is malformed.');
+      }
+      if (d.source === 'free') {
+        if (
+          permissionFor(
+            getContext().operator!.role,
+            'terminal_free_discount',
+          ) !== 'allow'
+        ) {
+          throw new ForbiddenError('Only the owner can enter a free discount.');
+        }
+      } else if (d.source === 'named') {
+        if (typeof d.discountId !== 'string' || !UUID_RE.test(d.discountId)) {
+          throw new ValidationFailedError(
+            'A named discount reference is malformed.',
+          );
+        }
+        named.push({
+          id: d.discountId,
+          kind: d.kind,
+          value: d.value as number,
+          use: index === 0 ? 'order' : 'line',
+        });
+      } else {
+        throw new ValidationFailedError('Discount source is malformed.');
       }
     }
-
-    const unique = [...new Set(namedIds as string[])];
+    if (named.length === 0) return;
+    const unique = [...new Set(named.map((d) => d.id))];
     const found = await this.scoped.discount.findMany({
       where: { id: { in: unique } },
-      select: { id: true },
+      select: {
+        id: true,
+        kind: true,
+        value: true,
+        appliesTo: true,
+        active: true,
+      },
     });
-    const owned = new Set(found.map((d) => d.id));
-    for (const id of unique) {
-      if (!owned.has(id)) {
-        throw new ValidationFailedError('Unknown discount reference.');
+    const byId = new Map(found.map((d) => [d.id, d]));
+    for (const submitted of named) {
+      const actual = byId.get(submitted.id);
+      if (
+        !actual ||
+        !actual.active ||
+        actual.kind !== submitted.kind ||
+        actual.value !== submitted.value ||
+        (actual.appliesTo !== 'both' && actual.appliesTo !== submitted.use)
+      ) {
+        throw new ValidationFailedError(
+          'Named discount does not match the active catalog.',
+        );
       }
     }
   }
@@ -751,6 +892,9 @@ export class SalesService {
     const draft = row.draft as StoredDraft;
     return {
       ...(draft as object),
+      operatorUserId: row.operatorUserId,
+      statusRequestedByUserId: row.statusRequestedByUserId,
+      statusApprovedByUserId: row.statusApprovedByUserId,
       status: row.status,
       statusReason: row.statusReason,
       createdAt: row.createdAt.toISOString(),
@@ -758,6 +902,18 @@ export class SalesService {
       refundedAt: row.refundedAt ? row.refundedAt.toISOString() : null,
       refundShiftId: row.refundShiftId,
     } as CompletedSale;
+  }
+
+  private replay(row: Sale): CompletedSale {
+    if (
+      !row.operatorUserId ||
+      row.operatorUserId !== getContext().operator?.userId
+    ) {
+      throw new ForbiddenError(
+        'Only the original operator can replay this sale.',
+      );
+    }
+    return this.assemble(row);
   }
 
   private assembleSummary(row: Sale): SaleSummary {

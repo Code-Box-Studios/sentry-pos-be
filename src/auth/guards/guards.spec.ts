@@ -11,7 +11,7 @@
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 
 import { ExecutionContext } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
+import { JwtService, type JwtSignOptions } from '@nestjs/jwt';
 import { JwtStrategy } from '../jwt.strategy';
 import { PortalAuthGuard } from './portal-auth.guard';
 import { AdminGuard } from './admin.guard';
@@ -81,8 +81,10 @@ describe('JwtStrategy', () => {
 
 describe('PortalAuthGuard', () => {
   const jwt = new JwtService({});
-  const sign = (payload: object, expiresIn = '15m') =>
-    jwt.sign(payload, { secret: ACCESS_SECRET, expiresIn });
+  const sign = (
+    payload: object,
+    expiresIn: JwtSignOptions['expiresIn'] = '15m',
+  ) => jwt.sign(payload, { secret: ACCESS_SECRET, expiresIn });
 
   function guardWithUser(user: any, owner: any = null) {
     const raw: any = {
@@ -113,7 +115,12 @@ describe('PortalAuthGuard', () => {
   });
 
   it('rejects an expired token with 401', async () => {
-    const guard = guardWithUser({ id: 'u1', ownerId: 'o1', deletedAt: null });
+    const guard = guardWithUser({
+      id: 'u1',
+      role: 'owner',
+      ownerId: 'o1',
+      deletedAt: null,
+    });
     const token = sign({ sub: 'u1', role: 'owner', sid: 's1' }, '-1s');
     await runInCtx(async () => {
       await expect(
@@ -123,7 +130,12 @@ describe('PortalAuthGuard', () => {
   });
 
   it('rejects a preauth token with 401', async () => {
-    const guard = guardWithUser({ id: 'u1', ownerId: 'o1', deletedAt: null });
+    const guard = guardWithUser({
+      id: 'u1',
+      role: 'owner',
+      ownerId: 'o1',
+      deletedAt: null,
+    });
     const token = sign({ sub: 'u1', kind: 'preauth', sid: 's1' });
     await runInCtx(async () => {
       await expect(
@@ -134,7 +146,7 @@ describe('PortalAuthGuard', () => {
 
   it('rejects a suspended owner with owner_suspended', async () => {
     const guard = guardWithUser(
-      { id: 'u1', ownerId: 'o1', deletedAt: null },
+      { id: 'u1', role: 'owner', ownerId: 'o1', deletedAt: null },
       { id: 'o1', status: 'suspended' },
     );
     const token = sign({ sub: 'u1', role: 'owner', ownerId: 'o1', sid: 's1' });
@@ -148,7 +160,7 @@ describe('PortalAuthGuard', () => {
   it('fails closed when the owner row is missing (dangling ownerId)', async () => {
     // user.ownerId is set but no owner row exists → must be denied, never granted.
     const guard = guardWithUser(
-      { id: 'u1', ownerId: 'o-missing', deletedAt: null },
+      { id: 'u1', role: 'owner', ownerId: 'o-missing', deletedAt: null },
       null,
     );
     const token = sign({
@@ -166,7 +178,7 @@ describe('PortalAuthGuard', () => {
 
   it('accepts a live owner and stamps tenant context', async () => {
     const guard = guardWithUser(
-      { id: 'u1', ownerId: 'o1', deletedAt: null },
+      { id: 'u1', role: 'owner', ownerId: 'o1', deletedAt: null },
       { id: 'o1', status: 'active' },
     );
     const token = sign({ sub: 'u1', role: 'owner', ownerId: 'o1', sid: 's1' });
@@ -182,12 +194,27 @@ describe('PortalAuthGuard', () => {
       expect(stored.sessionId).toBe('s1');
     });
   });
+
+  it('rejects a cashier even when its token claims owner access', async () => {
+    const guard = guardWithUser(
+      { id: 'u1', role: 'cashier', ownerId: 'o1', deletedAt: null },
+      { id: 'o1', status: 'active' },
+    );
+    const token = sign({ sub: 'u1', role: 'owner', ownerId: 'o1', sid: 's1' });
+    await runInCtx(async () => {
+      await expect(
+        guard.canActivate(ctxWith({ authorization: `Bearer ${token}` })),
+      ).rejects.toBeInstanceOf(ForbiddenError);
+    });
+  });
 });
 
 describe('AdminGuard', () => {
   const jwt = new JwtService({});
-  const sign = (payload: object, expiresIn = '15m') =>
-    jwt.sign(payload, { secret: ACCESS_SECRET, expiresIn });
+  const sign = (
+    payload: object,
+    expiresIn: JwtSignOptions['expiresIn'] = '15m',
+  ) => jwt.sign(payload, { secret: ACCESS_SECRET, expiresIn });
   const guard = new AdminGuard();
 
   it('rejects a non-admin role with forbidden', async () => {

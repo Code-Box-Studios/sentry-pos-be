@@ -13,6 +13,7 @@ import { PortalAuthGuard } from '../../auth/guards/portal-auth.guard';
 import { ProductsService, ProductResponse } from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
+import { ManagerAccess } from '../../staff/portal-scope';
 
 /**
  * Task 12 — portal products (+ nested variants), gated by `PortalAuthGuard`
@@ -25,6 +26,7 @@ export class ProductsController {
   constructor(private readonly products: ProductsService) {}
 
   @Get('businesses/:businessId/products')
+  @ManagerAccess({ action: 'portal_catalog_read', businessParam: 'businessId' })
   list(
     @Param('businessId', ParseUUIDPipe) businessId: string,
   ): Promise<ProductResponse[]> {
@@ -40,6 +42,7 @@ export class ProductsController {
   }
 
   @Get('products/:id')
+  @ManagerAccess({ action: 'portal_catalog_read', productParam: 'id' })
   get(@Param('id', ParseUUIDPipe) id: string): Promise<ProductResponse> {
     return this.products.get(id);
   }

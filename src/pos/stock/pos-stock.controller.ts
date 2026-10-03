@@ -1,8 +1,10 @@
 import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
 import { TerminalGuard } from '../guards/terminal.guard';
+import { OperatorGuard } from '../operators/operator.guard';
 import { getContext } from '../../common/context/request-context';
 import { StockService } from '../../portal/stock/stock.service';
-import { AdjustStockDto } from '../../portal/stock/dto/adjust-stock.dto';
+import { ApprovalService } from '../operators/approval.service';
+import { PosAdjustStockDto } from './pos-adjust-stock.dto';
 
 /** FE `StockLevel` — the POS projection of a branch stock row (qty as a number). */
 export interface PosStockLevel {
@@ -19,7 +21,10 @@ export interface PosStockLevel {
 @Controller('pos/stock')
 @UseGuards(TerminalGuard)
 export class PosStockController {
-  constructor(private readonly stock: StockService) {}
+  constructor(
+    private readonly stock: StockService,
+    private readonly approvals: ApprovalService,
+  ) {}
 
   @Get()
   async getStock(): Promise<PosStockLevel[]> {
@@ -33,9 +38,15 @@ export class PosStockController {
   }
 
   @Post('adjustments')
-  async adjust(@Body() dto: AdjustStockDto): Promise<PosStockLevel> {
+  @UseGuards(OperatorGuard)
+  async adjust(@Body() dto: PosAdjustStockDto): Promise<PosStockLevel> {
     const ctx = getContext();
-    const res = await this.stock.adjust(ctx.branchId!, dto);
+    const approvedBy = await this.approvals.authorize(
+      'terminal_stock_adjust',
+      undefined,
+      dto.approval,
+    );
+    const res = await this.stock.adjust(ctx.branchId!, dto, approvedBy);
     return { productId: res.productId, variantId: res.variantId, qty: res.qty };
   }
 }

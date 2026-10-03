@@ -5,10 +5,12 @@ import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
 import { renderReport } from '../report-response';
 import { TaxReportService, type TaxReport } from './tax-report.service';
 import { taxCsv } from './tax-report.csv';
+import { ManagerAccess } from '../../../staff/portal-scope';
 
 /** Tax summary (analytics-spec §6). `GET /v1/portal/analytics/tax`. */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
+@ManagerAccess({ action: 'portal_reports', analytics: true })
 export class TaxReportController {
   constructor(private readonly tax: TaxReportService) {}
 

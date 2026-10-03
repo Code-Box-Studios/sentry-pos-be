@@ -229,7 +229,6 @@ export class ProductsService {
             ? { trackExpiry: dto.trackExpiry }
             : {}),
           ...(dto.active !== undefined ? { active: dto.active } : {}),
-          ...(dto.imagePath !== undefined ? { imagePath: dto.imagePath } : {}),
           variants: {
             create: variants.map((v) => ({
               name: v.name,
@@ -292,7 +291,6 @@ export class ProductsService {
         ? { trackExpiry: dto.trackExpiry }
         : {}),
       ...(dto.active !== undefined ? { active: dto.active } : {}),
-      ...(dto.imagePath !== undefined ? { imagePath: dto.imagePath } : {}),
     };
 
     if (dto.variants !== undefined) {

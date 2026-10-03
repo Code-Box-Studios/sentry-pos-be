@@ -10,14 +10,26 @@ import {
   SCOPED_PRISMA,
   type ScopedPrisma,
 } from '../../prisma/scoped-prisma.provider';
-import { getContext } from '../../common/context/request-context';
 import {
+  getContext,
+  runWithTxClient,
+} from '../../common/context/request-context';
+import { PrismaService } from '../../prisma/prisma.service';
+import {
+  assertOperatorWrite,
+  assertTerminalWrite,
+} from '../operators/operator-write';
+import {
+  ForbiddenError,
   NotFoundError,
+  UnauthorizedError,
   ValidationFailedError,
 } from '../../common/errors/api-errors';
 import { OpenShiftDto } from './dto/open-shift.dto';
 import { CashMovementDto } from './dto/cash-movement.dto';
 import { CloseShiftDto } from './dto/close-shift.dto';
+import { EmergencyCloseDto } from './dto/emergency-close.dto';
+import { ApprovalService } from '../operators/approval.service';
 
 // ---------------------------------------------------------------------------
 // FE contract (frontend/pos/src/api/types.ts) — the shift shapes the POS uses.
@@ -25,6 +37,7 @@ import { CloseShiftDto } from './dto/close-shift.dto';
 
 export interface CashMovement {
   id: string;
+  operatorUserId: string | null;
   type: 'in' | 'out';
   amountC: number;
   reason: string;
@@ -33,9 +46,12 @@ export interface CashMovement {
 
 export interface ShiftView {
   id: string;
+  operatorUserId: string | null;
+  closedByUserId: string | null;
+  emergencyCloseReason: string | null;
   openedAt: string;
   closedAt: string | null;
-  openingCashC: number;
+  openingCashC: number | null;
   cashMovements: CashMovement[];
 }
 
@@ -58,6 +74,9 @@ export interface ShiftTotals {
 
 export interface ZReport extends ShiftTotals {
   shiftId: string;
+  operatorUserId: string | null;
+  closedByUserId: string | null;
+  emergencyCloseReason: string | null;
   openedAt: string;
   closedAt: string;
   openingCashC: number;
@@ -66,6 +85,26 @@ export interface ZReport extends ShiftTotals {
   branchCode: string;
   terminalCode: string;
 }
+
+export type LiveShiftTotals =
+  | (ShiftTotals & { blindCloseEnabled: false })
+  | (Omit<
+      ShiftTotals,
+      | 'byMethod'
+      | 'cashSalesC'
+      | 'cashRefundsC'
+      | 'cashInC'
+      | 'cashOutC'
+      | 'expectedCashC'
+    > & {
+      blindCloseEnabled: true;
+      byMethod: Omit<Record<PaymentMethod, number>, 'cash'> & { cash: null };
+      cashSalesC: null;
+      cashRefundsC: null;
+      cashInC: null;
+      cashOutC: null;
+      expectedCashC: null;
+    });
 
 type ShiftWithMovements = Prisma.ShiftGetPayload<{
   include: { cashMovements: true };
@@ -84,6 +123,7 @@ function toApiType(t: CashMovementType): 'in' | 'out' {
 function serializeCashMovement(m: ShiftCashMovement): CashMovement {
   return {
     id: m.id,
+    operatorUserId: m.operatorUserId,
     type: toApiType(m.type),
     amountC: m.amount,
     reason: m.reason,
@@ -94,6 +134,9 @@ function serializeCashMovement(m: ShiftCashMovement): CashMovement {
 function serializeShift(s: ShiftWithMovements): ShiftView {
   return {
     id: s.id,
+    operatorUserId: s.operatorUserId,
+    closedByUserId: s.closedByUserId,
+    emergencyCloseReason: s.emergencyCloseReason,
     openedAt: s.openedAt.toISOString(),
     closedAt: s.closedAt ? s.closedAt.toISOString() : null,
     openingCashC: s.openingCash,
@@ -129,116 +172,239 @@ const sum = <T>(rows: T[], pick: (row: T) => number): number =>
  */
 @Injectable()
 export class ShiftsService {
-  constructor(@Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma) {}
+  constructor(
+    @Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma,
+    private readonly raw: PrismaService,
+    private readonly approvals: ApprovalService,
+  ) {}
 
   async current(): Promise<ShiftView | null> {
     const shift = await this.findOpenShift();
-    return shift ? serializeShift(shift) : null;
+    if (!shift) return null;
+    const operator = getContext().operator;
+    if (operator && shift.operatorUserId !== operator.userId)
+      throw new ForbiddenError('Only the shift operator can view this drawer.');
+    const business = await this.scoped.business.findFirst({
+      where: { id: getContext().businessId! },
+      select: { blindCloseEnabled: true },
+    });
+    const view = serializeShift(shift);
+    return !operator || business?.blindCloseEnabled
+      ? { ...view, openingCashC: null, cashMovements: [] }
+      : view;
   }
 
   async open(dto: OpenShiftDto): Promise<ShiftView> {
     const ctx = getContext();
+    if (!ctx.operator)
+      throw new UnauthorizedError('Unlock this terminal to continue.');
     // TerminalGuard always stamps branchId + a terminal actor.
     const terminalId = ctx.actor!.id;
     const branchId = ctx.branchId!;
-
-    // One open shift per terminal (mirrors the single-device FE state). No DB
-    // partial-unique backstop, so this is a check-then-create; a terminal is one
-    // physical device, so concurrent opens from it are not a real scenario.
-    const existing = await this.scoped.shift.findFirst({
-      where: { terminalId, closedAt: null },
-      select: { id: true },
+    return this.write(async (tx) => {
+      await assertOperatorWrite(tx);
+      const existing = await this.scoped.shift.findFirst({
+        where: { terminalId, closedAt: null },
+        select: { id: true },
+      });
+      if (existing)
+        throw new ValidationFailedError(
+          'A shift is already open on this terminal.',
+        );
+      const created = await this.scoped.shift.create({
+        data: {
+          branchId,
+          terminalId,
+          openedAt: new Date(),
+          openingCash: dto.openingCashC,
+          operatorUserId: ctx.operator!.userId,
+        },
+        include: { cashMovements: true },
+      });
+      return serializeShift(created);
     });
-    if (existing) {
-      throw new ValidationFailedError(
-        'A shift is already open on this terminal.',
-      );
-    }
-
-    // create-policing additionally pins branchId to the terminal's branch.
-    const created = await this.scoped.shift.create({
-      data: {
-        branchId,
-        terminalId,
-        openedAt: new Date(),
-        openingCash: dto.openingCashC,
-      },
-      include: { cashMovements: true },
-    });
-    return serializeShift(created);
   }
 
   async addCashMovement(dto: CashMovementDto): Promise<CashMovement> {
+    const operator = getContext().operator;
+    if (!operator)
+      throw new UnauthorizedError('Unlock this terminal to continue.');
     const reason = dto.reason.trim();
     if (!reason) throw new ValidationFailedError('A reason is required.');
 
-    const shift = await this.findOpenShift();
-    if (!shift) throw new ValidationFailedError('No shift is open.');
+    return this.write(async (tx) => {
+      await assertOperatorWrite(tx);
+      const shift = await this.findOpenShift();
+      if (!shift) throw new ValidationFailedError('No shift is open.');
+      if (shift.operatorUserId !== operator.userId) {
+        throw new ForbiddenError(
+          'Only the shift operator can use this drawer.',
+        );
+      }
 
-    // ShiftCashMovement is child-only in the tenant scope: write it through the
-    // parent shift's nested relation (rides the shift.update audit).
-    const movementId = randomUUID();
-    await this.scoped.shift.update({
-      where: { id: shift.id },
-      data: {
-        cashMovements: {
-          create: {
-            id: movementId,
-            type: toDbType(dto.type),
-            amount: dto.amountC,
-            reason,
+      // Child-only in tenant scope: write through the parent shift's audit path.
+      const movementId = randomUUID();
+      await this.scoped.shift.update({
+        where: { id: shift.id },
+        data: {
+          cashMovements: {
+            create: {
+              id: movementId,
+              type: toDbType(dto.type),
+              amount: dto.amountC,
+              reason,
+              operatorUserId: operator.userId,
+            },
           },
         },
-      },
+      });
+      const refreshed = await this.scoped.shift.findFirst({
+        where: { id: shift.id },
+        include: { cashMovements: { where: { id: movementId } } },
+      });
+      const movement = refreshed?.cashMovements[0];
+      if (!movement) throw new NotFoundError('Cash movement not found.');
+      return serializeCashMovement(movement);
     });
-
-    const refreshed = await this.scoped.shift.findFirst({
-      where: { id: shift.id },
-      include: { cashMovements: { where: { id: movementId } } },
-    });
-    const movement = refreshed?.cashMovements[0];
-    if (!movement) throw new NotFoundError('Cash movement not found.');
-    return serializeCashMovement(movement);
   }
 
-  async totals(): Promise<ShiftTotals> {
+  async totals(): Promise<LiveShiftTotals> {
     const shift = await this.findOpenShift();
     if (!shift) throw new ValidationFailedError('No shift is open.');
-    return this.computeTotals(shift);
+    if (shift.operatorUserId !== getContext().operator?.userId)
+      throw new ForbiddenError('Only the shift operator can view this drawer.');
+    const business = await this.scoped.business.findFirst({
+      where: { id: getContext().businessId! },
+      select: { blindCloseEnabled: true },
+    });
+    const totals = await this.computeTotals(shift);
+    return business?.blindCloseEnabled
+      ? {
+          ...totals,
+          blindCloseEnabled: true,
+          byMethod: { ...totals.byMethod, cash: null },
+          cashSalesC: null,
+          cashRefundsC: null,
+          cashInC: null,
+          cashOutC: null,
+          expectedCashC: null,
+        }
+      : { ...totals, blindCloseEnabled: false };
   }
 
   async close(dto: CloseShiftDto): Promise<ZReport> {
     const ctx = getContext();
-    const shift = await this.findOpenShift();
-    if (!shift) throw new ValidationFailedError('No shift is open.');
+    if (!ctx.operator)
+      throw new UnauthorizedError('Unlock this terminal to continue.');
+    return this.write(async (tx) => {
+      await assertOperatorWrite(tx);
+      const shift = await this.findOpenShift();
+      if (!shift) throw new ValidationFailedError('No shift is open.');
+      if (shift.operatorUserId !== ctx.operator!.userId) {
+        throw new ForbiddenError(
+          'Only the shift operator can close this drawer.',
+        );
+      }
 
+      return this.finishClose(shift, dto.countedCashC, ctx.operator!.userId);
+    });
+  }
+
+  async emergencyClose(dto: EmergencyCloseDto): Promise<ZReport> {
+    const reason = dto.reason.trim();
+    if (!reason)
+      throw new ValidationFailedError('An emergency close reason is required.');
+    const closerId = await this.approvals.authorizeEmergency(dto.approval);
+    return this.write(async (tx) => {
+      const ctx = getContext();
+      await assertTerminalWrite(tx);
+      const shift = await this.findOpenShift();
+      if (!shift) throw new ValidationFailedError('No shift is open.');
+      for (const userId of [
+        ...new Set(
+          [closerId, shift.operatorUserId].filter((id): id is string => !!id),
+        ),
+      ].sort()) {
+        await tx.$queryRaw`SELECT id FROM users WHERE id = ${userId}::uuid FOR UPDATE`;
+      }
+      await this.approvals.assertApproverWrite(tx, closerId);
+      if (shift.operatorUserId) {
+        const operator = await tx.user.findUnique({
+          where: { id: shift.operatorUserId },
+          include: { staffProfile: { include: { branches: true } } },
+        });
+        const profile = operator?.staffProfile;
+        const available =
+          operator &&
+          !operator.deletedAt &&
+          (operator.role === 'owner' ||
+            (profile &&
+              !profile.deletedAt &&
+              profile.status === 'active' &&
+              profile.businessId === ctx.businessId &&
+              profile.branches.some(
+                (b) => b.branchId === ctx.branchId && !b.deletedAt,
+              )));
+        if (available)
+          throw new ForbiddenError(
+            'An active shift operator must close their own drawer.',
+          );
+      }
+      return this.finishClose(shift, dto.countedCashC, closerId, reason);
+    });
+  }
+
+  private async finishClose(
+    shift: ShiftWithMovements,
+    countedCashC: number,
+    closerId: string,
+    emergencyCloseReason?: string,
+  ): Promise<ZReport> {
     const totals = await this.computeTotals(shift);
     const closedAt = new Date();
     await this.scoped.shift.update({
       where: { id: shift.id },
       data: {
         closedAt,
-        closingCash: dto.countedCashC,
+        closingCash: countedCashC,
         expectedCash: totals.expectedCashC,
+        closedByUserId: closerId,
+        ...(emergencyCloseReason ? { emergencyCloseReason } : {}),
       },
     });
-
     const branch = await this.scoped.branch.findFirst({
       where: { id: shift.branchId },
       select: { code: true },
     });
-
     return {
       ...totals,
       shiftId: shift.id,
+      operatorUserId: shift.operatorUserId,
+      closedByUserId: closerId,
+      emergencyCloseReason: emergencyCloseReason ?? null,
       openedAt: shift.openedAt.toISOString(),
       closedAt: closedAt.toISOString(),
       openingCashC: shift.openingCash,
-      countedCashC: dto.countedCashC,
-      overShortC: dto.countedCashC - totals.expectedCashC,
+      countedCashC,
+      overShortC: countedCashC - totals.expectedCashC,
       branchCode: branch?.code ?? '',
-      terminalCode: ctx.terminalCode ?? '',
+      terminalCode: getContext().terminalCode ?? '',
     };
+  }
+
+  private async write<T>(
+    fn: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    const terminalId = getContext().terminalId;
+    if (!terminalId) throw new UnauthorizedError();
+    return this.raw.$transaction(
+      (tx) =>
+        runWithTxClient(tx, async () => {
+          await tx.$queryRaw`SELECT id FROM terminals WHERE id = ${terminalId}::uuid FOR UPDATE`;
+          return fn(tx);
+        }),
+      { timeout: 30000 },
+    );
   }
 
   // -------------------------------------------------------------------------

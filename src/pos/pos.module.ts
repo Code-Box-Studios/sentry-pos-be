@@ -15,6 +15,14 @@ import { SalesService } from './sales/sales.service';
 import { PosStockController } from './stock/pos-stock.controller';
 import { PairingGuard } from './guards/pairing.guard';
 import { TerminalGuard } from './guards/terminal.guard';
+import { StaffModule } from '../staff/staff.module';
+import { OperatorController } from './operators/operator.controller';
+import {
+  OperatorGuard,
+  OptionalOperatorGuard,
+} from './operators/operator.guard';
+import { OperatorService } from './operators/operator.service';
+import { ApprovalService } from './operators/approval.service';
 
 /**
  * Task 16/17 — POS module: terminal pairing + guards + catalog pull. Imports
@@ -24,7 +32,13 @@ import { TerminalGuard } from './guards/terminal.guard';
  * (raw) + `SCOPED_PRISMA` come from the global `PrismaModule`.
  */
 @Module({
-  imports: [AuthModule, JwtModule.register({}), StockModule, LockoutModule],
+  imports: [
+    AuthModule,
+    JwtModule.register({}),
+    StockModule,
+    LockoutModule,
+    StaffModule,
+  ],
   controllers: [
     PairingController,
     PosController,
@@ -32,11 +46,16 @@ import { TerminalGuard } from './guards/terminal.guard';
     ShiftsController,
     SalesController,
     PosStockController,
+    OperatorController,
   ],
   providers: [
     PairingService,
     PairingGuard,
     TerminalGuard,
+    OperatorGuard,
+    OptionalOperatorGuard,
+    OperatorService,
+    ApprovalService,
     PosCatalogService,
     ShiftsService,
     SalesService,

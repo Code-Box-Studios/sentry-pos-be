@@ -14,6 +14,7 @@ import {
 import { getContext } from '../../common/context/request-context';
 import { NotFoundError } from '../../common/errors/api-errors';
 import { StockService } from '../../portal/stock/stock.service';
+import { ObjectStorageService } from '../../media/object-storage.service';
 import {
   BusinessSettings,
   serializeBusinessSettings,
@@ -192,6 +193,7 @@ export class PosCatalogService {
   constructor(
     @Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma,
     private readonly stock: StockService,
+    private readonly storage: ObjectStorageService,
   ) {}
 
   async pull(): Promise<CatalogPayload> {
@@ -251,7 +253,12 @@ export class PosCatalogService {
     const liveGroupIds = new Set(modifierGroups.map((g) => g.id));
 
     return {
-      business: serializeBusinessSettings(business),
+      business: {
+        ...serializeBusinessSettings(business),
+        ...(business.logoPath
+          ? { logoUrl: await this.storage.url(business.id, business.logoPath) }
+          : {}),
+      },
       branch: {
         id: branch.id,
         name: branch.name,

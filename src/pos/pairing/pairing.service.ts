@@ -10,6 +10,7 @@ import {
   UnauthorizedError,
 } from '../../common/errors/api-errors';
 import { PairDto } from './dto/pair.dto';
+import { ObjectStorageService } from '../../media/object-storage.service';
 import {
   BusinessSettings,
   serializeBusinessSettings,
@@ -60,6 +61,7 @@ export class PairingService {
   constructor(
     private readonly raw: PrismaService,
     private readonly auth: AuthService,
+    private readonly storage: ObjectStorageService,
   ) {}
 
   async signIn(email: string, password: string): Promise<OwnerSession> {
@@ -80,7 +82,7 @@ export class PairingService {
       entityType: 'user',
       entityId: user.id,
     });
-    return { token, email: user.email, ownerName: owner.name };
+    return { token, email: user.email ?? email, ownerName: owner.name };
   }
 
   async businesses(ownerId: string): Promise<BusinessListItem[]> {
@@ -181,7 +183,12 @@ export class PairingService {
 
     return {
       deviceToken,
-      business: serializeBusinessSettings(business),
+      business: {
+        ...serializeBusinessSettings(business),
+        ...(business.logoPath
+          ? { logoUrl: await this.storage.url(business.id, business.logoPath) }
+          : {}),
+      },
       branch: {
         id: branch.id,
         name: branch.name,

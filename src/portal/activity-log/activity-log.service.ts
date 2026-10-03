@@ -5,6 +5,7 @@ import {
   type ScopedPrisma,
 } from '../../prisma/scoped-prisma.provider';
 import { AuditService } from '../../auth/audit.service';
+import { getContext } from '../../common/context/request-context';
 import { Paginated } from '../../common/types/pagination';
 import { assertBusinessOwned } from '../shared/tenant-guards';
 import { ActivityLogQueryDto } from './dto/activity-log-query.dto';
@@ -31,6 +32,8 @@ export class ActivityLogService {
     query: ActivityLogQueryDto,
   ): Promise<Paginated<AuditLog>> {
     await assertBusinessOwned(this.scoped, businessId);
+    const ctx = getContext();
+    const manager = ctx.actor?.type === 'staff';
     const page = query.page ?? 1;
     const pageSize = query.pageSize ?? DEFAULT_PAGE_SIZE;
 
@@ -40,9 +43,34 @@ export class ActivityLogService {
     // branchId/actorType/action filter deliberately restricts to matching rows
     // (so, e.g., a branch filter drops account-level events, which aren't branch
     // activity); the unfiltered view is where the owner sees their own events.
+    const operationalPrefixes = [
+      'sale.',
+      'shift.',
+      'cash.',
+      'stock.',
+      'stockMovement.',
+      'stockCount.',
+      'branchStock.',
+      'terminal.',
+      'operator.',
+    ];
     const where: Prisma.AuditLogWhereInput = {
-      OR: [{ businessId }, { businessId: null }],
-      ...(query.branchId ? { branchId: query.branchId } : {}),
+      ...(manager
+        ? {
+            businessId,
+            branchId: {
+              in: query.branchId
+                ? [query.branchId]
+                : (ctx.managerBranchIds ?? []),
+            },
+            OR: operationalPrefixes.map((prefix) => ({
+              action: { startsWith: prefix },
+            })),
+          }
+        : {
+            OR: [{ businessId }, { businessId: null }],
+            ...(query.branchId ? { branchId: query.branchId } : {}),
+          }),
       ...(query.actorType ? { actorType: query.actorType } : {}),
       ...(query.action ? { action: query.action } : {}),
       ...(query.from || query.to

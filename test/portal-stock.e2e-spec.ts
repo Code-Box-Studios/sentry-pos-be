@@ -112,7 +112,7 @@ describe('Portal stock (e2e)', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ lines });
 
-  const adjust = (token: string, branchId: string, body: unknown) =>
+  const adjust = (token: string, branchId: string, body: object) =>
     request(server())
       .post(`/v1/portal/branches/${branchId}/stock/adjustments`)
       .set('Authorization', `Bearer ${token}`)
@@ -175,6 +175,7 @@ describe('Portal stock (e2e)', () => {
     // Multi-line receive shares one operation ref.
     expect(new Set(moves.map((m) => m.refId)).size).toBe(1);
     expect(moves.every((m) => m.unitCost !== null)).toBe(true);
+    expect(moves.every((m) => m.operatorUserId !== null)).toBe(true);
 
     // Latest-cost overwrite on the product.
     const prod1 = await raw.product.findUniqueOrThrow({ where: { id: p1.id } });
@@ -185,6 +186,13 @@ describe('Portal stock (e2e)', () => {
       where: { action: 'stockMovement.create' },
     });
     expect(audit.length).toBeGreaterThanOrEqual(2);
+    expect(
+      moves.every((m) =>
+        audit.some(
+          (row) => row.entityId === m.id && row.actorId === m.operatorUserId,
+        ),
+      ),
+    ).toBe(true);
   });
 
   it('accumulates qty across receives and updates cost to the latest', async () => {

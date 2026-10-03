@@ -14,10 +14,12 @@ export interface BusinessSettings {
   taxRate: number;
   serviceChargeRate: number;
   allowMiscItems: boolean;
+  blindCloseEnabled: boolean;
   isDemo: boolean;
   dayStartTime: string;
   receiptHeader: string;
   receiptFooter: string;
+  logoUrl?: string | null;
 }
 
 /** Map a `Business` row (Decimal rates) → the FE `BusinessSettings` shape. */
@@ -30,6 +32,7 @@ export function serializeBusinessSettings(b: Business): BusinessSettings {
     taxRate: b.taxRate.toNumber(),
     serviceChargeRate: b.serviceChargeRate.toNumber(),
     allowMiscItems: b.allowMiscItems,
+    blindCloseEnabled: b.blindCloseEnabled,
     isDemo: b.isDemo,
     dayStartTime: b.dayStartTime,
     receiptHeader: b.receiptHeader,

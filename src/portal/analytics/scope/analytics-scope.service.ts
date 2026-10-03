@@ -8,6 +8,7 @@ import {
   ValidationFailedError,
 } from '../../../common/errors/api-errors';
 import { AnalyticsQueryDto } from '../dto/analytics-query.dto';
+import { requestContext } from '../../../common/context/request-context';
 import {
   addDays,
   businessDayOf,
@@ -63,6 +64,22 @@ export class AnalyticsScopeService {
   constructor(@Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma) {}
 
   async resolve(query: AnalyticsQueryDto): Promise<ResolvedScope> {
+    const ctx = requestContext.getStore();
+    const manager = ctx?.actor?.type === 'staff' ? ctx : null;
+    if (
+      manager?.managerBusinessId &&
+      query.businessId &&
+      query.businessId !== manager.managerBusinessId
+    ) {
+      throw new NotFoundError('Business not found.');
+    }
+    if (
+      manager?.managerBranchIds &&
+      query.branchId &&
+      !manager.managerBranchIds.includes(query.branchId)
+    ) {
+      throw new NotFoundError('Branch not found.');
+    }
     if (query.branchId && !query.businessId) {
       throw new ValidationFailedError(
         'branchId requires businessId — a branch is only meaningful within its business.',
@@ -84,18 +101,26 @@ export class AnalyticsScopeService {
     const businesses = await this.scoped.business.findMany({
       // Demo businesses are excluded from rollups (project-spec §8) but remain
       // reportable when asked for by id, so training data can still be checked.
-      where: query.businessId ? { id: query.businessId } : { isDemo: false },
+      where: manager?.managerBusinessId
+        ? { id: manager.managerBusinessId }
+        : query.businessId
+          ? { id: query.businessId }
+          : { isDemo: false },
       select: { id: true, name: true, dayStartTime: true, taxRate: true },
       orderBy: { createdAt: 'asc' },
     });
-    if (businesses.length === 0) {
+    if (businesses.length === 0 && query.businessId) {
       throw new NotFoundError('Business not found.');
     }
 
     const branches = await this.scoped.branch.findMany({
       where: {
         businessId: { in: businesses.map((b) => b.id) },
-        ...(query.branchId ? { id: query.branchId } : {}),
+        ...(query.branchId
+          ? { id: query.branchId }
+          : manager?.managerBranchIds
+            ? { id: { in: manager.managerBranchIds } }
+            : {}),
       },
       select: { id: true, businessId: true },
       orderBy: { createdAt: 'asc' },
@@ -164,13 +189,22 @@ export class AnalyticsScopeService {
    * rows say which day was viewed.
    */
   async resolveToday(now: Date): Promise<ResolvedScope> {
+    const ctx = requestContext.getStore();
+    const manager = ctx?.actor?.type === 'staff' ? ctx : null;
     const businesses = await this.scoped.business.findMany({
-      where: { isDemo: false },
+      where: manager?.managerBusinessId
+        ? { id: manager.managerBusinessId }
+        : { isDemo: false },
       select: { id: true, name: true, dayStartTime: true, taxRate: true },
       orderBy: { createdAt: 'asc' },
     });
     const branches = await this.scoped.branch.findMany({
-      where: { businessId: { in: businesses.map((b) => b.id) } },
+      where: {
+        businessId: { in: businesses.map((b) => b.id) },
+        ...(manager?.managerBranchIds
+          ? { id: { in: manager.managerBranchIds } }
+          : {}),
+      },
       select: { id: true, businessId: true },
       orderBy: { createdAt: 'asc' },
     });

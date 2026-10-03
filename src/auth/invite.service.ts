@@ -7,7 +7,7 @@ import { MailService } from '../mail/mail.service';
 import { AuditService } from './audit.service';
 import { hashSecret } from './hashing';
 import { seedDemoBusiness } from '../portal/demo-seed';
-import { InvalidTokenError } from '../common/errors/api-errors';
+import { ForbiddenError, InvalidTokenError } from '../common/errors/api-errors';
 
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -57,6 +57,9 @@ export class InviteService {
     const user = await this.raw.user.findUniqueOrThrow({
       where: { id: userId },
     });
+    if (user.role !== 'owner' || !user.email) {
+      throw new ForbiddenError('An owner email is required for invitations.');
+    }
 
     const rawToken = generateRawToken();
     await this.raw.authToken.create({
@@ -155,7 +158,7 @@ export class InviteService {
 
     const link = `${this.appUrl}/password-reset/confirm?token=${rawToken}`;
     await this.mail.send({
-      to: user.email,
+      to: email,
       subject: 'Reset your Sentry POS password',
       html:
         `<p>We received a request to reset your Sentry POS password.</p>` +

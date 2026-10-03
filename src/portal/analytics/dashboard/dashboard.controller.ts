@@ -1,6 +1,7 @@
 import { Controller, Get, UseGuards } from '@nestjs/common';
 import { PortalAuthGuard } from '../../../auth/guards/portal-auth.guard';
 import { DashboardService, type DashboardReport } from './dashboard.service';
+import { ManagerAccess } from '../../../staff/portal-scope';
 
 /**
  * The portal landing (analytics-spec §0). `GET /v1/portal/dashboard`.
@@ -11,6 +12,7 @@ import { DashboardService, type DashboardReport } from './dashboard.service';
  */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
+@ManagerAccess({ action: 'portal_reports', analytics: true })
 export class DashboardController {
   constructor(private readonly dashboard: DashboardService) {}
 

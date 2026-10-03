@@ -100,6 +100,12 @@ export class UnauthorizedError extends ApiHttpException {
   }
 }
 
+export class OperatorSessionError extends ApiHttpException {
+  constructor(message = 'Unlock this terminal to continue.') {
+    super(HttpStatus.UNAUTHORIZED, 'operator_unauthorized', message);
+  }
+}
+
 export class ForbiddenError extends ApiHttpException {
   constructor(message = 'You do not have permission to perform this action.') {
     super(HttpStatus.FORBIDDEN, 'forbidden', message);

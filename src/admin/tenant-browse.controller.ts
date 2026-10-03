@@ -1,3 +1,4 @@
+import { InspectQueryDto } from './dto/inspect-query.dto';
 import {
   Controller,
   Get,
@@ -22,6 +23,18 @@ import { ActivityLogQueryDto } from './dto/activity-log-query.dto';
 @UseGuards(AdminGuard)
 export class TenantBrowseController {
   constructor(private readonly browse: TenantBrowseService) {}
+
+  @Get('metrics')
+  metrics() {
+    return this.browse.metrics();
+  }
+  @Get('businesses/:id/inspect')
+  inspect(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: InspectQueryDto,
+  ) {
+    return this.browse.inspect(id, query);
+  }
 
   @Get('owners/:id/businesses')
   businesses(@Param('id', ParseUUIDPipe) id: string): Promise<Business[]> {

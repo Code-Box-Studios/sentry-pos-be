@@ -5,11 +5,29 @@ export type Scope = 'platform' | 'tenant';
 export interface RequestContext {
   requestId: string;
   scope: Scope | null; // null until a guard authenticates
-  actor: { type: 'platform_admin' | 'owner' | 'terminal'; id: string } | null;
+  actor: {
+    type: 'platform_admin' | 'owner' | 'staff' | 'terminal';
+    id: string;
+  } | null;
   ownerId: string | null; // tenant scope: the BO who owns everything queried
   businessId: string | null; // set for terminal requests (and portal routes that carry one)
   branchId: string | null; // set for terminal requests
+  managerBusinessId?: string; // verified portal manager scope, set by the guard
+  managerBranchIds?: string[]; // current active assignments, set by the guard
   terminalCode: string | null;
+  terminalId?: string;
+  deviceTokenHash?: string; // Internal binding; never expose in responses or audit metadata.
+  operator?: {
+    userId: string;
+    name: string;
+    role: 'owner' | 'manager' | 'cashier';
+  };
+  operatorSessionId?: string;
+  approvalActor?: {
+    userId: string;
+    role: 'owner' | 'manager';
+    pinHash: string;
+  };
   sessionId: string | null; // §11 "session/token id"
   ip: string;
   userAgent: string;

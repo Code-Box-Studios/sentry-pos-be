@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { Category } from '@prisma/client';
 import { PortalAuthGuard } from '../../auth/guards/portal-auth.guard';
+import { ManagerAccess } from '../../staff/portal-scope';
 import { CategoriesService } from './categories.service';
 import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
@@ -26,6 +27,7 @@ export class CategoriesController {
   constructor(private readonly categories: CategoriesService) {}
 
   @Get('businesses/:businessId/categories')
+  @ManagerAccess({ action: 'portal_catalog_read', businessParam: 'businessId' })
   list(
     @Param('businessId', ParseUUIDPipe) businessId: string,
   ): Promise<Category[]> {

@@ -22,6 +22,21 @@ enum OwnerStatus {
 enum UserRole {
   platform_admin
   owner
+  manager
+  cashier
+}
+
+enum StaffStatus {
+  pending
+  active
+  deactivated
+}
+
+enum StaffChallengeKind {
+  manager_setup
+  cashier_setup
+  pin_reset
+  password_reset
 }
 
 enum BusinessType {
@@ -107,6 +122,7 @@ enum NotificationType {
 
 enum ActorType {
   owner
+  staff
   terminal
   platform_admin
 }
@@ -121,66 +137,79 @@ enum AuthTokenKind {
 // ---------------------------------------------------------------------------
 
 model Owner {
-  id          String      @id @default(uuid()) @db.Uuid
-  createdAt   DateTime    @default(now()) @map("created_at")
-  updatedAt   DateTime    @updatedAt @map("updated_at")
-  deletedAt   DateTime?   @map("deleted_at")
+  closedAt   DateTime? @map("closed_at")
+  purgeAfter DateTime? @map("purge_after")
+  id         String    @id @default(uuid()) @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
 
-  name        String
-  email       String      @unique
-  status      OwnerStatus @default(active)
-  maxBusinesses Int       @default(1) @map("max_businesses")
-  suspendedAt DateTime?   @map("suspended_at")
+  name          String
+  email         String      @unique
+  status        OwnerStatus @default(active)
+  maxBusinesses Int         @default(1) @map("max_businesses")
+  suspendedAt   DateTime?   @map("suspended_at")
 
   // relations
-  users       User[]
-  businesses  Business[]
+  users      User[]
+  businesses Business[]
 
   @@map("owners")
 }
 
 model User {
-  id                 String    @id @default(uuid()) @db.Uuid
-  createdAt          DateTime  @default(now()) @map("created_at")
-  updatedAt          DateTime  @updatedAt @map("updated_at")
-  deletedAt          DateTime? @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  email              String    @unique
-  passwordHash       String?   @map("password_hash")
-  role               UserRole
-  ownerId            String?   @db.Uuid @map("owner_id")
-  pinHash            String?   @map("pin_hash")
-  totpSecret         String?   @map("totp_secret")
-  totpPendingSecret  String?   @map("totp_pending_secret")
-  totpLastTimeStep   Int?      @map("totp_last_time_step")
-  totpRecoveryCodes  String[]  @map("totp_recovery_codes")
-  failedLoginCount   Int       @default(0) @map("failed_login_count")
-  loginLockedUntil   DateTime? @map("login_locked_until")
-  failedPinCount     Int       @default(0) @map("failed_pin_count")
-  pinLockedUntil     DateTime? @map("pin_locked_until")
+  email             String?   @unique
+  passwordHash      String?   @map("password_hash")
+  role              UserRole
+  ownerId           String?   @map("owner_id") @db.Uuid
+  pinHash           String?   @map("pin_hash")
+  totpSecret        String?   @map("totp_secret")
+  totpPendingSecret String?   @map("totp_pending_secret")
+  totpLastTimeStep  Int?      @map("totp_last_time_step")
+  totpRecoveryCodes String[]  @map("totp_recovery_codes")
+  failedLoginCount  Int       @default(0) @map("failed_login_count")
+  loginLockedUntil  DateTime? @map("login_locked_until")
+  failedPinCount    Int       @default(0) @map("failed_pin_count")
+  pinLockedUntil    DateTime? @map("pin_locked_until")
 
   // relations
-  owner        Owner?        @relation(fields: [ownerId], references: [id])
-  authTokens   AuthToken[]
-  refreshTokens RefreshToken[]
+  owner                  Owner?              @relation(fields: [ownerId], references: [id])
+  authTokens             AuthToken[]
+  refreshTokens          RefreshToken[]
+  staffProfile           StaffProfile?
+  staffChallenges        StaffChallenge[]
+  operatorSessions       OperatorSession[]
+  operatedShifts         Shift[]             @relation("ShiftOperator")
+  closedShifts           Shift[]             @relation("ShiftCloser")
+  operatedCashMovements ShiftCashMovement[] @relation("CashMovementOperator")
+  operatedSales          Sale[]              @relation("SaleOperator")
+  requestedSaleStatuses  Sale[]              @relation("SaleStatusRequester")
+  approvedSaleStatuses   Sale[]              @relation("SaleStatusApprover")
+  operatedStockMovements StockMovement[]     @relation("StockMovementOperator")
+  approvedStockMovements StockMovement[]     @relation("StockMovementApprover")
 
   @@map("users")
 }
 
 model AuthToken {
-  id        String        @id @default(uuid()) @db.Uuid
-  createdAt DateTime      @default(now()) @map("created_at")
-  updatedAt DateTime      @updatedAt @map("updated_at")
-  deletedAt DateTime?     @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
   kind      AuthTokenKind
   tokenHash String        @unique @map("token_hash")
-  userId    String        @db.Uuid @map("user_id")
+  userId    String        @map("user_id") @db.Uuid
   expiresAt DateTime      @map("expires_at")
   usedAt    DateTime?     @map("used_at")
 
   // relations
-  user      User          @relation(fields: [userId], references: [id])
+  user User @relation(fields: [userId], references: [id])
 
   @@map("auth_tokens")
 }
@@ -192,28 +221,106 @@ model RefreshToken {
   deletedAt DateTime? @map("deleted_at")
 
   tokenHash String    @unique @map("token_hash")
-  userId    String    @db.Uuid @map("user_id")
+  userId    String    @map("user_id") @db.Uuid
   expiresAt DateTime  @map("expires_at")
   revokedAt DateTime? @map("revoked_at")
 
   // relations
-  user      User      @relation(fields: [userId], references: [id])
+  user User @relation(fields: [userId], references: [id])
 
   @@map("refresh_tokens")
 }
 
-model Business {
-  id                String       @id @default(uuid()) @db.Uuid
-  createdAt         DateTime     @default(now()) @map("created_at")
-  updatedAt         DateTime     @updatedAt @map("updated_at")
-  deletedAt         DateTime?    @map("deleted_at")
+model StaffProfile {
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  ownerId           String       @db.Uuid @map("owner_id")
+  userId     String      @unique @map("user_id") @db.Uuid
+  businessId String      @map("business_id") @db.Uuid
+  name       String
+  status     StaffStatus @default(pending)
+
+  user     User          @relation(fields: [userId], references: [id])
+  business Business      @relation(fields: [businessId], references: [id])
+  branches StaffBranch[]
+
+  @@index([businessId, status])
+  @@map("staff_profiles")
+}
+
+model StaffBranch {
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  staffProfileId String @map("staff_profile_id") @db.Uuid
+  branchId       String @map("branch_id") @db.Uuid
+
+  staffProfile StaffProfile @relation(fields: [staffProfileId], references: [id])
+  branch       Branch       @relation(fields: [branchId], references: [id])
+
+  @@unique([staffProfileId, branchId])
+  @@index([branchId])
+  @@map("staff_branches")
+}
+
+model StaffChallenge {
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  userId         String             @map("user_id") @db.Uuid
+  kind           StaffChallengeKind
+  pinHash        String             @map("pin_hash")
+  expiresAt      DateTime           @map("expires_at")
+  usedAt         DateTime?          @map("used_at")
+  failedAttempts Int                @default(0) @map("failed_attempts")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, kind, expiresAt])
+  @@map("staff_challenges")
+}
+
+model OperatorSession {
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  tokenHash      String    @unique @map("token_hash")
+  userId         String    @map("user_id") @db.Uuid
+  terminalId     String    @map("terminal_id") @db.Uuid
+  branchId       String    @map("branch_id") @db.Uuid
+  lastActivityAt DateTime  @map("last_activity_at")
+  expiresAt      DateTime  @map("expires_at")
+  revokedAt      DateTime? @map("revoked_at")
+
+  user     User     @relation(fields: [userId], references: [id])
+  terminal Terminal @relation(fields: [terminalId], references: [id])
+  branch   Branch   @relation(fields: [branchId], references: [id])
+
+  @@index([terminalId, revokedAt])
+  @@index([userId, revokedAt])
+  @@map("operator_sessions")
+}
+
+model Business {
+  dailySummaryEnabled Boolean   @default(true) @map("daily_summary_enabled")
+  blindCloseEnabled   Boolean   @default(false) @map("blind_close_enabled")
+  id                  String    @id @default(uuid()) @db.Uuid
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+  deletedAt           DateTime? @map("deleted_at")
+
+  ownerId           String       @map("owner_id") @db.Uuid
   name              String
   type              BusinessType
   currency          String       @default("PHP")
-  taxRate           Decimal      @db.Decimal(5, 4) @map("tax_rate")
-  serviceChargeRate Decimal      @db.Decimal(5, 4) @default(0) @map("service_charge_rate")
+  taxRate           Decimal      @map("tax_rate") @db.Decimal(5, 4)
+  serviceChargeRate Decimal      @default(0) @map("service_charge_rate") @db.Decimal(5, 4)
   allowMiscItems    Boolean      @default(true) @map("allow_misc_items")
   isDemo            Boolean      @default(false) @map("is_demo")
   dayStartTime      String       @default("00:00") @map("day_start_time")
@@ -223,47 +330,51 @@ model Business {
   receiptFooter     String       @default("") @map("receipt_footer")
 
   // relations
-  owner             Owner        @relation(fields: [ownerId], references: [id])
-  branches          Branch[]
-  categories        Category[]
-  products          Product[]
-  modifierGroups    ModifierGroup[]
-  discounts         Discount[]
+  owner          Owner           @relation(fields: [ownerId], references: [id])
+  branches       Branch[]
+  categories     Category[]
+  products       Product[]
+  modifierGroups ModifierGroup[]
+  discounts      Discount[]
+  staffProfiles  StaffProfile[]
 
   @@map("businesses")
 }
 
 model Branch {
-  id         String    @id @default(uuid()) @db.Uuid
-  createdAt  DateTime  @default(now()) @map("created_at")
-  updatedAt  DateTime  @updatedAt @map("updated_at")
-  deletedAt  DateTime? @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  businessId String    @db.Uuid @map("business_id")
+  businessId String @map("business_id") @db.Uuid
   name       String
   code       String
   address    String
 
   // relations
-  business      Business        @relation(fields: [businessId], references: [id])
-  terminals     Terminal[]
-  branchStocks  BranchStock[]
+  business       Business        @relation(fields: [businessId], references: [id])
+  terminals      Terminal[]
+  branchStocks   BranchStock[]
   stockMovements StockMovement[]
-  shifts        Shift[]
-  stockCounts   StockCount[]
-  sales         Sale[]
+  shifts         Shift[]
+  stockCounts    StockCount[]
+  stockBatches   StockBatch[]
+  sales          Sale[]
+  staffAssignments StaffBranch[]
+  operatorSessions OperatorSession[]
 
   @@unique([businessId, code])
   @@map("branches")
 }
 
 model Terminal {
-  id              String    @id @default(uuid()) @db.Uuid
-  createdAt       DateTime  @default(now()) @map("created_at")
-  updatedAt       DateTime  @updatedAt @map("updated_at")
-  deletedAt       DateTime? @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  branchId        String    @db.Uuid @map("branch_id")
+  branchId        String    @map("branch_id") @db.Uuid
   name            String
   code            String
   deviceTokenHash String?   @map("device_token_hash")
@@ -271,60 +382,61 @@ model Terminal {
   lastSeenAt      DateTime? @map("last_seen_at")
 
   // relations
-  branch          Branch    @relation(fields: [branchId], references: [id])
-  shifts          Shift[]
-  sales           Sale[]
+  branch Branch  @relation(fields: [branchId], references: [id])
+  shifts Shift[]
+  sales  Sale[]
+  operatorSessions OperatorSession[]
 
   @@unique([branchId, code])
   @@map("terminals")
 }
 
 model Category {
-  id         String    @id @default(uuid()) @db.Uuid
-  createdAt  DateTime  @default(now()) @map("created_at")
-  updatedAt  DateTime  @updatedAt @map("updated_at")
-  deletedAt  DateTime? @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  businessId String    @db.Uuid @map("business_id")
+  businessId String @map("business_id") @db.Uuid
   name       String
-  sortOrder  Int       @default(0) @map("sort_order")
+  sortOrder  Int    @default(0) @map("sort_order")
 
   // relations
-  business   Business  @relation(fields: [businessId], references: [id])
-  products   Product[]
+  business Business  @relation(fields: [businessId], references: [id])
+  products Product[]
 
   @@map("categories")
 }
 
 model Product {
-  id                  String    @id @default(uuid()) @db.Uuid
-  createdAt           DateTime  @default(now()) @map("created_at")
-  updatedAt           DateTime  @updatedAt @map("updated_at")
-  deletedAt           DateTime? @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  businessId          String    @db.Uuid @map("business_id")
-  categoryId          String    @db.Uuid @map("category_id")
-  name                String
-  sku                 String?
-  barcode             String?
-  price               Int
-  cost                Int?
-  soldBy              SoldBy    @default(unit) @map("sold_by")
-  lowStockThreshold   Decimal?  @db.Decimal(10, 3) @map("low_stock_threshold")
-  imagePath           String?   @map("image_path")
-  trackStock          Boolean   @default(true) @map("track_stock")
-  trackExpiry         Boolean   @default(false) @map("track_expiry")
-  active              Boolean   @default(true)
+  businessId        String   @map("business_id") @db.Uuid
+  categoryId        String   @map("category_id") @db.Uuid
+  name              String
+  sku               String?
+  barcode           String?
+  price             Int
+  cost              Int?
+  soldBy            SoldBy   @default(unit) @map("sold_by")
+  lowStockThreshold Decimal? @map("low_stock_threshold") @db.Decimal(10, 3)
+  imagePath         String?  @map("image_path")
+  trackStock        Boolean  @default(true) @map("track_stock")
+  trackExpiry       Boolean  @default(false) @map("track_expiry")
+  active            Boolean  @default(true)
 
   // relations
-  business            Business          @relation(fields: [businessId], references: [id])
-  category            Category          @relation(fields: [categoryId], references: [id])
-  variants            ProductVariant[]
+  business              Business               @relation(fields: [businessId], references: [id])
+  category              Category               @relation(fields: [categoryId], references: [id])
+  variants              ProductVariant[]
   productModifierGroups ProductModifierGroup[]
-  branchStocks        BranchStock[]
-  stockMovements      StockMovement[]
-  stockBatches        StockBatch[]
-  stockCountItems     StockCountItem[]
+  branchStocks          BranchStock[]
+  stockMovements        StockMovement[]
+  stockBatches          StockBatch[]
+  stockCountItems       StockCountItem[]
 
   @@map("products")
 }
@@ -335,7 +447,7 @@ model ProductVariant {
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
 
-  productId String    @db.Uuid @map("product_id")
+  productId String  @map("product_id") @db.Uuid
   name      String
   sku       String?
   barcode   String?
@@ -343,10 +455,10 @@ model ProductVariant {
   cost      Int?
 
   // relations
-  product       Product         @relation(fields: [productId], references: [id])
-  branchStocks  BranchStock[]
-  stockMovements StockMovement[]
-  stockBatches  StockBatch[]
+  product         Product          @relation(fields: [productId], references: [id])
+  branchStocks    BranchStock[]
+  stockMovements  StockMovement[]
+  stockBatches    StockBatch[]
   stockCountItems StockCountItem[]
 
   @@unique([productId, sku])
@@ -355,64 +467,64 @@ model ProductVariant {
 }
 
 model ModifierGroup {
-  id         String    @id @default(uuid()) @db.Uuid
-  createdAt  DateTime  @default(now()) @map("created_at")
-  updatedAt  DateTime  @updatedAt @map("updated_at")
-  deletedAt  DateTime? @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  businessId String    @db.Uuid @map("business_id")
+  businessId String @map("business_id") @db.Uuid
   name       String
-  minSelect  Int       @default(0) @map("min_select")
-  maxSelect  Int       @default(1) @map("max_select")
+  minSelect  Int    @default(0) @map("min_select")
+  maxSelect  Int    @default(1) @map("max_select")
 
   // relations
-  business   Business  @relation(fields: [businessId], references: [id])
-  modifiers  Modifier[]
+  business              Business               @relation(fields: [businessId], references: [id])
+  modifiers             Modifier[]
   productModifierGroups ProductModifierGroup[]
 
   @@map("modifier_groups")
 }
 
 model Modifier {
-  id         String        @id @default(uuid()) @db.Uuid
-  createdAt  DateTime      @default(now()) @map("created_at")
-  updatedAt  DateTime      @updatedAt @map("updated_at")
-  deletedAt  DateTime?     @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  groupId    String        @db.Uuid @map("group_id")
+  groupId    String @map("group_id") @db.Uuid
   name       String
-  priceDelta Int           @default(0) @map("price_delta")
+  priceDelta Int    @default(0) @map("price_delta")
 
   // relations
-  group      ModifierGroup @relation(fields: [groupId], references: [id])
+  group ModifierGroup @relation(fields: [groupId], references: [id])
 
   @@map("modifiers")
 }
 
 model ProductModifierGroup {
-  id        String        @id @default(uuid()) @db.Uuid
-  createdAt DateTime      @default(now()) @map("created_at")
-  updatedAt DateTime      @updatedAt @map("updated_at")
-  deletedAt DateTime?     @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  productId String        @db.Uuid @map("product_id")
-  groupId   String        @db.Uuid @map("group_id")
+  productId String @map("product_id") @db.Uuid
+  groupId   String @map("group_id") @db.Uuid
 
   // relations
-  product   Product       @relation(fields: [productId], references: [id])
-  group     ModifierGroup @relation(fields: [groupId], references: [id])
+  product Product       @relation(fields: [productId], references: [id])
+  group   ModifierGroup @relation(fields: [groupId], references: [id])
 
   @@unique([productId, groupId])
   @@map("product_modifier_groups")
 }
 
 model Discount {
-  id         String            @id @default(uuid()) @db.Uuid
-  createdAt  DateTime          @default(now()) @map("created_at")
-  updatedAt  DateTime          @updatedAt @map("updated_at")
-  deletedAt  DateTime?         @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  businessId String            @db.Uuid @map("business_id")
+  businessId String            @map("business_id") @db.Uuid
   name       String
   kind       DiscountKind
   value      Int
@@ -420,170 +532,186 @@ model Discount {
   active     Boolean           @default(true)
 
   // relations
-  business   Business          @relation(fields: [businessId], references: [id])
-  sales      Sale[]
-  saleItems  SaleItem[]
+  business  Business   @relation(fields: [businessId], references: [id])
+  sales     Sale[]
+  saleItems SaleItem[]
 
   @@map("discounts")
 }
 
 model BranchStock {
-  id        String          @id @default(uuid()) @db.Uuid
-  createdAt DateTime        @default(now()) @map("created_at")
-  updatedAt DateTime        @updatedAt @map("updated_at")
-  deletedAt DateTime?       @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  branchId  String          @db.Uuid @map("branch_id")
-  productId String          @db.Uuid @map("product_id")
-  variantId String?         @db.Uuid @map("variant_id")
-  qty       Decimal         @db.Decimal(10, 3) @default(0)
+  branchId  String  @map("branch_id") @db.Uuid
+  productId String  @map("product_id") @db.Uuid
+  variantId String? @map("variant_id") @db.Uuid
+  qty       Decimal @default(0) @db.Decimal(10, 3)
 
   // relations
-  branch    Branch          @relation(fields: [branchId], references: [id])
-  product   Product         @relation(fields: [productId], references: [id])
-  variant   ProductVariant? @relation(fields: [variantId], references: [id])
+  branch  Branch          @relation(fields: [branchId], references: [id])
+  product Product         @relation(fields: [productId], references: [id])
+  variant ProductVariant? @relation(fields: [variantId], references: [id])
 
   @@map("branch_stock")
 }
 
 model StockMovement {
-  id             String          @id @default(uuid()) @db.Uuid
-  createdAt      DateTime        @default(now()) @map("created_at")
-  updatedAt      DateTime        @updatedAt @map("updated_at")
-  deletedAt      DateTime?       @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  branchId       String          @db.Uuid @map("branch_id")
-  productId      String          @db.Uuid @map("product_id")
-  variantId      String?         @db.Uuid @map("variant_id")
+  branchId       String          @map("branch_id") @db.Uuid
+  productId      String          @map("product_id") @db.Uuid
+  variantId      String?         @map("variant_id") @db.Uuid
   type           MovementType
-  refId          String          @db.Uuid @map("ref_id")
-  transferId     String?         @db.Uuid @map("transfer_id")
-  qtyDelta       Decimal         @db.Decimal(10, 3) @map("qty_delta")
+  refId          String          @map("ref_id") @db.Uuid
+  transferId     String?         @map("transfer_id") @db.Uuid
+  qtyDelta       Decimal         @map("qty_delta") @db.Decimal(10, 3)
   reasonCategory ReasonCategory? @map("reason_category")
   unitCost       Int?            @map("unit_cost")
   note           String?
+  operatorUserId String?         @map("operator_user_id") @db.Uuid
+  approvedByUserId String?       @map("approved_by_user_id") @db.Uuid
 
   // relations
-  branch         Branch          @relation(fields: [branchId], references: [id])
-  product        Product         @relation(fields: [productId], references: [id])
-  variant        ProductVariant? @relation(fields: [variantId], references: [id])
+  branch  Branch          @relation(fields: [branchId], references: [id])
+  product Product         @relation(fields: [productId], references: [id])
+  variant ProductVariant? @relation(fields: [variantId], references: [id])
+  operator User? @relation("StockMovementOperator", fields: [operatorUserId], references: [id])
+  approver User? @relation("StockMovementApprover", fields: [approvedByUserId], references: [id])
 
   @@map("stock_movements")
 }
 
 model Shift {
-  id           String    @id @default(uuid()) @db.Uuid
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
-  deletedAt    DateTime? @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  branchId     String    @db.Uuid @map("branch_id")
-  terminalId   String    @db.Uuid @map("terminal_id")
+  branchId     String    @map("branch_id") @db.Uuid
+  terminalId   String    @map("terminal_id") @db.Uuid
   openedAt     DateTime  @map("opened_at")
   closedAt     DateTime? @map("closed_at")
   openingCash  Int       @map("opening_cash")
   closingCash  Int?      @map("closing_cash")
   expectedCash Int?      @map("expected_cash")
+  operatorUserId String? @map("operator_user_id") @db.Uuid
+  closedByUserId String? @map("closed_by_user_id") @db.Uuid
+  emergencyCloseReason String? @map("emergency_close_reason")
 
   // relations
-  branch        Branch             @relation(fields: [branchId], references: [id])
-  terminal      Terminal           @relation(fields: [terminalId], references: [id])
+  branch        Branch              @relation(fields: [branchId], references: [id])
+  terminal      Terminal            @relation(fields: [terminalId], references: [id])
   cashMovements ShiftCashMovement[]
   sales         Sale[]
+  operator      User? @relation("ShiftOperator", fields: [operatorUserId], references: [id])
+  closer        User? @relation("ShiftCloser", fields: [closedByUserId], references: [id])
 
   @@map("shifts")
 }
 
 model ShiftCashMovement {
-  id        String           @id @default(uuid()) @db.Uuid
-  createdAt DateTime         @default(now()) @map("created_at")
-  updatedAt DateTime         @updatedAt @map("updated_at")
-  deletedAt DateTime?        @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  shiftId   String           @db.Uuid @map("shift_id")
-  type      CashMovementType
-  amount    Int
-  reason    String
+  shiftId String           @map("shift_id") @db.Uuid
+  type    CashMovementType
+  amount  Int
+  reason  String
+  operatorUserId String? @map("operator_user_id") @db.Uuid
 
   // relations
-  shift     Shift            @relation(fields: [shiftId], references: [id])
+  shift Shift @relation(fields: [shiftId], references: [id])
+  operator User? @relation("CashMovementOperator", fields: [operatorUserId], references: [id])
 
   @@map("shift_cash_movements")
 }
 
 model StockCount {
-  id         String      @id @default(uuid()) @db.Uuid
-  createdAt  DateTime    @default(now()) @map("created_at")
-  updatedAt  DateTime    @updatedAt @map("updated_at")
-  deletedAt  DateTime?   @map("deleted_at")
+  countedAt DateTime  @default(now()) @map("counted_at")
+  notes     String?
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  branchId   String      @db.Uuid @map("branch_id")
-  status     CountStatus @default(draft)
-  postedAt   DateTime?   @map("posted_at")
+  branchId String      @map("branch_id") @db.Uuid
+  status   CountStatus @default(draft)
+  postedAt DateTime?   @map("posted_at")
 
   // relations
-  branch     Branch          @relation(fields: [branchId], references: [id])
-  items      StockCountItem[]
+  branch Branch           @relation(fields: [branchId], references: [id])
+  items  StockCountItem[]
 
   @@map("stock_counts")
 }
 
 model StockCountItem {
-  id           String         @id @default(uuid()) @db.Uuid
-  createdAt    DateTime       @default(now()) @map("created_at")
-  updatedAt    DateTime       @updatedAt @map("updated_at")
-  deletedAt    DateTime?      @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  stockCountId String         @db.Uuid @map("stock_count_id")
-  productId    String         @db.Uuid @map("product_id")
-  variantId    String?        @db.Uuid @map("variant_id")
-  expectedQty  Decimal        @db.Decimal(10, 3) @map("expected_qty")
-  countedQty   Decimal        @db.Decimal(10, 3) @map("counted_qty")
+  stockCountId String  @map("stock_count_id") @db.Uuid
+  productId    String  @map("product_id") @db.Uuid
+  variantId    String? @map("variant_id") @db.Uuid
+  expectedQty  Decimal @map("expected_qty") @db.Decimal(10, 3)
+  countedQty   Decimal @map("counted_qty") @db.Decimal(10, 3)
 
   // relations
-  stockCount   StockCount     @relation(fields: [stockCountId], references: [id])
-  product      Product        @relation(fields: [productId], references: [id])
-  variant      ProductVariant? @relation(fields: [variantId], references: [id])
+  stockCount StockCount      @relation(fields: [stockCountId], references: [id])
+  product    Product         @relation(fields: [productId], references: [id])
+  variant    ProductVariant? @relation(fields: [variantId], references: [id])
 
   @@map("stock_count_items")
 }
 
 model StockBatch {
-  id          String         @id @default(uuid()) @db.Uuid
-  createdAt   DateTime       @default(now()) @map("created_at")
-  updatedAt   DateTime       @updatedAt @map("updated_at")
-  deletedAt   DateTime?      @map("deleted_at")
+  branchId          String?   @map("branch_id") @db.Uuid
+  receiveMovementId String?   @map("receive_movement_id") @db.Uuid
+  branch            Branch?   @relation(fields: [branchId], references: [id])
+  id                String    @id @default(uuid()) @db.Uuid
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  deletedAt         DateTime? @map("deleted_at")
 
-  productId   String         @db.Uuid @map("product_id")
-  variantId   String?        @db.Uuid @map("variant_id")
-  qty         Decimal        @db.Decimal(10, 3)
-  expiresAt   DateTime?      @map("expires_at")
-  receivedAt  DateTime       @map("received_at")
-  unitCost    Int?           @map("unit_cost")
+  productId  String    @map("product_id") @db.Uuid
+  variantId  String?   @map("variant_id") @db.Uuid
+  qty        Decimal   @db.Decimal(10, 3)
+  expiresAt  DateTime? @map("expires_at")
+  receivedAt DateTime  @map("received_at")
+  unitCost   Int?      @map("unit_cost")
 
   // relations
-  product     Product        @relation(fields: [productId], references: [id])
-  variant     ProductVariant? @relation(fields: [variantId], references: [id])
+  product Product         @relation(fields: [productId], references: [id])
+  variant ProductVariant? @relation(fields: [variantId], references: [id])
 
   @@map("stock_batches")
 }
 
 model Sale {
-  id              String     @id @default(uuid()) @db.Uuid
-  createdAt       DateTime   @default(now()) @map("created_at")
-  updatedAt       DateTime   @updatedAt @map("updated_at")
-  deletedAt       DateTime?  @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  branchId        String     @db.Uuid @map("branch_id")
-  terminalId      String     @db.Uuid @map("terminal_id")
-  shiftId         String?    @db.Uuid @map("shift_id")
+  branchId        String     @map("branch_id") @db.Uuid
+  terminalId      String     @map("terminal_id") @db.Uuid
+  shiftId         String?    @map("shift_id") @db.Uuid
   receiptNo       String     @map("receipt_no")
   orderType       OrderType  @map("order_type")
   status          SaleStatus
   statusReason    String?    @map("status_reason")
   subtotal        Int
   discount        Int        @default(0)
-  discountId      String?    @db.Uuid @map("discount_id")
+  discountId      String?    @map("discount_id") @db.Uuid
   serviceCharge   Int        @default(0) @map("service_charge")
   scPwd           Json?      @map("sc_pwd")
   scPwdDiscount   Int        @default(0) @map("sc_pwd_discount")
@@ -594,52 +722,58 @@ model Sale {
   syncedAt        DateTime?  @map("synced_at")
   voidedAt        DateTime?  @map("voided_at")
   refundedAt      DateTime?  @map("refunded_at")
-  refundShiftId   String?    @db.Uuid @map("refund_shift_id")
+  refundShiftId   String?    @map("refund_shift_id") @db.Uuid
   draft           Json
+  operatorUserId String? @map("operator_user_id") @db.Uuid
+  statusRequestedByUserId String? @map("status_requested_by_user_id") @db.Uuid
+  statusApprovedByUserId String? @map("status_approved_by_user_id") @db.Uuid
 
   // relations
-  branch          Branch      @relation(fields: [branchId], references: [id])
-  terminal        Terminal    @relation(fields: [terminalId], references: [id])
-  shift           Shift?      @relation(fields: [shiftId], references: [id])
-  discount_rel    Discount?   @relation(fields: [discountId], references: [id])
-  items           SaleItem[]
-  payments        SalePayment[]
+  branch       Branch        @relation(fields: [branchId], references: [id])
+  terminal     Terminal      @relation(fields: [terminalId], references: [id])
+  shift        Shift?        @relation(fields: [shiftId], references: [id])
+  discount_rel Discount?     @relation(fields: [discountId], references: [id])
+  items        SaleItem[]
+  payments     SalePayment[]
+  operator User? @relation("SaleOperator", fields: [operatorUserId], references: [id])
+  statusRequester User? @relation("SaleStatusRequester", fields: [statusRequestedByUserId], references: [id])
+  statusApprover User? @relation("SaleStatusApprover", fields: [statusApprovedByUserId], references: [id])
 
   @@unique([terminalId, receiptNo])
   @@map("sales")
 }
 
 model SaleItem {
-  id            String         @id @default(uuid()) @db.Uuid
-  createdAt     DateTime       @default(now()) @map("created_at")
-  updatedAt     DateTime       @updatedAt @map("updated_at")
-  deletedAt     DateTime?      @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  saleId        String         @db.Uuid @map("sale_id")
-  productId     String?        @db.Uuid @map("product_id")
-  variantId     String?        @db.Uuid @map("variant_id")
-  nameSnapshot  String         @map("name_snapshot")
-  qty           Decimal        @db.Decimal(10, 3)
-  unitPrice     Int            @map("unit_price")
-  costSnapshot  Int?           @map("cost_snapshot")
-  discount      Int            @default(0)
-  discountId    String?        @db.Uuid @map("discount_id")
-  modifiers     Json
+  saleId       String  @map("sale_id") @db.Uuid
+  productId    String? @map("product_id") @db.Uuid
+  variantId    String? @map("variant_id") @db.Uuid
+  nameSnapshot String  @map("name_snapshot")
+  qty          Decimal @db.Decimal(10, 3)
+  unitPrice    Int     @map("unit_price")
+  costSnapshot Int?    @map("cost_snapshot")
+  discount     Int     @default(0)
+  discountId   String? @map("discount_id") @db.Uuid
+  modifiers    Json
 
   // relations
-  sale          Sale           @relation(fields: [saleId], references: [id])
-  discount_rel  Discount?      @relation(fields: [discountId], references: [id])
+  sale         Sale      @relation(fields: [saleId], references: [id])
+  discount_rel Discount? @relation(fields: [discountId], references: [id])
 
   @@map("sale_items")
 }
 
 model SalePayment {
-  id        String        @id @default(uuid()) @db.Uuid
-  createdAt DateTime      @default(now()) @map("created_at")
-  updatedAt DateTime      @updatedAt @map("updated_at")
-  deletedAt DateTime?     @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  saleId    String        @db.Uuid @map("sale_id")
+  saleId    String        @map("sale_id") @db.Uuid
   method    PaymentMethod
   reference String?
   amount    Int
@@ -647,46 +781,64 @@ model SalePayment {
   change    Int
 
   // relations
-  sale      Sale          @relation(fields: [saleId], references: [id])
+  sale Sale @relation(fields: [saleId], references: [id])
 
   @@map("sale_payments")
 }
 
 model Notification {
-  id             String           @id @default(uuid()) @db.Uuid
-  createdAt      DateTime         @default(now()) @map("created_at")
-  updatedAt      DateTime         @updatedAt @map("updated_at")
-  deletedAt      DateTime?        @map("deleted_at")
+  alertKey   String?   @unique @map("alert_key")
+  resolvedAt DateTime? @map("resolved_at")
+  id         String    @id @default(uuid()) @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
 
-  recipientType  RecipientType    @map("recipient_type")
-  recipientId    String           @db.Uuid @map("recipient_id")
-  type           NotificationType
-  title          String
-  body           String
-  businessId     String?          @db.Uuid @map("business_id")
-  branchId       String?          @db.Uuid @map("branch_id")
-  entityId       String?          @db.Uuid @map("entity_id")
-  readAt         DateTime?        @map("read_at")
+  recipientType RecipientType    @map("recipient_type")
+  recipientId   String           @map("recipient_id") @db.Uuid
+  type          NotificationType
+  title         String
+  body          String
+  businessId    String?          @map("business_id") @db.Uuid
+  branchId      String?          @map("branch_id") @db.Uuid
+  entityId      String?          @map("entity_id") @db.Uuid
+  readAt        DateTime?        @map("read_at")
 
   @@map("notifications")
 }
 
 model AuditLog {
-  id          String    @id @default(uuid()) @db.Uuid
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime  @updatedAt @map("updated_at")
-  deletedAt   DateTime? @map("deleted_at")
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
 
-  actorType   ActorType @map("actor_type")
-  actorId     String?   @db.Uuid @map("actor_id")
-  ownerId     String?   @db.Uuid @map("owner_id")
-  businessId  String?   @db.Uuid @map("business_id")
-  branchId    String?   @db.Uuid @map("branch_id")
-  action      String
-  entityType  String    @map("entity_type")
-  entityId    String?   @db.Uuid @map("entity_id")
-  changes     Json
-  metadata    Json
+  actorType  ActorType @map("actor_type")
+  actorId    String?   @map("actor_id") @db.Uuid
+  ownerId    String?   @map("owner_id") @db.Uuid
+  businessId String?   @map("business_id") @db.Uuid
+  branchId   String?   @map("branch_id") @db.Uuid
+  action     String
+  entityType String    @map("entity_type")
+  entityId   String?   @map("entity_id") @db.Uuid
+  changes    Json
+  metadata   Json
 
   @@map("audit_logs")
+}
+
+model JobDelivery {
+  id         String    @id @default(uuid()) @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  jobKey     String    @unique @map("job_key")
+  businessId String?   @map("business_id") @db.Uuid
+  status     String    @default("pending")
+  claimedAt  DateTime? @map("claimed_at")
+  sentAt     DateTime? @map("sent_at")
+  attempts   Int       @default(0)
+  lastError  String?   @map("last_error")
+  payload    Json
+
+  @@map("job_deliveries")
 }

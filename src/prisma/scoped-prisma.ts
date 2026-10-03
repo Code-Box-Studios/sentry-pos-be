@@ -657,13 +657,25 @@ function auditMetadata(ctx: RequestContext): AnyArgs {
     requestId: ctx.requestId,
     sessionId: ctx.sessionId ?? undefined,
     deviceTimestamp: ctx.deviceTimestamp ?? undefined,
+    terminalId: ctx.terminalId,
+    operatorUserId: ctx.operator?.userId,
+    operatorRole: ctx.operator?.role,
+    approvedByUserId: ctx.approvalActor?.userId,
+    approverRole: ctx.approvalActor?.role,
+    actorRole:
+      ctx.operator?.role ??
+      ctx.approvalActor?.role ??
+      (ctx.actor?.type === 'staff' ? 'manager' : ctx.actor?.type),
   };
 }
 
 function actorTypeFor(
   ctx: RequestContext,
-): 'owner' | 'terminal' | 'platform_admin' {
+): 'owner' | 'staff' | 'terminal' | 'platform_admin' {
+  const human = ctx.operator ?? ctx.approvalActor;
+  if (human) return human.role === 'owner' ? 'owner' : 'staff';
   const t = ctx.actor?.type;
+  if (t === 'staff') return 'staff';
   if (t === 'terminal') return 'terminal';
   if (t === 'platform_admin') return 'platform_admin';
   return 'owner';
@@ -725,7 +737,11 @@ async function writeAudit(
   await runner.auditLog.create({
     data: {
       actorType: actorTypeFor(ctx),
-      actorId: ctx.actor?.id ?? null,
+      actorId:
+        ctx.operator?.userId ??
+        ctx.approvalActor?.userId ??
+        ctx.actor?.id ??
+        null,
       ownerId: ctx.ownerId,
       businessId,
       branchId,
@@ -862,7 +878,10 @@ export function createScopedPrisma(base: PrismaService) {
               a.where = mergeDeletedNull(a.where);
               a = injectNestedSoftDelete(model, a) ?? a;
             }
-            return query(a);
+            // Preserve read-your-writes and row-lock consistency inside the
+            // explicitly registered transaction, after applying scope filters.
+            const tx = registeredTx(ctx);
+            return tx ? delegateOf(tx, model)[operation](a) : query(a);
           }
 
           // ---------------- MUTATIONS --------------------------------------

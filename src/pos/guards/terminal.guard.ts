@@ -56,8 +56,20 @@ export class TerminalGuard implements CanActivate {
       businessId: terminal.branch.businessId,
       branchId: terminal.branchId,
       terminalCode: terminal.code,
+      terminalId: terminal.id,
+      deviceTokenHash,
       sessionId: deviceTokenHash.slice(0, 8),
     });
+
+    // Archiving any ancestor revokes the terminal, including open shifts that
+    // would otherwise qualify for the owner's suspension grace period.
+    if (
+      owner.deletedAt ||
+      terminal.branch.business.deletedAt ||
+      terminal.branch.deletedAt
+    ) {
+      throw new UnauthorizedError();
+    }
 
     // Owner-status gate (§8).
     if (owner.status === 'hard_suspended' || owner.status === 'closed') {

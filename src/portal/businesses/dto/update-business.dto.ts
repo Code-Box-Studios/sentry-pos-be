@@ -20,6 +20,10 @@ import { HHMM_REGEX } from '../../../common/validation-constants';
  */
 export class UpdateBusinessDto {
   @IsOptional()
+  @IsBoolean()
+  dailySummaryEnabled?: boolean;
+
+  @IsOptional()
   @IsString()
   @MinLength(1)
   @MaxLength(200)
@@ -52,6 +56,10 @@ export class UpdateBusinessDto {
   @IsOptional()
   @IsBoolean()
   allowMiscItems?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  blindCloseEnabled?: boolean;
 
   @IsOptional()
   @IsInt()

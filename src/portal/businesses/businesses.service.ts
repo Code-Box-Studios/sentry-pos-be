@@ -125,6 +125,9 @@ export class BusinessesService {
   async update(id: string, dto: UpdateBusinessDto): Promise<BusinessResponse> {
     const existing = await this.get(id); // 404 if missing / not owned
     const data = {
+      ...(dto.dailySummaryEnabled !== undefined
+        ? { dailySummaryEnabled: dto.dailySummaryEnabled }
+        : {}),
       ...(dto.name !== undefined ? { name: dto.name } : {}),
       ...(dto.type !== undefined ? { type: dto.type } : {}),
       ...(dto.currency !== undefined ? { currency: dto.currency } : {}),
@@ -137,6 +140,9 @@ export class BusinessesService {
         : {}),
       ...(dto.allowMiscItems !== undefined
         ? { allowMiscItems: dto.allowMiscItems }
+        : {}),
+      ...(dto.blindCloseEnabled !== undefined
+        ? { blindCloseEnabled: dto.blindCloseEnabled }
         : {}),
       ...(dto.expiryWarningDays !== undefined
         ? { expiryWarningDays: dto.expiryWarningDays }

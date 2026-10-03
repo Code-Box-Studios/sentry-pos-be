@@ -1,5 +1,9 @@
 import type { Response } from 'express';
 import { renderReport } from './report-response';
+import {
+  requestContext,
+  RequestContext,
+} from '../../common/context/request-context';
 
 function fakeRes() {
   const setHeader = jest.fn();
@@ -13,6 +17,61 @@ const sections = (d: typeof data) => [
 ];
 
 describe('renderReport', () => {
+  it('does not leak unit costs through inventory values or CSV totals to managers', () => {
+    const context = { actor: { type: 'staff', id: 'u-1' } } as RequestContext;
+    const report = {
+      rows: [{ qty: 2, valueC: 8600 }],
+      totals: { valueC: 8600 },
+    };
+    const toSections = () => [
+      { columns: ['Quantity', 'Value'], rows: [[2, 8600]] },
+    ];
+    requestContext.run(context, () => {
+      const { res } = fakeRes();
+      expect(
+        renderReport(res, 'inventory-on-hand', query, report, toSections),
+      ).toEqual({ rows: [{ qty: 2 }], totals: {} });
+      const csv = renderReport(
+        res,
+        'inventory-on-hand',
+        { ...query, format: 'csv' },
+        report,
+        toSections,
+      );
+      expect(csv).toContain('Quantity');
+      expect(csv).not.toContain('8600');
+      expect(csv).not.toContain('Value');
+    });
+  });
+  it('omits cost and margin columns in manager JSON and CSV exports', () => {
+    const context = { actor: { type: 'staff', id: 'u-1' } } as RequestContext;
+    const report = { salesC: 10000, costC: 4300, grossMarginC: 5700 };
+    const toSections = (value: typeof report) => [
+      {
+        columns: ['Sales', 'Cost', 'Gross margin'],
+        rows: [[value.salesC, value.costC, value.grossMarginC]],
+      },
+    ];
+    requestContext.run(context, () => {
+      const { res } = fakeRes();
+      expect(renderReport(res, 'sales', query, report, toSections)).toEqual({
+        salesC: 10000,
+      });
+      const csv = renderReport(
+        res,
+        'sales',
+        { ...query, format: 'csv' },
+        report,
+        toSections,
+      );
+      expect(csv).toContain('Sales');
+      expect(csv).not.toContain('Cost');
+      expect(csv).not.toContain('margin');
+      expect(csv).not.toContain('4300');
+      expect(csv).not.toContain('5700');
+    });
+  });
+
   it('returns the data untouched for JSON, setting no headers', () => {
     const { res, setHeader } = fakeRes();
     expect(renderReport(res, 'overview', query, data, sections)).toBe(data);

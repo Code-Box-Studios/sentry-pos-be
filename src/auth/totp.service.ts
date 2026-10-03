@@ -3,7 +3,7 @@ import { randomBytes } from 'crypto';
 import { generateSecret, generateURI, verifySync } from 'otplib';
 import { PrismaService } from '../prisma/prisma.service';
 import { hashSecret, verifySecret } from './hashing';
-import { TotpInvalidError } from '../common/errors/api-errors';
+import { ForbiddenError, TotpInvalidError } from '../common/errors/api-errors';
 
 const RECOVERY_CODE_COUNT = 8;
 const RECOVERY_CODE_BYTES = 10; // 20 hex chars per code
@@ -49,6 +49,11 @@ export class TotpService {
     const user = await this.raw.user.findUniqueOrThrow({
       where: { id: userId },
     });
+    if (user.role !== 'platform_admin' || !user.email) {
+      throw new ForbiddenError(
+        'Platform admin email is required for TOTP setup.',
+      );
+    }
 
     const secret = generateSecret();
     const otpauthUri = generateURI({

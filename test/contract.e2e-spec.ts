@@ -76,7 +76,7 @@ describe('POS API contract (e2e)', () => {
       },
     });
     const email = `maria-${seq}-${Date.now()}@test.com`;
-    await raw.user.create({
+    const ownerUser = await raw.user.create({
       data: {
         email,
         role: 'owner',
@@ -132,7 +132,7 @@ describe('POS API contract (e2e)', () => {
     await raw.branchStock.create({
       data: { branchId: branch.id, productId: rice.id, qty: '23.45' },
     });
-    return { owner, email, business, branch, coffee, rice };
+    return { owner, ownerUser, email, business, branch, coffee, rice };
   }
 
   function buildDraft(shiftId: string, coffeeId: string, qty: number) {
@@ -301,7 +301,15 @@ describe('POS API contract (e2e)', () => {
       })
       .expect(201);
     const device = pair.body.deviceToken as string;
-    const auth = { Authorization: bearer(device) };
+    const unlocked = await request(server())
+      .post('/v1/pos/operators/unlock')
+      .set('Authorization', bearer(device))
+      .send({ userId: t.ownerUser.id, pin: PIN })
+      .expect(201);
+    const auth = {
+      Authorization: bearer(device),
+      'X-Operator-Token': unlocked.body.token as string,
+    };
 
     // pullCatalog — Decimal taxRate as a number.
     const catalog = await request(server())

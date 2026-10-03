@@ -28,7 +28,7 @@ const raw = new PrismaClient();
 const sha256 = (t: string) => createHash('sha256').update(t).digest('hex');
 const TAX_RATE = 0.12;
 const SC_RATE = 0.05;
-const PIN = '4921';
+const PIN = '492100';
 
 let seq = 0;
 
@@ -77,7 +77,7 @@ describe('POS void + refund (e2e)', () => {
         maxBusinesses: 5,
       },
     });
-    await raw.user.create({
+    const ownerUser = await raw.user.create({
       data: {
         email: `user-${seq}-${Date.now()}@test.com`,
         role: 'owner',
@@ -120,6 +120,7 @@ describe('POS void + refund (e2e)', () => {
         terminalId: terminal.id,
         openedAt: new Date(),
         openingCash: 200000,
+        operatorUserId: ownerUser.id,
       },
     });
     const category = await raw.category.create({
@@ -139,9 +140,17 @@ describe('POS void + refund (e2e)', () => {
       data: { branchId: branch.id, productId: p1.id, qty: '5' },
     });
 
+    const unlocked = await request(server())
+      .post('/v1/pos/operators/unlock')
+      .set('Authorization', bearer(deviceToken))
+      .send({ userId: ownerUser.id, pin: PIN })
+      .expect(201);
+
     return {
       owner,
+      ownerUserId: ownerUser.id,
       deviceToken,
+      operatorToken: unlocked.body.token as string,
       branchId: branch.id,
       terminalId: terminal.id,
       shiftId: shift.id,
@@ -168,6 +177,7 @@ describe('POS void + refund (e2e)', () => {
   /** Create a completed cash sale via the real endpoint; return CompletedSale. */
   async function makeSale(w: {
     deviceToken: string;
+    operatorToken: string;
     shiftId: string;
     p1: { id: string };
   }) {
@@ -205,10 +215,170 @@ describe('POS void + refund (e2e)', () => {
     const res = await request(server())
       .post('/v1/pos/sales')
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send(draft)
       .expect(201);
     return res.body;
   }
+
+  async function switchToCashier(w: Awaited<ReturnType<typeof seedWorld>>) {
+    const cashier = await raw.user.create({
+      data: {
+        role: 'cashier',
+        ownerId: w.owner.id,
+        pinHash: await hashSecret('654321'),
+      },
+    });
+    await raw.staffProfile.create({
+      data: {
+        userId: cashier.id,
+        businessId: (
+          await raw.branch.findUniqueOrThrow({
+            where: { id: w.branchId },
+            select: { businessId: true },
+          })
+        ).businessId,
+        name: 'Ana',
+        status: 'active',
+        branches: { create: [{ branchId: w.branchId }] },
+      },
+    });
+    await raw.shift.update({
+      where: { id: w.shiftId },
+      data: { operatorUserId: cashier.id },
+    });
+    const unlocked = await request(server())
+      .post('/v1/pos/operators/unlock')
+      .set('Authorization', bearer(w.deviceToken))
+      .send({ userId: cashier.id, pin: '654321' })
+      .expect(201);
+    w.operatorToken = unlocked.body.token as string;
+    return cashier;
+  }
+
+  it('requires an assigned manager or owner PIN for a cashier void without taking over the drawer', async () => {
+    const w = await seedWorld();
+    const sale = await makeSale(w);
+    const cashier = await switchToCashier(w);
+    await request(server())
+      .post(`/v1/pos/sales/${sale.id}/void`)
+      .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
+      .send({ reason: 'Wrong item' })
+      .expect(403);
+    const businessId = (
+      await raw.branch.findUniqueOrThrow({
+        where: { id: w.branchId },
+        select: { businessId: true },
+      })
+    ).businessId;
+    const manager = await raw.user.create({
+      data: {
+        role: 'manager',
+        ownerId: w.owner.id,
+        email: 'manager-approval@example.test',
+        pinHash: await hashSecret('112233'),
+      },
+    });
+    await raw.staffProfile.create({
+      data: {
+        userId: manager.id,
+        businessId,
+        name: 'Mia',
+        status: 'active',
+        branches: { create: [{ branchId: w.branchId }] },
+      },
+    });
+    const result = await request(server())
+      .post(`/v1/pos/sales/${sale.id}/void`)
+      .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
+      .send({
+        reason: 'Wrong item',
+        approval: { approverUserId: manager.id, pin: '112233' },
+      })
+      .expect(200);
+    expect(result.body.operatorUserId).toBe(w.ownerUserId);
+    expect(result.body.statusRequestedByUserId).toBe(cashier.id);
+    expect(result.body.statusApprovedByUserId).toBe(manager.id);
+    const changed = await raw.sale.findUniqueOrThrow({
+      where: { id: sale.id as string },
+    });
+    expect(changed.statusRequestedByUserId).toBe(cashier.id);
+    expect(changed.statusApprovedByUserId).toBe(manager.id);
+    const restoration = await raw.stockMovement.findFirstOrThrow({
+      where: { refId: sale.id as string, type: 'void' },
+    });
+    expect(restoration.operatorUserId).toBe(cashier.id);
+    expect(restoration.approvedByUserId).toBe(manager.id);
+    expect(
+      (await raw.shift.findUniqueOrThrow({ where: { id: w.shiftId } }))
+        .operatorUserId,
+    ).toBe(cashier.id);
+  });
+
+  it('keeps a cashier refund pending until an assigned approver enters a valid PIN', async () => {
+    const w = await seedWorld();
+    const sale = await makeSale(w);
+    const cashier = await switchToCashier(w);
+    const businessId = (
+      await raw.branch.findUniqueOrThrow({
+        where: { id: w.branchId },
+        select: { businessId: true },
+      })
+    ).businessId;
+    const otherBranch = await raw.branch.create({
+      data: {
+        businessId,
+        name: 'Other',
+        code: 'OTH',
+        address: 'Street',
+      },
+    });
+    const manager = await raw.user.create({
+      data: {
+        role: 'manager',
+        ownerId: w.owner.id,
+        email: 'manager-refund@example.test',
+        pinHash: await hashSecret('112233'),
+      },
+    });
+    const profile = await raw.staffProfile.create({
+      data: {
+        userId: manager.id,
+        businessId,
+        name: 'Mia',
+        status: 'active',
+        branches: { create: [{ branchId: otherBranch.id }] },
+      },
+    });
+    const refund = (approval?: { approverUserId: string; pin: string }) =>
+      request(server())
+        .post(`/v1/pos/sales/${sale.id}/refund`)
+        .set('Authorization', bearer(w.deviceToken))
+        .set('X-Operator-Token', w.operatorToken)
+        .send({ reason: 'Customer request', approval });
+    await refund().expect(403);
+    await refund({ approverUserId: manager.id, pin: '112233' }).expect(403);
+    await raw.staffBranch.create({
+      data: { staffProfileId: profile.id, branchId: w.branchId },
+    });
+    await refund({ approverUserId: manager.id, pin: '000000' }).expect(403);
+    expect(
+      (await raw.user.findUniqueOrThrow({ where: { id: manager.id } }))
+        .failedPinCount,
+    ).toBe(1);
+    await refund({ approverUserId: manager.id, pin: '112233' }).expect(200);
+    const changed = await raw.sale.findUniqueOrThrow({
+      where: { id: sale.id as string },
+    });
+    expect(changed.statusRequestedByUserId).toBe(cashier.id);
+    expect(changed.statusApprovedByUserId).toBe(manager.id);
+    expect(
+      (await raw.shift.findUniqueOrThrow({ where: { id: w.shiftId } }))
+        .operatorUserId,
+    ).toBe(cashier.id);
+  });
 
   const stockQty = async (branchId: string, productId: string) => {
     const level = await raw.branchStock.findFirstOrThrow({
@@ -216,6 +386,51 @@ describe('POS void + refund (e2e)', () => {
     });
     return level.qty.toString();
   };
+
+  it('uses the manager own PIN for a direct refund, not the owner PIN', async () => {
+    const w = await seedWorld();
+    const sale = await makeSale(w);
+    const businessId = (
+      await raw.branch.findUniqueOrThrow({ where: { id: w.branchId } })
+    ).businessId;
+    const manager = await raw.user.create({
+      data: {
+        role: 'manager',
+        ownerId: w.owner.id,
+        email: 'direct-refund@example.test',
+        pinHash: await hashSecret('112233'),
+      },
+    });
+    await raw.staffProfile.create({
+      data: {
+        userId: manager.id,
+        businessId,
+        name: 'Mia',
+        status: 'active',
+        branches: { create: [{ branchId: w.branchId }] },
+      },
+    });
+    await raw.shift.update({
+      where: { id: w.shiftId },
+      data: { closedAt: new Date() },
+    });
+    const unlocked = await request(server())
+      .post('/v1/pos/operators/unlock')
+      .set('Authorization', bearer(w.deviceToken))
+      .send({ userId: manager.id, pin: '112233' })
+      .expect(201);
+    const refund = (pin: string) =>
+      request(server())
+        .post(`/v1/pos/sales/${sale.id}/refund`)
+        .set('Authorization', bearer(w.deviceToken))
+        .set('X-Operator-Token', unlocked.body.token as string)
+        .send({ reason: 'Customer request', pin });
+    await refund(PIN).expect(403);
+    const changed = await refund('112233').expect(200);
+    expect(changed.body.statusRequestedByUserId).toBe(manager.id);
+    expect(changed.body.statusApprovedByUserId).toBe(manager.id);
+    expect(changed.body.refundShiftId).toBeNull();
+  });
 
   // ------------------------------------------------------------------ void
 
@@ -227,6 +442,7 @@ describe('POS void + refund (e2e)', () => {
     const res = await request(server())
       .post(`/v1/pos/sales/${sale.id}/void`)
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ reason: 'wrong item' })
       .expect(200);
     expect(res.body.status).toBe('voided');
@@ -248,12 +464,14 @@ describe('POS void + refund (e2e)', () => {
     await request(server())
       .post('/v1/pos/shifts/current/close')
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ countedCashC: 0 })
       .expect(200);
 
     await request(server())
       .post(`/v1/pos/sales/${sale.id}/void`)
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ reason: 'too late' })
       .expect(422);
     expect(await stockQty(w.branchId, w.p1.id)).toBe('3'); // not restored
@@ -265,6 +483,7 @@ describe('POS void + refund (e2e)', () => {
     await request(server())
       .post(`/v1/pos/sales/${sale.id}/void`)
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ reason: '   ' })
       .expect(422);
   });
@@ -278,6 +497,7 @@ describe('POS void + refund (e2e)', () => {
       request(server())
         .post(`/v1/pos/sales/${sale.id}/refund`)
         .set('Authorization', bearer(w.deviceToken))
+        .set('X-Operator-Token', w.operatorToken)
         .send({ reason: 'x', pin });
 
     const remaining: number[] = [];
@@ -313,6 +533,7 @@ describe('POS void + refund (e2e)', () => {
     const res = await request(server())
       .post(`/v1/pos/sales/${sale.id}/refund`)
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ reason: 'customer changed mind', pin: PIN })
       .expect(200);
     expect(res.body.status).toBe('refunded');
@@ -330,6 +551,7 @@ describe('POS void + refund (e2e)', () => {
     const totals = await request(server())
       .get('/v1/pos/shifts/current/totals')
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .expect(200);
     expect(totals.body.refundCount).toBe(1);
     expect(totals.body.cashRefundsC).toBe(sale.totals.totalC);
@@ -343,18 +565,21 @@ describe('POS void + refund (e2e)', () => {
     await request(server())
       .post('/v1/pos/shifts/current/close')
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ countedCashC: 0 })
       .expect(200);
     // A brand-new shift is opened.
     await request(server())
       .post('/v1/pos/shifts')
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ openingCashC: 100000 })
       .expect(201);
 
     const res = await request(server())
       .post(`/v1/pos/sales/${sale.id}/refund`)
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ reason: 'late refund', pin: PIN })
       .expect(200);
     expect(res.body.status).toBe('refunded');
@@ -364,6 +589,7 @@ describe('POS void + refund (e2e)', () => {
     const totals = await request(server())
       .get('/v1/pos/shifts/current/totals')
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .expect(200);
     expect(totals.body.refundCount).toBe(0);
     expect(totals.body.cashRefundsC).toBe(0);
@@ -376,6 +602,7 @@ describe('POS void + refund (e2e)', () => {
     await request(server())
       .post(`/v1/pos/sales/${sale.id}/void`)
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ reason: 'void first' })
       .expect(200);
     expect(await stockQty(w.branchId, w.p1.id)).toBe('5');
@@ -383,6 +610,7 @@ describe('POS void + refund (e2e)', () => {
     await request(server())
       .post(`/v1/pos/sales/${sale.id}/refund`)
       .set('Authorization', bearer(w.deviceToken))
+      .set('X-Operator-Token', w.operatorToken)
       .send({ reason: 'nope', pin: PIN })
       .expect(422);
 

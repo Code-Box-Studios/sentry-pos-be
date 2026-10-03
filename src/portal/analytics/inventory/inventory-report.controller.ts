@@ -12,6 +12,7 @@ import {
   type OnHandReport,
   type ShrinkageReport,
 } from './inventory-report.service';
+import { ManagerAccess } from '../../../staff/portal-scope';
 
 /**
  * §5 Inventory —
@@ -19,6 +20,7 @@ import {
  */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
+@ManagerAccess({ action: 'portal_reports', analytics: true })
 export class InventoryReportController {
   constructor(private readonly inventory: InventoryReportService) {}
 

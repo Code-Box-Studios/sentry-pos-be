@@ -3,7 +3,11 @@ import { Owner, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InviteService } from '../auth/invite.service';
 import { AuditService } from '../auth/audit.service';
-import { EmailTakenError, NotFoundError } from '../common/errors/api-errors';
+import {
+  EmailTakenError,
+  NotFoundError,
+  ValidationFailedError,
+} from '../common/errors/api-errors';
 import { CreateOwnerDto } from './dto/create-owner.dto';
 import { UpdateOwnerDto } from './dto/update-owner.dto';
 import { SuspendOwnerDto } from './dto/suspend-owner.dto';
@@ -124,9 +128,13 @@ export class OwnersService {
    * - `hard` → `hard_suspended` (everything dies instantly).
    */
   async suspend(id: string, dto: SuspendOwnerDto): Promise<Owner> {
-    await this.get(id); // 404 before we attempt the write
+    const before = await this.get(id);
+    if (before.status === 'closed' || before.closedAt)
+      throw new ValidationFailedError(
+        'Closed accounts cannot be suspended or reinstated.',
+      );
     const owner = await this.raw.owner.update({
-      where: { id },
+      where: { id, closedAt: null, status: { not: 'closed' } },
       data: {
         status: dto.tier === 'hard' ? 'hard_suspended' : 'suspended',
         suspendedAt: new Date(),
@@ -142,9 +150,13 @@ export class OwnersService {
   }
 
   async reinstate(id: string): Promise<Owner> {
-    await this.get(id);
+    const before = await this.get(id);
+    if (before.status === 'closed' || before.closedAt)
+      throw new ValidationFailedError(
+        'Closed accounts cannot be suspended or reinstated.',
+      );
     const owner = await this.raw.owner.update({
-      where: { id },
+      where: { id, closedAt: null, status: { not: 'closed' } },
       data: { status: 'active', suspendedAt: null },
     });
 

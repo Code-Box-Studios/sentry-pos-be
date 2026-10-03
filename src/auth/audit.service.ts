@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { ActorType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { getContext, RequestContext } from '../common/context/request-context';
 
@@ -35,6 +35,7 @@ export class AuditService {
     ownerId: string | null,
     meta: Record<string, unknown> = {},
     client: AuditClient = this.raw,
+    actorType?: ActorType,
   ): Promise<void> {
     let ctx: RequestContext | null = null;
     try {
@@ -45,7 +46,7 @@ export class AuditService {
 
     await client.auditLog.create({
       data: {
-        actorType: ownerId ? 'owner' : 'platform_admin',
+        actorType: actorType ?? (ownerId ? 'owner' : 'platform_admin'),
         actorId: userId,
         ownerId,
         action,

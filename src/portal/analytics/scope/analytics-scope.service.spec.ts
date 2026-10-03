@@ -6,6 +6,10 @@ import {
   ValidationFailedError,
 } from '../../../common/errors/api-errors';
 import type { AnalyticsQueryDto } from '../dto/analytics-query.dto';
+import {
+  requestContext,
+  RequestContext,
+} from '../../../common/context/request-context';
 
 type BusinessRow = {
   id: string;
@@ -49,6 +53,27 @@ const query = (over: Partial<AnalyticsQueryDto> = {}): AnalyticsQueryDto => ({
 });
 
 describe('AnalyticsScopeService.resolve', () => {
+  it('constrains a manager rollup to their business and assigned branches', async () => {
+    const { service, businessFindMany, branchFindMany } = makeService(
+      [midnight],
+      [{ id: 'br-1', businessId: 'b-1' }],
+    );
+    const context = {
+      actor: { type: 'staff', id: 'u-1' },
+      managerBusinessId: 'b-1',
+      managerBranchIds: ['br-1'],
+    } as RequestContext;
+    await requestContext.run(context, () => service.resolve(query()));
+    expect(businessFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'b-1' } }),
+    );
+    expect(branchFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { businessId: { in: ['b-1'] }, id: { in: ['br-1'] } },
+      }),
+    );
+  });
+
   it('rejects a branchId without a businessId', async () => {
     const { service } = makeService([midnight], []);
     await expect(service.resolve(query({ branchId: 'br-1' }))).rejects.toThrow(

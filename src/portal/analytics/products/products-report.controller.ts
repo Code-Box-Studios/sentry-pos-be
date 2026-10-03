@@ -24,10 +24,12 @@ import {
   type SlowProductsReport,
   type TopProductsReport,
 } from './products-report.service';
+import { ManagerAccess } from '../../../staff/portal-scope';
 
 /** §3 Products sold — `GET /v1/portal/analytics/products/{top,slow}`. */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
+@ManagerAccess({ action: 'portal_reports', analytics: true })
 export class ProductsReportController {
   constructor(private readonly products: ProductsReportService) {}
 

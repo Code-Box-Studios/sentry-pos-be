@@ -11,6 +11,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { PortalAuthGuard } from '../../auth/guards/portal-auth.guard';
+import { ManagerAccess } from '../../staff/portal-scope';
 import {
   ModifierGroupsService,
   ModifierGroupResponse,
@@ -33,6 +34,7 @@ export class ModifierGroupsController {
   constructor(private readonly groups: ModifierGroupsService) {}
 
   @Get('businesses/:businessId/modifier-groups')
+  @ManagerAccess({ action: 'portal_catalog_read', businessParam: 'businessId' })
   list(
     @Param('businessId', ParseUUIDPipe) businessId: string,
   ): Promise<ModifierGroupResponse[]> {

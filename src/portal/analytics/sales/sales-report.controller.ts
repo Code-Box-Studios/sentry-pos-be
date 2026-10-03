@@ -17,10 +17,12 @@ import {
   patternsCsv,
   trendCsv,
 } from './sales-report.csv';
+import { ManagerAccess } from '../../../staff/portal-scope';
 
 /** Sales reports (analytics-spec §2) under `/v1/portal/analytics/sales/*`. */
 @Controller('portal')
 @UseGuards(PortalAuthGuard)
+@ManagerAccess({ action: 'portal_reports', analytics: true })
 export class SalesReportController {
   constructor(private readonly sales: SalesReportService) {}
 

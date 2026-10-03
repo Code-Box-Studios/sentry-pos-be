@@ -1,18 +1,32 @@
+import { deriveFefo } from './fefo';
 import { Inject, Injectable } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import { Prisma, StockMovement } from '@prisma/client';
+import { AuditService } from '../../auth/audit.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
   SCOPED_PRISMA,
   type ScopedPrisma,
 } from '../../prisma/scoped-prisma.provider';
-import { runWithTxClient } from '../../common/context/request-context';
 import {
+  getContext,
+  runWithTxClient,
+} from '../../common/context/request-context';
+import {
+  ForbiddenError,
   NotFoundError,
   ValidationFailedError,
 } from '../../common/errors/api-errors';
 import { ReceiveDto, ReceiveLineDto } from './dto/receive.dto';
+import {
+  TransferDto,
+  CreateCountDto,
+  UpdateCountDto,
+} from './dto/inventory.dto';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import { ApprovalService } from '../../pos/operators/approval.service';
+import { assertOperatorWrite } from '../../pos/operators/operator-write';
+import { assertManagerWrite } from '../../staff/manager-write';
 
 type ProductWithVariants = Prisma.ProductGetPayload<{
   include: { variants: true };
@@ -20,6 +34,8 @@ type ProductWithVariants = Prisma.ProductGetPayload<{
 
 export interface MovementResponse {
   id: string;
+  operatorUserId: string | null;
+  approvedByUserId: string | null;
   productId: string;
   variantId: string | null;
   type: StockMovement['type'];
@@ -39,6 +55,8 @@ export interface StockLevel {
 function serializeMovement(m: StockMovement): MovementResponse {
   return {
     id: m.id,
+    operatorUserId: m.operatorUserId,
+    approvedByUserId: m.approvedByUserId,
     productId: m.productId,
     variantId: m.variantId,
     type: m.type,
@@ -56,29 +74,64 @@ function serializeMovement(m: StockMovement): MovementResponse {
  * choke point rides it (`runWithTxClient`) and the whole receive/adjust is atomic.
  * `branch_stock.qty >= 0` is guarded by a DB CHECK; movements are the event log.
  *
- * Stock model note: StockBatch has no branchId column (unlike branch_stock /
- * stock_movements), so batches are written via a NESTED create through the
- * product (bypassing the top-level branch scope map) rather than a top-level
- * scoped.stockBatch write.
+ * Batches retain their original received quantity. Branch stock determines
+ * FEFO-derived remaining quantities; sales never mutate batch records.
  */
 @Injectable()
 export class StockService {
   constructor(
     @Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma,
     private readonly raw: PrismaService,
+    private readonly audit: AuditService,
+    private readonly approvals: ApprovalService,
   ) {}
 
   async receive(
     branchId: string,
     dto: ReceiveDto,
   ): Promise<{ operationId: string; movements: MovementResponse[] }> {
+    if (
+      getContext().actor?.type === 'staff' &&
+      dto.lines.some((line) => line.unitCostC !== undefined)
+    ) {
+      throw new ForbiddenError('Managers cannot set unit cost.');
+    }
     this.assertNoDuplicateLines(dto.lines);
-    const operationId = randomUUID();
+    const operationId = dto.id ?? randomUUID();
 
     return this.withLevelCreateRetry(async () => {
       return this.raw.$transaction((tx) =>
         runWithTxClient(tx, async () => {
           const branch = await this.assertBranch(branchId);
+          await this.lockBusiness(tx, branch.businessId);
+          await assertManagerWrite(tx, branch.businessId, branchId);
+          if (dto.id)
+            await this.recordRequest(
+              tx,
+              branch.businessId,
+              'stock-receive',
+              dto.id,
+              {
+                branchId,
+                lines: this.canonicalLines(
+                  dto.lines.map((line) => ({
+                    productId: line.productId,
+                    variantId: line.variantId ?? null,
+                    qty: new Prisma.Decimal(line.qty).toString(),
+                    unitCostC: line.unitCostC ?? null,
+                    expiryDate: line.expiryDate
+                      ? new Date(line.expiryDate).toISOString()
+                      : null,
+                  })),
+                ),
+              },
+            );
+          const replay = await this.scoped.stockMovement.findMany({
+            where: { branchId, refId: operationId, type: 'receive' },
+            orderBy: { createdAt: 'asc' },
+          });
+          if (replay.length)
+            return { operationId, movements: replay.map(serializeMovement) };
           const movements: MovementResponse[] = [];
 
           for (const line of dto.lines) {
@@ -107,6 +160,7 @@ export class StockService {
                 productId: line.productId,
                 variantId,
                 type: 'receive',
+                operatorUserId: getContext().actor!.id,
                 // One operation ref stamped on every movement so a multi-line
                 // receive groups together.
                 refId: operationId,
@@ -118,7 +172,7 @@ export class StockService {
             });
             movements.push(serializeMovement(mv));
 
-            await this.applyCostAndBatch(product, line);
+            await this.applyCostAndBatch(product, line, branchId, mv.id);
           }
 
           return { operationId, movements };
@@ -130,21 +184,36 @@ export class StockService {
   async adjust(
     branchId: string,
     dto: AdjustStockDto,
+    approvedBy: string | null = null,
   ): Promise<{
     productId: string;
     variantId: string | null;
     qty: number;
     movement: MovementResponse;
   }> {
-    // `newQty` is an ABSOLUTE target. Under two concurrent adjusts on the same
-    // level the final qty is authoritative (last-writer-wins, always >= 0 by DTO
-    // + DB CHECK), but the recorded movement deltas are best-effort (each is
-    // computed from the qty read at its own start) and may not sum to the net
-    // change — acceptable for an absolute set.
     return this.withLevelCreateRetry(async () => {
       return this.raw.$transaction((tx) =>
         runWithTxClient(tx, async () => {
+          const ctx = getContext();
+          const isTerminal = ctx.actor?.type === 'terminal';
+          if (isTerminal) {
+            await tx.$queryRaw`SELECT id FROM terminals WHERE id = ${ctx.terminalId}::uuid FOR UPDATE`;
+          }
           const branch = await this.assertBranch(branchId);
+          await this.lockBusiness(tx, branch.businessId);
+          // Portal stock locks business → manager user. Terminal writes must
+          // follow that same order after their device lock to avoid a cycle.
+          if (isTerminal) {
+            await assertOperatorWrite(tx);
+            await this.approvals.assertApproverWrite(tx, approvedBy);
+          }
+          await assertManagerWrite(tx, branch.businessId, branchId);
+          await this.lockLevel(
+            tx,
+            branchId,
+            dto.productId,
+            dto.variantId ?? null,
+          );
           const product = await this.loadProduct(
             branch.businessId,
             dto.productId,
@@ -191,6 +260,8 @@ export class StockService {
               refId: movementId,
               qtyDelta,
               reasonCategory: dto.reasonCategory,
+              operatorUserId: isTerminal ? ctx.operator!.userId : ctx.actor?.id,
+              approvedByUserId: isTerminal ? approvedBy : null,
               ...(dto.note !== undefined ? { note: dto.note } : {}),
             },
           });
@@ -242,6 +313,444 @@ export class StockService {
     }));
   }
 
+  private canonicalLines<
+    T extends { productId: string; variantId: string | null },
+  >(lines: T[]): T[] {
+    return [...lines].sort((a, b) =>
+      (a.productId + ':' + (a.variantId ?? '')).localeCompare(
+        b.productId + ':' + (b.variantId ?? ''),
+      ),
+    );
+  }
+  private async recordRequest(
+    tx: Prisma.TransactionClient,
+    businessId: string,
+    kind: string,
+    id: string,
+    request: unknown,
+  ) {
+    const jobKey = `${kind}:${businessId}:${id}`;
+    const digest = createHash('sha256')
+      .update(JSON.stringify(request))
+      .digest('hex');
+    const existing = await tx.jobDelivery.findUnique({ where: { jobKey } });
+    if (existing) {
+      if ((existing.payload as { digest: string }).digest !== digest)
+        throw new ValidationFailedError(
+          'This request ID was already used with different details. Use a new ID for an edited request.',
+        );
+      return;
+    }
+    await tx.jobDelivery.create({
+      data: {
+        jobKey,
+        businessId,
+        status: 'sent',
+        sentAt: new Date(),
+        payload: { digest },
+      },
+    });
+  }
+
+  /** Scope is proven before locks; advisory lock serializes first-row creation,
+   * while row locks also serialize against terminal sale/refund updates. */
+  private async lockBusiness(tx: Prisma.TransactionClient, businessId: string) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${businessId}, 0))`;
+  }
+  private async lockLevel(
+    tx: Prisma.TransactionClient,
+    branchId: string,
+    productId: string,
+    variantId: string | null,
+  ) {
+    await tx.$queryRaw`SELECT id FROM branch_stock WHERE branch_id=${branchId}::uuid AND product_id=${productId}::uuid AND variant_id IS NOT DISTINCT FROM ${variantId}::uuid AND deleted_at IS NULL FOR UPDATE`;
+  }
+  private async transaction<T>(
+    branchId: string,
+    fn: (tx: Prisma.TransactionClient, businessId: string) => Promise<T>,
+  ): Promise<T> {
+    return this.withLevelCreateRetry(() =>
+      this.raw.$transaction(
+        (tx) =>
+          runWithTxClient(tx, async () => {
+            const branch = await this.assertBranch(branchId);
+            await this.lockBusiness(tx, branch.businessId);
+            await assertManagerWrite(tx, branch.businessId, branchId);
+            return fn(tx, branch.businessId);
+          }),
+        { timeout: 30000 },
+      ),
+    );
+  }
+
+  async transfer(branchId: string, dto: TransferDto) {
+    this.assertNoDuplicateLines(dto.lines);
+    return this.transaction(branchId, async (tx, businessId) => {
+      await this.recordRequest(tx, businessId, 'stock-transfer', dto.id, {
+        branchId,
+        toBranchId: dto.toBranchId,
+        note: dto.note ?? null,
+        lines: this.canonicalLines(
+          dto.lines.map((line) => ({
+            productId: line.productId,
+            variantId: line.variantId ?? null,
+            qty: new Prisma.Decimal(line.qty).toString(),
+          })),
+        ),
+      });
+      const destination = await this.assertBranch(dto.toBranchId);
+      if (destination.businessId !== businessId || branchId === dto.toBranchId)
+        throw new ValidationFailedError(
+          'Transfer requires different branches of the same business.',
+        );
+      const replay = await this.scoped.stockMovement.findMany({
+        where: { branchId, type: 'transfer_out', transferId: dto.id },
+      });
+      if (replay.length)
+        return (await this.transfers(branchId)).find((t) => t.id === dto.id)!;
+      // Canonical row order avoids lock inversions with other inventory workflows.
+      for (const line of [...dto.lines].sort((a, b) =>
+        (a.productId + (a.variantId ?? '')).localeCompare(
+          b.productId + (b.variantId ?? ''),
+        ),
+      )) {
+        const product = await this.loadProduct(businessId, line.productId);
+        this.assertVariantIntegrity(product, line.variantId);
+        const variantId = line.variantId ?? null;
+        for (const branch of [branchId, dto.toBranchId].sort())
+          await this.lockLevel(tx, branch, line.productId, variantId);
+        const source = await this.scoped.branchStock.findFirst({
+          where: { branchId, productId: line.productId, variantId },
+        });
+        if (!source || source.qty.lessThan(line.qty))
+          throw new ValidationFailedError('Insufficient source stock.');
+        const cost = variantId
+          ? product.variants.find((v) => v.id === variantId)!.cost
+          : product.cost;
+        // Derived batch quantities travel with expiry-tracked stock, without
+        // changing the original receive records or allocating sale lines.
+        const batches = product.trackExpiry
+          ? (await this.remainingBatches(branchId)).filter(
+              (b) =>
+                b.productId === line.productId && b.variantId === variantId,
+            )
+          : [];
+        await this.scoped.branchStock.update({
+          where: { id: source.id },
+          data: { qty: { decrement: line.qty } },
+        });
+        await this.addToLevel(
+          dto.toBranchId,
+          line.productId,
+          variantId,
+          line.qty,
+        );
+        for (const [branch, type, qty] of [
+          [branchId, 'transfer_out', -line.qty],
+          [dto.toBranchId, 'transfer_in', line.qty],
+        ] as const) {
+          const movement = await this.scoped.stockMovement.create({
+            data: {
+              branchId: branch,
+              productId: line.productId,
+              variantId,
+              type,
+              qtyDelta: qty,
+              refId: dto.id,
+              transferId: dto.id,
+              operatorUserId: getContext().actor!.id,
+              unitCost: cost,
+              note: dto.note,
+            },
+          });
+          if (type === 'transfer_in') {
+            let left = line.qty;
+            for (const batch of batches) {
+              const amount = Math.min(left, batch.remainingQty);
+              if (amount <= 0) continue;
+              await this.scoped.stockBatch.create({
+                data: {
+                  branchId: branch,
+                  productId: line.productId,
+                  variantId,
+                  qty: amount,
+                  receivedAt: new Date(),
+                  expiresAt: batch.expiryDate,
+                  unitCost: batch.unitCostC,
+                  receiveMovementId: movement.id,
+                },
+              });
+              left -= amount;
+            }
+          }
+        }
+      }
+      return (await this.transfers(branchId)).find((t) => t.id === dto.id)!;
+    });
+  }
+
+  async transfers(branchId: string) {
+    const branch = await this.assertBranch(branchId);
+    const own = await this.scoped.stockMovement.findMany({
+      where: {
+        branchId,
+        type: { in: ['transfer_in', 'transfer_out'] },
+        transferId: { not: null },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    const ids = [...new Set(own.map((m) => m.transferId!))];
+    const rows = await this.scoped.stockMovement.findMany({
+      where: {
+        transferId: { in: ids },
+        branch: { businessId: branch.businessId },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    return ids.map((id) => {
+      const out = rows.filter(
+        (m) => m.transferId === id && m.type === 'transfer_out',
+      );
+      const incoming = rows.find(
+        (m) => m.transferId === id && m.type === 'transfer_in',
+      );
+      return {
+        id,
+        fromBranchId: out[0]?.branchId,
+        toBranchId: incoming?.branchId,
+        createdAt: out[0]?.createdAt,
+        note: out[0]?.note ?? null,
+        lines: out.map((m) => ({
+          productId: m.productId,
+          variantId: m.variantId,
+          qty: -m.qtyDelta.toNumber(),
+        })),
+      };
+    });
+  }
+
+  private serializeCount(
+    count: Prisma.StockCountGetPayload<{ include: { items: true } }>,
+  ) {
+    return {
+      ...count,
+      items: count.items.map((i) => ({
+        ...i,
+        expectedQty: i.expectedQty.toNumber(),
+        countedQty: i.countedQty.toNumber(),
+        variance: i.countedQty.minus(i.expectedQty).toNumber(),
+      })),
+    };
+  }
+  async counts(branchId: string) {
+    await this.assertBranch(branchId);
+    return (
+      await this.scoped.stockCount.findMany({
+        where: { branchId },
+        include: { items: true },
+        orderBy: { createdAt: 'desc' },
+      })
+    ).map((c) => this.serializeCount(c));
+  }
+  async count(branchId: string, id: string) {
+    await this.assertBranch(branchId);
+    const count = await this.scoped.stockCount.findFirst({
+      where: { id, branchId },
+      include: { items: true },
+    });
+    if (!count) throw new NotFoundError('Stock count not found.');
+    return this.serializeCount(count);
+  }
+  private async countItems(businessId: string, dto: UpdateCountDto) {
+    const keys = new Set<string>();
+    for (const item of dto.items) {
+      const key = item.productId + ':' + (item.variantId ?? '');
+      if (keys.has(key))
+        throw new ValidationFailedError('Duplicate count item.');
+      keys.add(key);
+      const product = await this.loadProduct(businessId, item.productId);
+      this.assertVariantIntegrity(product, item.variantId);
+    }
+    return dto.items.map((i) => ({
+      productId: i.productId,
+      variantId: i.variantId ?? null,
+      countedQty: i.countedQty,
+      expectedQty: 0,
+    }));
+  }
+  async createCount(branchId: string, dto: CreateCountDto) {
+    return this.transaction(branchId, async (tx, businessId) => {
+      await this.recordRequest(tx, businessId, 'stock-count', dto.id, {
+        branchId,
+        notes: dto.notes ?? null,
+        items: this.canonicalLines(
+          dto.items.map((item) => ({
+            productId: item.productId,
+            variantId: item.variantId ?? null,
+            countedQty: new Prisma.Decimal(item.countedQty).toString(),
+          })),
+        ),
+      });
+      const existing = await this.scoped.stockCount.findFirst({
+        where: { id: dto.id, branchId },
+        include: { items: true },
+      });
+      if (existing) return this.serializeCount(existing);
+      const items = await this.countItems(businessId, dto);
+      return this.serializeCount(
+        await this.scoped.stockCount.create({
+          data: {
+            id: dto.id,
+            branchId,
+            notes: dto.notes,
+            items: { create: items },
+          },
+          include: { items: true },
+        }),
+      );
+    });
+  }
+  async updateCount(branchId: string, id: string, dto: UpdateCountDto) {
+    return this.transaction(branchId, async (_tx, businessId) => {
+      const count = await this.count(branchId, id);
+      if (count.status !== 'draft')
+        throw new ValidationFailedError('Posted stock counts are immutable.');
+      const items = await this.countItems(businessId, dto);
+      await this.scoped.stockCount.update({
+        where: { id },
+        data: {
+          notes: dto.notes,
+          items: {
+            delete: count.items.map((item) => ({ id: item.id })),
+            create: items,
+          },
+        },
+      });
+      return this.count(branchId, id);
+    });
+  }
+  async postCount(branchId: string, id: string) {
+    return this.transaction(branchId, async (tx, businessId) => {
+      const count = await this.count(branchId, id);
+      if (count.status === 'posted') return count;
+      for (const item of [...count.items].sort((a, b) =>
+        (a.productId + (a.variantId ?? '')).localeCompare(
+          b.productId + (b.variantId ?? ''),
+        ),
+      )) {
+        const product = await this.loadProduct(businessId, item.productId);
+        this.assertVariantIntegrity(product, item.variantId ?? undefined);
+        await this.lockLevel(tx, branchId, item.productId, item.variantId);
+        const existing = await this.scoped.branchStock.findFirst({
+          where: {
+            branchId,
+            productId: item.productId,
+            variantId: item.variantId,
+          },
+        });
+        const expected = existing?.qty ?? new Prisma.Decimal(0);
+        const delta = new Prisma.Decimal(item.countedQty).minus(expected);
+        await this.addToLevel(
+          branchId,
+          item.productId,
+          item.variantId,
+          delta.toNumber(),
+        );
+        await this.scoped.stockCount.update({
+          where: { id },
+          data: {
+            items: {
+              update: {
+                where: { id: item.id },
+                data: { expectedQty: expected },
+              },
+            },
+          },
+        });
+        await this.scoped.stockMovement.create({
+          data: {
+            branchId,
+            productId: item.productId,
+            variantId: item.variantId,
+            type: 'adjustment',
+            refId: id,
+            qtyDelta: delta,
+            reasonCategory: 'count_correction',
+            operatorUserId: getContext().actor!.id,
+            note: count.notes,
+            unitCost: item.variantId
+              ? product.variants.find((v) => v.id === item.variantId)!.cost
+              : product.cost,
+          },
+        });
+      }
+      await this.scoped.stockCount.update({
+        where: { id },
+        data: { status: 'posted', postedAt: new Date() },
+      });
+      return this.count(branchId, id);
+    });
+  }
+
+  private async remainingBatches(branchId: string) {
+    const batches = await this.scoped.stockBatch.findMany({
+      where: { branchId },
+      orderBy: [{ expiresAt: 'asc' }, { receivedAt: 'asc' }, { id: 'asc' }],
+    });
+    const levels = await this.scoped.branchStock.findMany({
+      where: { branchId },
+    });
+    return deriveFefo(batches, levels).map((b) => ({
+      id: b.id,
+      productId: b.productId,
+      variantId: b.variantId,
+      receivedQty: b.qty.toNumber(),
+      remainingQty: b.remainingQty,
+      expiryDate: b.expiresAt,
+      unitCostC: b.unitCost,
+    }));
+  }
+
+  async expiry(branchId: string) {
+    const branch = await this.assertBranch(branchId);
+    const business = await this.scoped.business.findFirstOrThrow({
+      where: { id: branch.businessId },
+    });
+    const asOf = new Date(),
+      warningDays = business.expiryWarningDays;
+    const products = await this.scoped.product.findMany({
+      where: { businessId: branch.businessId, trackExpiry: true },
+      include: { variants: true },
+    });
+    const batches = (await this.remainingBatches(branchId))
+      .filter(
+        (b) =>
+          b.remainingQty > 0 &&
+          b.expiryDate &&
+          b.expiryDate.getTime() <= asOf.getTime() + warningDays * 86400000,
+      )
+      .map((b) => {
+        const product = products.find((p) => p.id === b.productId);
+        return {
+          ...b,
+          productName: product?.name ?? '',
+          variantName:
+            product?.variants.find((v) => v.id === b.variantId)?.name ?? null,
+          daysLeft: Math.ceil(
+            (b.expiryDate!.getTime() - asOf.getTime()) / 86400000,
+          ),
+        };
+      });
+    await this.audit.logPortal(
+      'audit.report_read',
+      'report',
+      null,
+      branch.businessId,
+      { report: 'expiry', branchId },
+    );
+    return { asOf, warningDays, batches };
+  }
+
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
@@ -261,7 +770,7 @@ export class StockService {
         if (
           attempt < 2 &&
           err instanceof Prisma.PrismaClientKnownRequestError &&
-          err.code === 'P2002'
+          ['P2002', 'P2034'].includes(err.code)
         ) {
           continue;
         }
@@ -307,6 +816,8 @@ export class StockService {
         'productId does not reference a product in this branch business.',
       );
     }
+    if (!product.trackStock)
+      throw new ValidationFailedError('Stock tracking is required.');
     return product;
   }
 
@@ -363,6 +874,8 @@ export class StockService {
   private async applyCostAndBatch(
     product: ProductWithVariants,
     line: ReceiveLineDto,
+    branchId: string,
+    receiveMovementId: string,
   ): Promise<void> {
     const data: Prisma.ProductUpdateInput = {};
 
@@ -383,6 +896,8 @@ export class StockService {
       data.stockBatches = {
         create: [
           {
+            branch: { connect: { id: branchId } },
+            receiveMovementId,
             qty: line.qty,
             receivedAt: new Date(),
             ...(line.expiryDate

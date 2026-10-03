@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { TerminalGuard } from '../guards/terminal.guard';
+import { OperatorGuard } from '../operators/operator.guard';
 import {
   SalesService,
   type CompletedSale,
@@ -33,6 +34,7 @@ export class SalesController {
   constructor(private readonly sales: SalesService) {}
 
   @Post()
+  @UseGuards(OperatorGuard)
   async completeSale(
     @Body() dto: SaleDraftDto,
     @Res({ passthrough: true }) res: Response,
@@ -54,19 +56,21 @@ export class SalesController {
 
   @Post(':id/void')
   @HttpCode(200)
+  @UseGuards(OperatorGuard)
   voidSale(
     @Param('id') id: string,
     @Body() dto: VoidSaleDto,
   ): Promise<CompletedSale> {
-    return this.sales.voidSale(id, dto.reason);
+    return this.sales.voidSale(id, dto.reason, dto.approval);
   }
 
   @Post(':id/refund')
   @HttpCode(200)
+  @UseGuards(OperatorGuard)
   refundSale(
     @Param('id') id: string,
     @Body() dto: RefundSaleDto,
   ): Promise<CompletedSale> {
-    return this.sales.refundSale(id, dto.reason, dto.pin);
+    return this.sales.refundSale(id, dto.reason, dto.pin, dto.approval);
   }
 }

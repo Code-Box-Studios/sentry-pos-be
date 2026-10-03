@@ -12,10 +12,13 @@
  * never by business modules through the scoped client.
  */
 export const PLATFORM_MODELS = [
+  'jobDelivery',
   'owner',
   'user',
   'authToken',
   'refreshToken',
+  'staffChallenge',
+  'operatorSession',
 ] as const;
 
 /**
@@ -38,6 +41,7 @@ export const TENANT_DIRECT: Record<
   discount: 'businessId',
   notification: 'businessId',
   auditLog: 'businessId',
+  staffProfile: 'businessId',
   terminal: 'branchId',
   branchStock: 'branchId',
   stockMovement: 'branchId',
@@ -61,6 +65,7 @@ export const CHILD_ONLY_MODELS = [
   'salePayment',
   'shiftCashMovement',
   'stockCountItem',
+  'staffBranch',
 ] as const;
 
 /**
@@ -75,6 +80,7 @@ export const CHILD_PARENT: Record<string, string> = {
   salePayment: 'sale',
   shiftCashMovement: 'shift',
   stockCountItem: 'stockCount',
+  staffBranch: 'staffProfile',
 };
 
 export const PLATFORM_MODEL_SET: ReadonlySet<string> = new Set(PLATFORM_MODELS);

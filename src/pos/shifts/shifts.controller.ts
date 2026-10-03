@@ -10,15 +10,20 @@ import {
 import type { Response } from 'express';
 import { TerminalGuard } from '../guards/terminal.guard';
 import {
+  OperatorGuard,
+  OptionalOperatorGuard,
+} from '../operators/operator.guard';
+import {
   ShiftsService,
   type CashMovement,
-  type ShiftTotals,
+  type LiveShiftTotals,
   type ShiftView,
   type ZReport,
 } from './shifts.service';
 import { OpenShiftDto } from './dto/open-shift.dto';
 import { CashMovementDto } from './dto/cash-movement.dto';
 import { CloseShiftDto } from './dto/close-shift.dto';
+import { EmergencyCloseDto } from './dto/emergency-close.dto';
 
 /**
  * Task 18 — POS shift routes (all TerminalGuard), mirroring the FE `PosApi`:
@@ -34,29 +39,40 @@ export class ShiftsController {
   // (a bare `return null` makes Nest's Express adapter send an empty body,
   // which a real client's `.json()` cannot parse). Body is `Shift | null`.
   @Get('current')
+  @UseGuards(OptionalOperatorGuard)
   async current(@Res() res: Response): Promise<void> {
     const shift = await this.shifts.current();
     res.status(200).json(shift);
   }
 
   @Post()
+  @UseGuards(OperatorGuard)
   open(@Body() dto: OpenShiftDto): Promise<ShiftView> {
     return this.shifts.open(dto);
   }
 
   @Post('current/cash-movements')
+  @UseGuards(OperatorGuard)
   addCashMovement(@Body() dto: CashMovementDto): Promise<CashMovement> {
     return this.shifts.addCashMovement(dto);
   }
 
   @Get('current/totals')
-  totals(): Promise<ShiftTotals> {
+  @UseGuards(OperatorGuard)
+  totals(): Promise<LiveShiftTotals> {
     return this.shifts.totals();
   }
 
   @Post('current/close')
   @HttpCode(200)
+  @UseGuards(OperatorGuard)
   close(@Body() dto: CloseShiftDto): Promise<ZReport> {
     return this.shifts.close(dto);
+  }
+
+  @Post('current/emergency-close')
+  @HttpCode(200)
+  emergencyClose(@Body() dto: EmergencyCloseDto): Promise<ZReport> {
+    return this.shifts.emergencyClose(dto);
   }
 }

@@ -6,6 +6,12 @@ import {
 } from '../../prisma/scoped-prisma.provider';
 import { NotFoundError } from '../../common/errors/api-errors';
 import { assertBusinessOwned } from '../shared/tenant-guards';
+import {
+  getContext,
+  runWithTxClient,
+} from '../../common/context/request-context';
+import { PrismaService } from '../../prisma/prisma.service';
+import { assertManagerWrite } from '../../staff/manager-write';
 
 export interface TerminalResponse {
   id: string;
@@ -38,24 +44,50 @@ function serializeTerminal(t: Terminal): TerminalResponse {
  */
 @Injectable()
 export class TerminalsService {
-  constructor(@Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma) {}
+  constructor(
+    @Inject(SCOPED_PRISMA) private readonly scoped: ScopedPrisma,
+    private readonly raw: PrismaService,
+  ) {}
 
   async list(businessId: string): Promise<TerminalResponse[]> {
     await assertBusinessOwned(this.scoped, businessId);
+    const ctx = getContext();
     const rows = await this.scoped.terminal.findMany({
-      where: { branch: { businessId } },
+      where: {
+        branch: { businessId },
+        ...(ctx.actor?.type === 'staff'
+          ? { branchId: { in: ctx.managerBranchIds ?? [] } }
+          : {}),
+      },
       orderBy: { createdAt: 'asc' },
     });
     return rows.map(serializeTerminal);
   }
 
   async unpair(id: string): Promise<TerminalResponse> {
-    const existing = await this.scoped.terminal.findFirst({ where: { id } });
-    if (!existing) throw new NotFoundError('Terminal not found.');
-    const updated = await this.scoped.terminal.update({
-      where: { id },
-      data: { deviceTokenHash: null },
-    });
-    return serializeTerminal(updated);
+    return this.raw.$transaction((tx) =>
+      runWithTxClient(tx, async () => {
+        await tx.$queryRaw`SELECT id FROM terminals WHERE id = ${id}::uuid FOR UPDATE`;
+        const existing = await this.scoped.terminal.findFirst({
+          where: { id },
+          include: { branch: { select: { businessId: true } } },
+        });
+        if (!existing) throw new NotFoundError('Terminal not found.');
+        await assertManagerWrite(
+          tx,
+          existing.branch.businessId,
+          existing.branchId,
+        );
+        const updated = await this.scoped.terminal.update({
+          where: { id },
+          data: { deviceTokenHash: null },
+        });
+        await tx.operatorSession.updateMany({
+          where: { terminalId: id, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        return serializeTerminal(updated);
+      }),
+    );
   }
 }

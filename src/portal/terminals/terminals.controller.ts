@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { PortalAuthGuard } from '../../auth/guards/portal-auth.guard';
 import { TerminalsService, TerminalResponse } from './terminals.service';
+import { ManagerAccess } from '../../staff/portal-scope';
 
 /**
  * Task 14 — portal terminals, gated by `PortalAuthGuard` (tenant scope).
@@ -22,6 +23,7 @@ export class TerminalsController {
   constructor(private readonly terminals: TerminalsService) {}
 
   @Get('businesses/:businessId/terminals')
+  @ManagerAccess({ action: 'portal_terminals', businessParam: 'businessId' })
   list(
     @Param('businessId', ParseUUIDPipe) businessId: string,
   ): Promise<TerminalResponse[]> {
@@ -29,6 +31,7 @@ export class TerminalsController {
   }
 
   @Post('terminals/:id/unpair')
+  @ManagerAccess({ action: 'portal_terminals', terminalParam: 'id' })
   @HttpCode(HttpStatus.OK)
   unpair(@Param('id', ParseUUIDPipe) id: string): Promise<TerminalResponse> {
     return this.terminals.unpair(id);

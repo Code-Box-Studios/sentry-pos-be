@@ -17,6 +17,7 @@ import request from 'supertest';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import { PrismaClient } from '@prisma/client';
 import { AppModule } from '../src/app.module';
+import { hashSecret } from '../src/auth/hashing';
 import { ApiExceptionFilter } from '../src/common/filters/api-exception.filter';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { computeTotals } from '../src/common/totals/totals';
@@ -71,6 +72,7 @@ describe('POS completeSale (e2e)', () => {
 
   const server = () => app.getHttpServer();
   const bearer = (t: string) => `Bearer ${t}`;
+  const operatorTokens = new Map<string, string>();
 
   /**
    * Seed owner→business→branch→terminal→open shift, plus two stocked products:
@@ -84,6 +86,14 @@ describe('POS completeSale (e2e)', () => {
         email: `owner-${seq}-${Date.now()}@test.com`,
         status: 'active',
         maxBusinesses: 5,
+      },
+    });
+    const ownerUser = await raw.user.create({
+      data: {
+        role: 'owner',
+        ownerId: owner.id,
+        email: owner.email,
+        pinHash: await hashSecret('123456'),
       },
     });
     const business = await raw.business.create({
@@ -120,6 +130,7 @@ describe('POS completeSale (e2e)', () => {
         terminalId: terminal.id,
         openedAt: new Date(),
         openingCash: 200000,
+        operatorUserId: ownerUser.id,
       },
     });
     const category = await raw.category.create({
@@ -189,8 +200,16 @@ describe('POS completeSale (e2e)', () => {
       },
     });
 
+    const unlocked = await request(server())
+      .post('/v1/pos/operators/unlock')
+      .set('Authorization', bearer(deviceToken))
+      .send({ userId: ownerUser.id, pin: '123456' })
+      .expect(201);
+    operatorTokens.set(deviceToken, unlocked.body.token as string);
+
     return {
       deviceToken,
+      operatorUserId: ownerUser.id,
       branchId: branch.id,
       terminalId: terminal.id,
       businessId: business.id,
@@ -264,11 +283,333 @@ describe('POS completeSale (e2e)', () => {
     request(server())
       .post('/v1/pos/sales')
       .set('Authorization', bearer(token))
+      .set('X-Operator-Token', operatorTokens.get(token) ?? '')
       .send(draft as object);
 
   it('rejects unauthenticated access (401)', async () => {
     await request(server()).post('/v1/pos/sales').send({}).expect(401);
     await request(server()).get('/v1/pos/sales').expect(401);
+  });
+
+  it('does not let another operator submit a sale against an open drawer', async () => {
+    const w = await seedWorld();
+    const business = await raw.business.findUniqueOrThrow({
+      where: { id: w.businessId },
+    });
+    const other = await raw.user.create({
+      data: { role: 'cashier', ownerId: business.ownerId },
+    });
+    await raw.shift.update({
+      where: { id: w.shiftId },
+      data: { operatorUserId: other.id },
+    });
+    const draft = buildDraft({
+      shiftId: w.shiftId,
+      lines: [line({ id: randomUUID(), name: 'Water', unitPriceC: 1000 })],
+    });
+    await postSale(w.deviceToken, draft).expect(403);
+    expect(await raw.sale.count({ where: { id: draft.id } })).toBe(0);
+  });
+
+  it('rejects a cashier whose access is removed while the sale waits to commit', async () => {
+    const w = await seedWorld();
+    const business = await raw.business.findUniqueOrThrow({
+      where: { id: w.businessId },
+    });
+    const cashier = await raw.user.create({
+      data: {
+        role: 'cashier',
+        ownerId: business.ownerId,
+        pinHash: await hashSecret('654321'),
+      },
+    });
+    const profile = await raw.staffProfile.create({
+      data: {
+        userId: cashier.id,
+        businessId: w.businessId,
+        name: 'Ana',
+        status: 'active',
+        branches: { create: [{ branchId: w.branchId }] },
+      },
+    });
+    await raw.shift.update({
+      where: { id: w.shiftId },
+      data: { operatorUserId: cashier.id },
+    });
+    const unlocked = await request(server())
+      .post('/v1/pos/operators/unlock')
+      .set('Authorization', bearer(w.deviceToken))
+      .send({ userId: cashier.id, pin: '654321' })
+      .expect(201);
+    operatorTokens.set(w.deviceToken, unlocked.body.token as string);
+    const draft = buildDraft({
+      shiftId: w.shiftId,
+      lines: [line({ id: randomUUID(), name: 'Water', unitPriceC: 1000 })],
+    });
+
+    let release!: () => void;
+    let locked!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const transaction = raw.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM shifts WHERE id = ${w.shiftId}::uuid FOR UPDATE`;
+        locked();
+        await hold;
+        await tx.staffProfile.update({
+          where: { id: profile.id },
+          data: { status: 'deactivated' },
+        });
+      },
+      { timeout: 20000 },
+    );
+    await ready;
+    const pending = postSale(w.deviceToken, draft).then((response) => response);
+    let waiting = false;
+    for (let attempt = 0; attempt < 400; attempt++) {
+      const rows = await raw.$queryRaw<{ count: bigint }[]>`
+        SELECT count(*)::bigint AS count FROM pg_stat_activity
+        WHERE datname = current_database() AND wait_event_type = 'Lock'
+          AND query LIKE 'SELECT id FROM shifts%'
+      `;
+      if (rows[0]?.count > 0n) {
+        waiting = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    release();
+    await transaction;
+    expect(waiting).toBe(true);
+    expect((await pending).status).toBe(401);
+    expect(await raw.sale.count({ where: { id: draft.id } })).toBe(0);
+  }, 15000);
+
+  it('enforces the current miscellaneous-item policy without breaking committed replays', async () => {
+    const w = await seedWorld();
+    const draft = buildDraft({
+      shiftId: w.shiftId,
+      lines: [line({ id: randomUUID(), name: 'Water', unitPriceC: 1000 })],
+    });
+    await raw.business.update({
+      where: { id: w.businessId },
+      data: { allowMiscItems: false },
+    });
+    await postSale(w.deviceToken, draft).expect(422);
+    expect(await raw.sale.count()).toBe(0);
+    await raw.business.update({
+      where: { id: w.businessId },
+      data: { allowMiscItems: true },
+    });
+    const committed = await postSale(w.deviceToken, draft).expect(201);
+    await raw.business.update({
+      where: { id: w.businessId },
+      data: { allowMiscItems: false },
+    });
+    const replay = await postSale(w.deviceToken, draft).expect(200);
+    expect(replay.body).toEqual(committed.body);
+    expect(await raw.sale.count()).toBe(1);
+  });
+
+  it('rejects miscellaneous items disabled while a new sale waits to commit', async () => {
+    const w = await seedWorld();
+    await raw.business.update({
+      where: { id: w.businessId },
+      data: { allowMiscItems: true },
+    });
+    const draft = buildDraft({
+      shiftId: w.shiftId,
+      lines: [line({ id: randomUUID(), name: 'Water', unitPriceC: 1000 })],
+    });
+    let release!: () => void;
+    let ready!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const locked = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const holding = raw.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM shifts WHERE id = ${w.shiftId}::uuid FOR UPDATE`;
+        ready();
+        await blocked;
+        await tx.business.update({
+          where: { id: w.businessId },
+          data: { allowMiscItems: false },
+        });
+      },
+      { timeout: 20000 },
+    );
+    await locked;
+    const pending = postSale(w.deviceToken, draft).then((response) => response);
+    try {
+      let waiting = false;
+      for (let i = 0; i < 100; i++) {
+        const rows = await raw.$queryRaw<
+          { waiting: boolean }[]
+        >`SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT id FROM shifts%') AS waiting`;
+        if (rows[0].waiting) {
+          waiting = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(waiting).toBe(true);
+    } finally {
+      release();
+      await holding;
+    }
+    expect((await pending).status).toBe(422);
+    expect(await raw.sale.count()).toBe(0);
+  });
+
+  it('rejects a cashier free-entry discount even when the totals are valid', async () => {
+    const w = await seedWorld();
+    const business = await raw.business.findUniqueOrThrow({
+      where: { id: w.businessId },
+    });
+    const cashier = await raw.user.create({
+      data: {
+        role: 'cashier',
+        ownerId: business.ownerId,
+        pinHash: await hashSecret('654321'),
+      },
+    });
+    await raw.staffProfile.create({
+      data: {
+        userId: cashier.id,
+        businessId: w.businessId,
+        name: 'Ana',
+        status: 'active',
+        branches: { create: [{ branchId: w.branchId }] },
+      },
+    });
+    await raw.shift.update({
+      where: { id: w.shiftId },
+      data: { operatorUserId: cashier.id },
+    });
+    const unlocked = await request(server())
+      .post('/v1/pos/operators/unlock')
+      .set('Authorization', bearer(w.deviceToken))
+      .send({ userId: cashier.id, pin: '654321' })
+      .expect(201);
+    operatorTokens.set(w.deviceToken, unlocked.body.token as string);
+    const base = buildDraft({
+      shiftId: w.shiftId,
+      lines: [line({ id: randomUUID(), name: 'Water', unitPriceC: 1000 })],
+    });
+    const orderDiscount = {
+      source: 'free' as const,
+      kind: 'fixed' as const,
+      value: 100,
+    };
+    const totals = computeTotals(
+      {
+        id: base.id,
+        orderType: base.orderType,
+        lines: base.lines,
+        orderDiscount,
+        scPwd: null,
+      },
+      { taxRate: TAX_RATE, serviceChargeRate: SC_RATE },
+    );
+    const draft = {
+      ...base,
+      orderDiscount,
+      totals,
+      payment: {
+        ...base.payment,
+        amountC: totals.totalC,
+        tenderedC: totals.totalC,
+      },
+    };
+    await postSale(w.deviceToken, draft).expect(403);
+    expect(await raw.sale.count({ where: { id: draft.id } })).toBe(0);
+  });
+
+  it('does not accept a forged value for a named discount', async () => {
+    const w = await seedWorld();
+    const base = buildDraft({
+      shiftId: w.shiftId,
+      lines: [line({ id: randomUUID(), name: 'Water', unitPriceC: 1000 })],
+    });
+    const orderDiscount = {
+      source: 'named' as const,
+      discountId: w.discount.id,
+      name: w.discount.name,
+      kind: 'percent' as const,
+      value: 90,
+    };
+    const totals = computeTotals(
+      {
+        id: base.id,
+        orderType: base.orderType,
+        lines: base.lines,
+        orderDiscount,
+        scPwd: null,
+      },
+      { taxRate: TAX_RATE, serviceChargeRate: SC_RATE },
+    );
+    const draft = {
+      ...base,
+      orderDiscount,
+      totals,
+      payment: {
+        ...base.payment,
+        amountC: totals.totalC,
+        tenderedC: totals.totalC,
+      },
+    };
+    await postSale(w.deviceToken, draft).expect(422);
+    expect(await raw.sale.count({ where: { id: draft.id } })).toBe(0);
+  });
+
+  it('replays a paid sale only to its original operator', async () => {
+    const w = await seedWorld();
+    const draft = buildDraft({
+      shiftId: w.shiftId,
+      lines: [line({ id: randomUUID(), name: 'Water', unitPriceC: 1000 })],
+    });
+    await postSale(w.deviceToken, draft).expect(201);
+    await raw.shift.update({
+      where: { id: w.shiftId },
+      data: { closedAt: new Date() },
+    });
+    const business = await raw.business.findUniqueOrThrow({
+      where: { id: w.businessId },
+    });
+    const cashier = await raw.user.create({
+      data: {
+        role: 'cashier',
+        ownerId: business.ownerId,
+        pinHash: await hashSecret('654321'),
+      },
+    });
+    await raw.staffProfile.create({
+      data: {
+        userId: cashier.id,
+        businessId: w.businessId,
+        name: 'Ana',
+        status: 'active',
+        branches: { create: [{ branchId: w.branchId }] },
+      },
+    });
+    const unlocked = await request(server())
+      .post('/v1/pos/operators/unlock')
+      .set('Authorization', bearer(w.deviceToken))
+      .send({ userId: cashier.id, pin: '654321' })
+      .expect(201);
+    operatorTokens.set(w.deviceToken, unlocked.body.token as string);
+    await postSale(w.deviceToken, draft).expect(403);
+    expect(
+      (await raw.sale.findUniqueOrThrow({ where: { id: draft.id } }))
+        .operatorUserId,
+    ).toBe(w.operatorUserId);
   });
 
   it('completes a sale: persists sale/items/payment/movements/draft and decrements stock', async () => {
@@ -304,6 +645,7 @@ describe('POS completeSale (e2e)', () => {
       include: { items: true, payments: true },
     });
     expect(saleRow.status).toBe('completed');
+    expect(saleRow.operatorUserId).toBe(w.operatorUserId);
     expect(saleRow.total).toBe(draft.totals.totalC);
     expect(saleRow.subtotal).toBe(17000);
     expect(saleRow.items).toHaveLength(1);

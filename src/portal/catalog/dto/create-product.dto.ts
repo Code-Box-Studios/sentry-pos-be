@@ -97,9 +97,10 @@ export class CreateProductDto {
   soldBy?: 'unit' | 'weight';
 
   @IsOptional()
-  @IsNumber()
+  @IsNumber({ maxDecimalPlaces: 3 })
   @Min(0)
-  lowStockThreshold?: number;
+  @Max(9999999.999)
+  lowStockThreshold?: number | null;
 
   @IsOptional()
   @IsBoolean()
@@ -112,11 +113,6 @@ export class CreateProductDto {
   @IsOptional()
   @IsBoolean()
   active?: boolean;
-
-  @IsOptional()
-  @IsString()
-  @MaxLength(500)
-  imagePath?: string;
 
   @IsOptional()
   @IsArray()
